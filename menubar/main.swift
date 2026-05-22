@@ -2074,6 +2074,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "You're fired!",                            // The Apprentice
         "I think we should see other people",       // the soft kill
         "Death before dishonor",                    // old soldier's creed
+        "I'll be your Huckleberry",                 // Tombstone — Doc Holliday
+        "Rip and Tear",                             // DOOM — the Slayer's creed
+        "You Died",                                 // Dark Souls / Elden Ring
+        "It's super effective!",                    // Pokémon — the killing blow
+        "Fus Ro Dah!",                              // Skyrim — force pushes you out
+        "Headshot!",                                // Counter-Strike / every FPS ever
+        "Omae wa mou shindeiru",                    // Fist of the North Star / gaming meme
+        "Get dunked on",                            // Undertale — Sans
+        "No respawns",                              // battle royale finality
+        "Alt+F4",                                   // the original force-quit
+        "Git Gud",                                  // Dark Souls community wisdom
+        "Press F to pay respects",                  // CoD: Advanced Warfare meme
+        "Leeeeroy Jenkins!",                        // WoW — chaos incarnate
+        "By fire be purged",                        // Warcraft — Scarlet Crusade
+        "Critical hit!",                            // every RPG ever
+        "Permanently uninstalled",                  // meta
     ]
 
     let sparePhrases: [String] = [
