@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.5.1"
+let appVersion = "1.5.2"
 
 // MARK: - Settings
 
@@ -652,6 +652,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var sortButton:       NSButton?
     var axeCheckedButton: NSButton?
 
+    // Rotating kill-button phrases — picked once on first checkbox tick, held until cleared
+    var currentKillPhrase: String = ""
+    let killPhrases: [String] = [
+        "Yeet",
+        "Darth Maul 'em",
+        "Get to the choppa!",
+        "Ain't nobody got time for that",
+        "Hasta la vista",
+        "Execute Order 66",
+        "Bye Felicia",
+        "You're fired!",
+        "He's dead, Jim",
+        "I am inevitable",
+        "You shall not pass",
+        "It's not you, it's me",
+        "This is the way",
+        "Thanos snap",
+        "git rm -rf",
+        "No more Mr. Nice App",
+        "Send to the shadow realm",
+        "Winter is here",
+        "Mess around and find out",
+        "Let 'er rip",
+    ]
+
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
 
@@ -840,6 +865,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func showOverlay() {
         checkedPIDs.removeAll()
+        currentKillPhrase = ""
         refreshApps()
         if panel == nil { buildPanel() }
         searchField?.stringValue = ""
@@ -1149,8 +1175,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func updateHint() {
         let checked = checkedPIDs.count
         if checked > 0 {
-            // Show the prominent action button; hide the keyboard-shortcut label
-            let btnTitle = checked == 1 ? "Yeet (1)" : "Yeet (\(checked))"
+            // Pick a new phrase on the first tick; hold it while more boxes are added
+            if currentKillPhrase.isEmpty {
+                currentKillPhrase = killPhrases.randomElement() ?? "Yeet"
+            }
+            let btnTitle = "\(currentKillPhrase) (\(checked))"
             axeCheckedButton?.attributedTitle = NSAttributedString(
                 string: btnTitle,
                 attributes: [.foregroundColor: NSColor.white,
@@ -1158,6 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             axeCheckedButton?.isHidden = false
             hintLabel?.isHidden = true
         } else {
+            currentKillPhrase = ""   // reset so next session gets a fresh phrase
             axeCheckedButton?.isHidden = true
             hintLabel?.isHidden = false
             let sel = tableView?.selectedRowIndexes.count ?? 0
