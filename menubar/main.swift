@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.1.1"
+let appVersion = "2.2.0"
 
 // MARK: - Settings
 
@@ -88,6 +88,16 @@ struct AppSettings {
         if let stored = d.object(forKey: "firstLaunchDate") as? Date { return stored }
         let now = Date(); d.set(now, forKey: "firstLaunchDate"); return now
     }
+    /// Maximum number of sessions to keep. Default 10.
+    static var maxSessions: Int {
+        get { d.object(forKey: "maxSessions") == nil ? 10 : d.integer(forKey: "maxSessions") }
+        set { d.set(newValue, forKey: "maxSessions") }
+    }
+    /// If true, restore the most-recent session automatically on launch.
+    static var autoRestoreLastSession: Bool {
+        get { d.bool(forKey: "autoRestoreLastSession") }
+        set { d.set(newValue, forKey: "autoRestoreLastSession") }
+    }
     /// Phrases the user has explicitly turned off. Stored as a JSON array of strings.
     /// Unrecognised / new phrases are implicitly enabled (not in this set).
     static var disabledKillPhrases: Set<String> {
@@ -150,6 +160,23 @@ struct AppEntry {
     var name:  String    { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
     var icon:  NSImage?  { app.icon }
     init(_ a: NSRunningApplication) { app = a; memMB = residentMB(for: a.processIdentifier) }
+}
+
+// MARK: - AutoFitTableView
+
+/// NSTableView that keeps its single column exactly as wide as the visible
+/// scroll-view content area on every layout pass. This prevents horizontal
+/// overflow regardless of system scroll-bar style (overlay vs. always-on).
+private final class AutoFitTableView: NSTableView {
+    override func layout() {
+        super.layout()
+        guard let col = tableColumns.first,
+              let sv  = enclosingScrollView else { return }
+        let available = sv.contentView.bounds.width
+        if available > 1 && abs(col.width - available) > 0.5 {
+            col.width = available
+        }
+    }
 }
 
 // MARK: - RoundedIconView
@@ -351,6 +378,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("Phrases", to: root, rows: [
             phraseRow(),
+        ])
+
+        addSection("Sessions", to: root, rows: [
+            popupRow("Max saved sessions",
+                     options: ["5", "10", "20", "50"],
+                     selected: [5, 10, 20, 50].firstIndex(of: AppSettings.maxSessions) ?? 1)
+                { AppSettings.maxSessions = [5, 10, 20, 50][safe: $0] ?? 10 },
+            toggleRow("Auto-restore last session on launch",
+                      on: AppSettings.autoRestoreLastSession) { AppSettings.autoRestoreLastSession = $0 },
         ])
 
         addSection("App List", to: root, rows: [
@@ -673,7 +709,7 @@ struct AppSession: Codable {
 final class SessionManager {
     static let shared = SessionManager()
     private let key = "savedSessions"
-    private let max = 10
+    private var max: Int { AppSettings.maxSessions }
 
     var all: [AppSession] {
         get {
@@ -1366,6 +1402,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var emptyView:   EmptyStateView?
     var hintLabel:   NSTextField?
 
+    // ── Sessions panel (shown inside the overlay on demand) ────────
+    var isShowingSessions  = false
+    var sessionBtn:        NSButton?       // the clock icon in the search bar
+    var appListContainer:  NSView?         // the NSScrollView holding the app table
+    var sessionsPanelView: NSView?         // replaces the table area in sessions mode
+    var sessionsListStack: NSStackView?    // inner stack rebuilt on each show
+
     // Data
     var allApps:      [AppEntry]  = []
     var filtered:     [AppEntry]  = []
@@ -1482,6 +1525,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 self.onboardingWindow.show()
             }
         }
+        // Auto-restore last session if enabled
+        if AppSettings.autoRestoreLastSession,
+           let lastSession = SessionManager.shared.all.first {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                SessionManager.shared.restore(lastSession)
+            }
+        }
+
         // Support nudge — show every 6 hours, skip first 24 h and if already licensed
         _ = AppSettings.firstLaunchDate   // ensures first-launch date is recorded
         startNudgeTimer()
@@ -1761,6 +1812,235 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     /// Unregisters the current hot key and registers a fresh one from AppSettings.
     /// Call after the user changes the shortcut in Settings.
+    // MARK: Sessions panel
+
+    /// Builds the sessions overlay panel view (initially hidden).
+    private func buildSessionsPanel() -> NSView {
+        let container = NSView()
+        container.wantsLayer = true
+
+        // ── Header bar ─────────────────────────────────────────────
+        let header = NSView()
+        header.wantsLayer = true
+        header.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
+        header.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(header)
+
+        let backBtn = NSButton()
+        backBtn.isBordered = false
+        if let sym = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "Back") {
+            backBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        }
+        backBtn.contentTintColor = .secondaryLabelColor
+        backBtn.target = self; backBtn.action = #selector(toggleSessionsPanel)
+        backBtn.toolTip = "Back to app list"
+        backBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(backBtn)
+
+        let titleLbl = NSTextField(labelWithString: "Sessions")
+        titleLbl.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLbl.textColor = .secondaryLabelColor; titleLbl.alignment = .center
+        titleLbl.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(titleLbl)
+
+        let saveBtn = NSButton()
+        saveBtn.isBordered = false
+        if let sym = NSImage(systemSymbolName: "plus.circle", accessibilityDescription: "Save Session") {
+            saveBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+        }
+        saveBtn.contentTintColor = .controlAccentColor
+        saveBtn.target = self; saveBtn.action = #selector(saveSessionFromPanel)
+        saveBtn.toolTip = "Save current session"
+        saveBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(saveBtn)
+
+        let headerH: CGFloat = 36
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: container.topAnchor),
+            header.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: headerH),
+            backBtn.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 10),
+            backBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            backBtn.widthAnchor.constraint(equalToConstant: 28),
+            backBtn.heightAnchor.constraint(equalToConstant: 28),
+            titleLbl.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            titleLbl.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            saveBtn.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -10),
+            saveBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            saveBtn.widthAnchor.constraint(equalToConstant: 28),
+            saveBtn.heightAnchor.constraint(equalToConstant: 28),
+        ])
+
+        // ── Thin divider under header ───────────────────────────────
+        let hdrDiv = divider()
+        hdrDiv.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(hdrDiv)
+        NSLayoutConstraint.activate([
+            hdrDiv.topAnchor.constraint(equalTo: header.bottomAnchor),
+            hdrDiv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            hdrDiv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            hdrDiv.heightAnchor.constraint(equalToConstant: 1),
+        ])
+
+        // ── Scrollable sessions list ────────────────────────────────
+        let listStack = NSStackView()
+        listStack.orientation = .vertical; listStack.spacing = 0; listStack.alignment = .leading
+        listStack.translatesAutoresizingMaskIntoConstraints = false
+        sessionsListStack = listStack
+
+        let listSV = NSScrollView()
+        listSV.documentView = listStack
+        listSV.hasVerticalScroller = true; listSV.autohidesScrollers = true
+        listSV.hasHorizontalScroller = false; listSV.horizontalScrollElasticity = .none
+        listSV.drawsBackground = false
+        listSV.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(listSV)
+        listStack.widthAnchor.constraint(equalTo: listSV.contentView.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            listSV.topAnchor.constraint(equalTo: hdrDiv.bottomAnchor),
+            listSV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            listSV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            listSV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        return container
+    }
+
+    /// Rebuild the sessions list stack with current saved sessions.
+    func refreshSessionsPanel() {
+        guard let stack = sessionsListStack else { return }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        let sessions = SessionManager.shared.all
+        if sessions.isEmpty {
+            let empty = NSTextField(labelWithString: "No sessions saved yet.\nPress + to save the current apps.")
+            empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
+            empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            let wrap = NSView(); wrap.translatesAutoresizingMaskIntoConstraints = false
+            wrap.addSubview(empty)
+            NSLayoutConstraint.activate([
+                empty.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 16),
+                empty.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -16),
+                empty.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 20),
+                empty.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -20),
+            ])
+            stack.addArrangedSubview(wrap)
+            wrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            return
+        }
+
+        let fmt = DateFormatter(); fmt.dateStyle = .medium; fmt.timeStyle = .short
+        for (i, session) in sessions.enumerated() {
+            let row = NSStackView(); row.orientation = .horizontal; row.spacing = 10
+            row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 12)
+            row.alignment = .centerY
+
+            // icon
+            let iconView = NSImageView()
+            if let sym = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: nil) {
+                iconView.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+            }
+            iconView.contentTintColor = .secondaryLabelColor
+            iconView.translatesAutoresizingMaskIntoConstraints = false
+            iconView.widthAnchor.constraint(equalToConstant: 20).isActive = true
+
+            // text stack
+            let nameLabel = NSTextField(labelWithString: session.name)
+            nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+            nameLabel.lineBreakMode = .byTruncatingTail
+            let metaLabel = NSTextField(labelWithString:
+                "\(session.apps.count) app\(session.apps.count == 1 ? "" : "s")  ·  \(fmt.string(from: session.date))")
+            metaLabel.font = .systemFont(ofSize: 11); metaLabel.textColor = .tertiaryLabelColor
+            let textStack = NSStackView(views: [nameLabel, metaLabel])
+            textStack.orientation = .vertical; textStack.spacing = 2; textStack.alignment = .leading
+            textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            // restore button
+            let restoreBtn = NSButton()
+            restoreBtn.isBordered = false
+            if let sym = NSImage(systemSymbolName: "play.circle", accessibilityDescription: "Restore") {
+                restoreBtn.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 16, weight: .regular))
+            }
+            restoreBtn.contentTintColor = .controlAccentColor
+            restoreBtn.target = self; restoreBtn.action = #selector(restoreSessionFromPanel(_:))
+            restoreBtn.tag = i
+            restoreBtn.toolTip = "Restore session"
+            restoreBtn.translatesAutoresizingMaskIntoConstraints = false
+            restoreBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+
+            // delete button
+            let delBtn = NSButton()
+            delBtn.isBordered = false
+            if let sym = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Delete") {
+                delBtn.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+            }
+            delBtn.contentTintColor = .tertiaryLabelColor
+            delBtn.target = self; delBtn.action = #selector(deleteSessionFromPanel(_:))
+            delBtn.tag = i
+            delBtn.toolTip = "Delete session"
+            delBtn.translatesAutoresizingMaskIntoConstraints = false
+            delBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
+
+            row.addArrangedSubview(iconView)
+            row.addArrangedSubview(textStack)
+            row.addArrangedSubview(restoreBtn)
+            row.addArrangedSubview(delBtn)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+            if i < sessions.count - 1 {
+                let sep = NSBox(); sep.boxType = .separator
+                sep.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(sep)
+                sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
+            }
+        }
+    }
+
+    @objc func toggleSessionsPanel() {
+        isShowingSessions.toggle()
+        appListContainer?.isHidden  = isShowingSessions
+        sessionsPanelView?.isHidden = !isShowingSessions
+        sessionBtn?.contentTintColor = isShowingSessions ? .controlAccentColor : .tertiaryLabelColor
+        if isShowingSessions {
+            refreshSessionsPanel()
+            searchField?.window?.makeFirstResponder(nil)
+        } else {
+            searchField?.window?.makeFirstResponder(searchField)
+        }
+        updateHint()
+    }
+
+    @objc func saveSessionFromPanel() {
+        // Reuse the existing save-session flow
+        saveSession()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.refreshSessionsPanel()
+        }
+    }
+
+    @objc func restoreSessionFromPanel(_ sender: NSButton) {
+        let sessions = SessionManager.shared.all
+        guard sender.tag < sessions.count else { return }
+        SessionManager.shared.restore(sessions[sender.tag])
+        hideOverlay()
+    }
+
+    @objc func deleteSessionFromPanel(_ sender: NSButton) {
+        let sessions = SessionManager.shared.all
+        guard sender.tag < sessions.count else { return }
+        SessionManager.shared.delete(id: sessions[sender.tag].id)
+        refreshSessionsPanel()
+    }
+
     func reregisterHotKey() {
         if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
         let id = EventHotKeyID(signature: fourCC("axe!"), id: 1)
@@ -1825,6 +2105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         popover?.close();     popover = nil; popoverVC = nil
         searchField = nil; tableView = nil; emptyView = nil
         hintLabel = nil; sortButton = nil; axeCheckedButton = nil
+        sessionBtn = nil; appListContainer = nil
+        sessionsPanelView = nil; sessionsListStack = nil
+        isShowingSessions = false
         lastBuiltStyle = nil
     }
 
@@ -1834,6 +2117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         checkedPIDs.removeAll()
         currentKillPhrase = ""
+        isShowingSessions = false
         refreshApps()
 
         switch AppSettings.uiStyle {
@@ -1982,17 +2266,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(sf)
         searchField = sf
 
+        // Sessions toggle button
+        let sesBtn = NSButton()
+        sesBtn.isBordered = false
+        if let sym = NSImage(systemSymbolName: "clock.arrow.circlepath",
+                             accessibilityDescription: "Sessions") {
+            sesBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sesBtn.contentTintColor = .tertiaryLabelColor
+        sesBtn.target = self; sesBtn.action = #selector(toggleSessionsPanel)
+        sesBtn.toolTip = "Sessions"
+        sesBtn.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sesBtn)
+        sessionBtn = sesBtn
+
         NSLayoutConstraint.activate([
             searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
             searchIcon.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
             searchIcon.widthAnchor.constraint(equalToConstant: 16),
             searchIcon.heightAnchor.constraint(equalToConstant: 16),
-            sortBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            sesBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            sesBtn.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            sesBtn.widthAnchor.constraint(equalToConstant: 26),
+            sesBtn.heightAnchor.constraint(equalToConstant: 26),
+            sortBtn.trailingAnchor.constraint(equalTo: sesBtn.leadingAnchor, constant: -2),
             sortBtn.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
             sortBtn.widthAnchor.constraint(equalToConstant: 26),
             sortBtn.heightAnchor.constraint(equalToConstant: 26),
             sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 8),
-            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -8),
+            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -6),
             sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
             sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
@@ -2008,7 +2311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ])
 
         // ── Table (app list) ───────────────────────────────────────
-        let tv = NSTableView()
+        let tv = AutoFitTableView()
         tv.headerView  = nil
         tv.rowHeight   = rowH
         tv.gridStyleMask = []
@@ -2034,6 +2337,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         sv.drawsBackground = false
         sv.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sv)
+        appListContainer = sv
+
+        // ── Sessions panel (hidden until sessions button is tapped) ─
+        let sp = buildSessionsPanel()
+        sp.isHidden = true
+        sp.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sp)
+        sessionsPanelView = sp
 
         // ── Empty state ────────────────────────────────────────────
         let ev = EmptyStateView()
@@ -2051,6 +2362,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             ev.leadingAnchor.constraint(equalTo: sv.leadingAnchor),
             ev.trailingAnchor.constraint(equalTo: sv.trailingAnchor),
             ev.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
+            sp.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            sp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            sp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            sp.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
         ])
 
         // ── Bottom divider + hint bar ──────────────────────────────
@@ -2145,17 +2460,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(sf)
         searchField = sf
 
+        let sesBtn2 = NSButton()
+        sesBtn2.isBordered = false
+        if let sym = NSImage(systemSymbolName: "clock.arrow.circlepath",
+                             accessibilityDescription: "Sessions") {
+            sesBtn2.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sesBtn2.contentTintColor = .tertiaryLabelColor
+        sesBtn2.target = self; sesBtn2.action = #selector(toggleSessionsPanel)
+        sesBtn2.toolTip = "Sessions"
+        sesBtn2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sesBtn2)
+        sessionBtn = sesBtn2
+
         NSLayoutConstraint.activate([
             searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
             searchIcon.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
             searchIcon.widthAnchor.constraint(equalToConstant: 16),
             searchIcon.heightAnchor.constraint(equalToConstant: 16),
-            sortBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            sesBtn2.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -8),
+            sesBtn2.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            sesBtn2.widthAnchor.constraint(equalToConstant: 26),
+            sesBtn2.heightAnchor.constraint(equalToConstant: 26),
+            sortBtn.trailingAnchor.constraint(equalTo: sesBtn2.leadingAnchor, constant: -2),
             sortBtn.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
             sortBtn.widthAnchor.constraint(equalToConstant: 26),
             sortBtn.heightAnchor.constraint(equalToConstant: 26),
             sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 6),
-            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -6),
+            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -4),
             sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
             sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
@@ -2171,7 +2504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ])
 
         // ── Table ──────────────────────────────────────────────────
-        let tv = NSTableView()
+        let tv = AutoFitTableView()
         tv.headerView = nil; tv.rowHeight = rowH
         tv.gridStyleMask = []; tv.backgroundColor = .clear
         tv.dataSource = self; tv.delegate = self
@@ -2193,6 +2526,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         sv2.drawsBackground = false
         sv2.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sv2)
+        appListContainer = sv2
+
+        let sp2 = buildSessionsPanel()
+        sp2.isHidden = true
+        sp2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sp2)
+        sessionsPanelView = sp2
 
         let ev = EmptyStateView()
         ev.translatesAutoresizingMaskIntoConstraints = false; ev.isHidden = true
@@ -2207,6 +2547,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             ev.leadingAnchor.constraint(equalTo: sv2.leadingAnchor),
             ev.trailingAnchor.constraint(equalTo: sv2.trailingAnchor),
             ev.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
+            sp2.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            sp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            sp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            sp2.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
         ])
 
         // ── Hint bar ───────────────────────────────────────────────
@@ -2339,10 +2683,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             if sel > 1 {
                 hintLabel?.stringValue = "\(sel) selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
             } else {
-                let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
-                                   && AppSettings.hotKeyMods == UInt32(cmdKey)
-                let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
-                hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close"
+                if isShowingSessions {
+                    hintLabel?.stringValue = "▶ restore  ·  ✕ delete  ·  esc back to apps"
+                } else {
+                    let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
+                                       && AppSettings.hotKeyMods == UInt32(cmdKey)
+                    let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
+                    hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close"
+                }
             }
         }
     }
@@ -2491,7 +2839,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                  doCommandBy sel: Selector) -> Bool {
         switch sel {
         case #selector(NSResponder.cancelOperation(_:)):
-            hideOverlay(); return true
+            if isShowingSessions { toggleSessionsPanel() } else { hideOverlay() }
+            return true
 
         case #selector(NSResponder.insertNewline(_:)):
             let force = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
