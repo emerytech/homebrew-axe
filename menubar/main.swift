@@ -1123,8 +1123,8 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
 final class NudgeWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    static let purchaseURL  = "https://ets3d.lemonsqueezy.com/checkout/buy/a1a1da63-ceee-40ae-81ef-2927e5fbbcb3"  // $9.99 — 3 seats
-    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/checkout/buy/d7d5c5b5-e7ac-40ef-acc7-b178742a5c45"  // $4.99 — 1 extra seat
+    static let purchaseURL  = "https://ets3d.lemonsqueezy.com/checkout/buy/7cf62599-8c8e-4dd1-bd5c-3e7643bbb7c2"  // $9.99 — 3 seats
+    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/checkout/buy/d7d5c5b5-e7ac-40ef-acc7-b178742a5c45?discount=0"  // $4.99 — 1 extra seat
 
     func show() {
         AppSettings.lastNudgeDate = Date()
