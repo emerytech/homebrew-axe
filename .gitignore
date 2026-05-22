@@ -1,0 +1,11 @@
+# Build artifacts
+menubar/Axe.app/
+menubar/makeicon
+menubar/AppIcon.icns
+menubar/AppIcon.iconset/
+
+# macOS
+.DS_Store
+
+# Editor / local config
+.claude/
