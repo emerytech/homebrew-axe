@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.4.0"
+let appVersion = "2.4.1"
 
 // MARK: - Settings
 
