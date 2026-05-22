@@ -114,8 +114,23 @@ if $SIGN; then
     echo "→ Stapling ticket..."
     xcrun stapler staple "$APP"
 
+    echo "→ Creating release artifacts..."
+    # Homebrew zip
+    ditto -c -k --keepParent "$APP" "$HERE/../Axe.zip"
+    echo "   Axe.zip  $(du -sh "$HERE/../Axe.zip" | cut -f1)"
+
+    # DMG with Applications symlink (for direct download)
+    DMGTMP=$(mktemp -d)
+    cp -r "$APP" "$DMGTMP/"
+    ln -s /Applications "$DMGTMP/Applications"
+    hdiutil create -volname "Axe" -srcfolder "$DMGTMP" -ov -format UDZO \
+        "$HERE/../Axe.dmg" 2>/dev/null
+    rm -rf "$DMGTMP"
+    echo "   Axe.dmg  $(du -sh "$HERE/../Axe.dmg" | cut -f1)"
+
     echo ""
     echo "✓ Built, signed, notarized, and stapled: $APP"
+    echo "  Release artifacts ready: Axe.zip  Axe.dmg"
 else
     # Ad-hoc sign for local dev
     codesign --force --deep --sign - "$APP" 2>/dev/null || true
