@@ -93,12 +93,22 @@ final class RoundedIconView: NSImageView {
 
 final class AppRowCell: NSTableCellView {
     let appIcon  = RoundedIconView()
+    let checkBox = NSButton()
     let appName  = NSTextField(labelWithString: "")
     let memLabel = NSTextField(labelWithString: "")
+
+    /// Called with the new checked state whenever the checkbox is toggled.
+    var onCheckToggle: ((Bool) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         appIcon.imageScaling = .scaleAxesIndependently
+
+        checkBox.setButtonType(.switch)
+        checkBox.title        = ""
+        checkBox.controlSize  = .small
+        checkBox.target       = self
+        checkBox.action       = #selector(checkChanged)
 
         appName.font = .systemFont(ofSize: 14)
         appName.lineBreakMode = .byTruncatingTail
@@ -109,7 +119,7 @@ final class AppRowCell: NSTableCellView {
         memLabel.setContentHuggingPriority(.required, for: .horizontal)
         memLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        for v in [appIcon, appName, memLabel] as [NSView] {
+        for v in [appIcon, checkBox, appName, memLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -119,16 +129,25 @@ final class AppRowCell: NSTableCellView {
             appIcon.widthAnchor.constraint(equalToConstant: 28),
             appIcon.heightAnchor.constraint(equalToConstant: 28),
 
+            checkBox.leadingAnchor.constraint(equalTo: appIcon.trailingAnchor, constant: 10),
+            checkBox.centerYAnchor.constraint(equalTo: centerYAnchor),
+            checkBox.widthAnchor.constraint(equalToConstant: 14),
+            checkBox.heightAnchor.constraint(equalToConstant: 14),
+
             memLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             memLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             memLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
 
-            appName.leadingAnchor.constraint(equalTo: appIcon.trailingAnchor, constant: 10),
+            appName.leadingAnchor.constraint(equalTo: checkBox.trailingAnchor, constant: 8),
             appName.trailingAnchor.constraint(lessThanOrEqualTo: memLabel.leadingAnchor, constant: -8),
             appName.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func checkChanged() {
+        onCheckToggle?(checkBox.state == .on)
+    }
 }
 
 // MARK: - EmptyStateView
@@ -268,7 +287,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.3  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v1.4  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -432,9 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var hintLabel:   NSTextField?
 
     // Data
-    var allApps:      [AppEntry] = []
-    var filtered:     [AppEntry] = []
-    var sortByMemory: Bool       = false
+    var allApps:      [AppEntry]  = []
+    var filtered:     [AppEntry]  = []
+    var checkedPIDs:  Set<pid_t>  = []
+    var sortByMemory: Bool        = false
     var sortButton:   NSButton?
 
     // Carbon hot key
@@ -547,6 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func showOverlay() {
+        checkedPIDs.removeAll()
         refreshApps()
         if panel == nil { buildPanel() }
         searchField?.stringValue = ""
@@ -796,8 +817,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         filtered = query.isEmpty
             ? allApps
             : allApps.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        // Drop checked PIDs for apps that are no longer running
+        let alivePIDs = Set(allApps.map { $0.app.processIdentifier })
+        checkedPIDs   = checkedPIDs.intersection(alivePIDs)
         tableView?.reloadData()
-        if !filtered.isEmpty {
+        if !filtered.isEmpty && checkedPIDs.isEmpty {
             tableView?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
         updateEmptyState(query: query)
@@ -834,21 +858,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func updateHint() {
-        let sel = tableView?.selectedRowIndexes.count ?? 0
-        if sel > 1 {
-            hintLabel?.stringValue = "\(sel) apps selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
+        let checked = checkedPIDs.count
+        if checked > 0 {
+            let label = checked == 1 ? "1 checked" : "\(checked) checked"
+            hintLabel?.stringValue = "\(label)  ·  ↵ axe checked  ·  ⌘↵ force kill  ·  esc close"
         } else {
-            hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill  ·  ⌘A select all  ·  esc close"
+            let sel = tableView?.selectedRowIndexes.count ?? 0
+            if sel > 1 {
+                hintLabel?.stringValue = "\(sel) selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
+            } else {
+                hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill  ·  ⌘A select all  ·  esc close"
+            }
         }
     }
 
     // MARK: Kill logic
 
     func killSelected(force: Bool) {
-        let rows = tableView?.selectedRowIndexes ?? IndexSet()
-        guard !rows.isEmpty else { return }
-        let targets = rows.compactMap { filtered[safe: $0] }
-        confirmAndExecuteKill(targets: targets, force: force)
+        if !checkedPIDs.isEmpty {
+            // Checked boxes take priority over the table highlight
+            let targets = filtered.filter { checkedPIDs.contains($0.app.processIdentifier) }
+            confirmAndExecuteKill(targets: targets, force: force)
+        } else {
+            let rows = tableView?.selectedRowIndexes ?? IndexSet()
+            guard !rows.isEmpty else { return }
+            let targets = rows.compactMap { filtered[safe: $0] }
+            confirmAndExecuteKill(targets: targets, force: force)
+        }
     }
 
     // Shows a confirmation sheet when "Confirm before killing" is on, then kills.
@@ -950,9 +986,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let cell = tv.makeView(withIdentifier: id, owner: nil) as? AppRowCell
                    ?? { let c = AppRowCell(frame: .zero); c.identifier = id; return c }()
         let e = filtered[row]
+        let pid = e.app.processIdentifier
         cell.appName.stringValue  = e.name
         cell.appIcon.image        = e.icon
         cell.memLabel.stringValue = e.memMB.map { "\($0) MB" } ?? "—"
+        cell.checkBox.state       = checkedPIDs.contains(pid) ? .on : .off
+        cell.onCheckToggle = { [weak self] checked in
+            guard let self else { return }
+            if checked { self.checkedPIDs.insert(pid) }
+            else       { self.checkedPIDs.remove(pid) }
+            self.updateHint()
+        }
         return cell
     }
 
