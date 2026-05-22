@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.8.1"
+let appVersion = "1.9.0"
 
 // MARK: - Settings
 
@@ -48,6 +48,30 @@ struct AppSettings {
     static func setLaunchAtLogin(_ on: Bool) {
         guard #available(macOS 13.0, *) else { return }
         try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+    }
+    // Global hotkey stored as Carbon key code + Carbon modifier flags + display character
+    static var hotKeyCode: UInt32 {
+        get { d.object(forKey: "hotKeyCode") == nil ? UInt32(kVK_ANSI_A) : UInt32(d.integer(forKey: "hotKeyCode")) }
+        set { d.set(Int(newValue), forKey: "hotKeyCode") }
+    }
+    static var hotKeyMods: UInt32 {
+        get { d.object(forKey: "hotKeyMods") == nil ? UInt32(cmdKey) : UInt32(d.integer(forKey: "hotKeyMods")) }
+        set { d.set(Int(newValue), forKey: "hotKeyMods") }
+    }
+    static var hotKeyChar: String {
+        get { d.string(forKey: "hotKeyChar") ?? "A" }
+        set { d.set(newValue, forKey: "hotKeyChar") }
+    }
+    /// Human-readable shortcut string, e.g. "⌘A" or "⌥⇧B"
+    static func shortcutLabel() -> String {
+        var s = ""
+        let m = hotKeyMods
+        if m & UInt32(controlKey) != 0 { s += "⌃" }
+        if m & UInt32(optionKey)  != 0 { s += "⌥" }
+        if m & UInt32(shiftKey)   != 0 { s += "⇧" }
+        if m & UInt32(cmdKey)     != 0 { s += "⌘" }
+        s += hotKeyChar
+        return s
     }
 }
 
@@ -288,7 +312,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         ])
 
         addSection("Keyboard Shortcut", to: root, rows: [
-            labelRow("Open overlay", value: "⌘ A"),
+            shortcutRow(),
         ])
 
         // Bottom divider + version
@@ -393,6 +417,32 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         return row
     }
 
+    private func shortcutRow() -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        let lbl = NSTextField(labelWithString: "Open overlay")
+        lbl.font = .systemFont(ofSize: 13, weight: .regular)
+        lbl.textColor = .labelColor
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let sub = NSTextField(labelWithString: "Click to record a new shortcut")
+        sub.font = .systemFont(ofSize: 11); sub.textColor = .tertiaryLabelColor
+        sub.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let labelStack = NSStackView(views: [lbl, sub])
+        labelStack.orientation = .vertical; labelStack.spacing = 2; labelStack.alignment = .leading
+        let recorder = HotKeyRecorder()
+        recorder.onChange = { code, mods, char in
+            AppSettings.hotKeyCode = code
+            AppSettings.hotKeyMods = mods
+            AppSettings.hotKeyChar = char
+            (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+        }
+        recorder.translatesAutoresizingMaskIntoConstraints = false
+        recorder.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        row.addArrangedSubview(labelStack)
+        row.addArrangedSubview(recorder)
+        return row
+    }
+
     // Helper to wrap a view with padding
     private func padded(_ v: NSView, top: CGFloat = 0, left: CGFloat = 0,
                         bottom: CGFloat = 0, right: CGFloat = 0) -> NSView {
@@ -449,6 +499,86 @@ private final class PopupBox: NSView {
 
 private extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+// MARK: - HotKeyRecorder
+
+/// Converts AppKit modifier flags to the Carbon bitmask RegisterEventHotKey expects.
+private func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+    var r: UInt32 = 0
+    if flags.contains(.control) { r |= UInt32(controlKey) }
+    if flags.contains(.option)  { r |= UInt32(optionKey)  }
+    if flags.contains(.shift)   { r |= UInt32(shiftKey)   }
+    if flags.contains(.command) { r |= UInt32(cmdKey)     }
+    return r
+}
+
+/// A pill-shaped control that shows the current global shortcut and enters
+/// recording mode when clicked, capturing the next key+modifier combination.
+final class HotKeyRecorder: NSControl {
+    private var isRecording = false
+    /// Called with (carbonKeyCode, carbonModifiers, displayChar) when the user sets a new shortcut.
+    var onChange: ((UInt32, UInt32, String) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        isRecording = true; needsDisplay = true; return true
+    }
+    override func resignFirstResponder() -> Bool {
+        isRecording = false; needsDisplay = true
+        return super.resignFirstResponder()
+    }
+    override func mouseDown(with event: NSEvent) {
+        if isRecording { window?.makeFirstResponder(nil) }
+        else           { window?.makeFirstResponder(self) }
+    }
+    override func keyDown(with event: NSEvent) {
+        guard isRecording else { super.keyDown(with: event); return }
+        // Escape cancels recording
+        if event.keyCode == UInt16(kVK_Escape) { window?.makeFirstResponder(nil); return }
+        // Must include at least one modifier key
+        let usable: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        let flags = event.modifierFlags.intersection(usable)
+        guard !flags.isEmpty else { NSSound.beep(); return }
+        let char = event.charactersIgnoringModifiers?.uppercased() ?? "?"
+        onChange?(UInt32(event.keyCode), carbonModifiers(flags), char)
+        window?.makeFirstResponder(nil)
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 120, height: 28) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
+        if isRecording {
+            NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
+            NSColor.controlAccentColor.withAlphaComponent(0.8).setStroke()
+        } else {
+            NSColor.controlBackgroundColor.setFill()
+            NSColor.separatorColor.withAlphaComponent(0.9).setStroke()
+        }
+        path.fill(); path.lineWidth = 1; path.stroke()
+
+        let text = isRecording ? "Type shortcut…" : AppSettings.shortcutLabel()
+        let para = NSMutableParagraphStyle(); para.alignment = .center
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: isRecording ? .regular : .medium),
+            .foregroundColor: isRecording ? NSColor.tertiaryLabelColor : NSColor.labelColor,
+            .paragraphStyle: para,
+        ]
+        let str = NSAttributedString(string: text, attributes: attrs)
+        let sz  = str.size()
+        str.draw(at: NSPoint(x: (bounds.width - sz.width) / 2,
+                             y: (bounds.height - sz.height) / 2 + 1))
+    }
 }
 
 // MARK: - Session persistence
@@ -1080,14 +1210,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let id = EventHotKeyID(signature: fourCC("axe!"), id: 1)
         // ⌘A — when the overlay is already frontmost, hotkeyPressed() lets
         // the in-overlay selectAll: fire instead of toggling.
-        RegisterEventHotKey(UInt32(kVK_ANSI_A), UInt32(cmdKey),
+        RegisterEventHotKey(AppSettings.hotKeyCode, AppSettings.hotKeyMods,
+                            id, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    /// Unregisters the current hot key and registers a fresh one from AppSettings.
+    /// Call after the user changes the shortcut in Settings.
+    func reregisterHotKey() {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+        let id = EventHotKeyID(signature: fourCC("axe!"), id: 1)
+        RegisterEventHotKey(AppSettings.hotKeyCode, AppSettings.hotKeyMods,
                             id, GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
     // Called by the Carbon hot key. In spotlight mode, skip the toggle when
     // the panel is already key so ⌘A fires "select all" inside the search field.
     func hotkeyPressed() {
+        // Only suppress the toggle when the hotkey is ⌘A and spotlight is focused —
+        // that lets NSTextField fire "select all" instead of closing the overlay.
+        // For any other shortcut, always toggle so pressing the hotkey closes the overlay.
         if AppSettings.uiStyle == .spotlight,
+           AppSettings.hotKeyCode == UInt32(kVK_ANSI_A),
+           AppSettings.hotKeyMods == UInt32(cmdKey),
            let p = panel, p.isVisible, p.isKeyWindow { return }
         toggleOverlay()
     }
@@ -1650,7 +1794,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             if sel > 1 {
                 hintLabel?.stringValue = "\(sel) selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
             } else {
-                hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill  ·  ⌘A select all  ·  esc close"
+                let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
+                                   && AppSettings.hotKeyMods == UInt32(cmdKey)
+                let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
+                hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close"
             }
         }
     }
