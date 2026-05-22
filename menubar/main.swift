@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.0.0"
+let appVersion = "2.1.0"
 
 // MARK: - Settings
 
@@ -87,6 +87,34 @@ struct AppSettings {
     static var firstLaunchDate: Date {
         if let stored = d.object(forKey: "firstLaunchDate") as? Date { return stored }
         let now = Date(); d.set(now, forKey: "firstLaunchDate"); return now
+    }
+    /// Phrases the user has explicitly turned off. Stored as a JSON array of strings.
+    /// Unrecognised / new phrases are implicitly enabled (not in this set).
+    static var disabledKillPhrases: Set<String> {
+        get {
+            guard let data = d.data(forKey: "disabledKillPhrases"),
+                  let arr  = try? JSONDecoder().decode([String].self, from: data)
+            else { return [] }
+            return Set(arr)
+        }
+        set {
+            if let data = try? JSONEncoder().encode(Array(newValue)) {
+                d.set(data, forKey: "disabledKillPhrases")
+            }
+        }
+    }
+    static var disabledSparePhrases: Set<String> {
+        get {
+            guard let data = d.data(forKey: "disabledSparePhrases"),
+                  let arr  = try? JSONDecoder().decode([String].self, from: data)
+            else { return [] }
+            return Set(arr)
+        }
+        set {
+            if let data = try? JSONEncoder().encode(Array(newValue)) {
+                d.set(data, forKey: "disabledSparePhrases")
+            }
+        }
     }
 }
 
@@ -321,6 +349,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                       on: AppSettings.confirmKill) { AppSettings.confirmKill = $0 },
         ])
 
+        addSection("Phrases", to: root, rows: [
+            phraseRow(),
+        ])
+
         addSection("App List", to: root, rows: [
             toggleRow("Show background agents and helpers",
                       on: AppSettings.showBackground) { AppSettings.showBackground = $0 },
@@ -430,6 +462,34 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         val.textColor = .secondaryLabelColor
         row.addArrangedSubview(lbl); row.addArrangedSubview(val)
         return row
+    }
+
+    private var phrasesWindow: PhrasesWindow?
+
+    private func phraseRow() -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        let lbl = NSTextField(labelWithString: "Kill & spare phrases")
+        lbl.font = .systemFont(ofSize: 13, weight: .regular); lbl.textColor = .labelColor
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let killEnabled  = (NSApp.delegate as? AppDelegate)?.killPhrases.count ?? 0
+        let spareEnabled = (NSApp.delegate as? AppDelegate)?.sparePhrases.count ?? 0
+        let disabledKill  = AppSettings.disabledKillPhrases.count
+        let disabledSpare = AppSettings.disabledSparePhrases.count
+        let detail = NSTextField(labelWithString:
+            "\(killEnabled - disabledKill)/\(killEnabled) kill · \(spareEnabled - disabledSpare)/\(spareEnabled) spare")
+        detail.font = .systemFont(ofSize: 12); detail.textColor = .tertiaryLabelColor
+        let btn = NSButton(title: "Customise…", target: self, action: #selector(openPhrasesWindow))
+        btn.bezelStyle = .rounded
+        row.addArrangedSubview(lbl)
+        row.addArrangedSubview(detail)
+        row.addArrangedSubview(btn)
+        return row
+    }
+
+    @objc private func openPhrasesWindow() {
+        if phrasesWindow == nil { phrasesWindow = PhrasesWindow() }
+        phrasesWindow?.show()
     }
 
     private func shortcutRow() -> NSView {
@@ -663,6 +723,207 @@ final class RedButton: NSButton {
     // Keep intrinsic height tidy
     override var intrinsicContentSize: NSSize {
         var s = super.intrinsicContentSize; s.height = 26; return s
+    }
+}
+
+// MARK: - PhrasesWindow
+
+final class PhrasesWindow: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    private var seg: NSSegmentedControl?
+    private var killScroll:  NSScrollView?
+    private var spareScroll: NSScrollView?
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 520),
+                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        w.title = "Phrases"
+        w.minSize = NSSize(width: 360, height: 400)
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        buildUI(in: w)
+        window = w
+        w.center()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ n: Notification) { window = nil }
+
+    private func buildUI(in w: NSWindow) {
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 0; root.alignment = .leading
+        root.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
+
+        // ── Segmented switcher ────────────────────────────────────
+        let segCtrl = NSSegmentedControl(labels: [killSegLabel(), spareSegLabel()],
+                                          trackingMode: .selectOne,
+                                          target: self, action: #selector(segChanged(_:)))
+        segCtrl.selectedSegment = 0
+        seg = segCtrl
+        segCtrl.translatesAutoresizingMaskIntoConstraints = false
+        let segPad = NSView(); segPad.translatesAutoresizingMaskIntoConstraints = false
+        segPad.addSubview(segCtrl)
+        NSLayoutConstraint.activate([
+            segCtrl.topAnchor.constraint(equalTo: segPad.topAnchor, constant: 14),
+            segCtrl.bottomAnchor.constraint(equalTo: segPad.bottomAnchor, constant: -14),
+            segCtrl.centerXAnchor.constraint(equalTo: segPad.centerXAnchor),
+        ])
+        root.addArrangedSubview(segPad)
+        segPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let topDiv = NSBox(); topDiv.boxType = .separator
+        topDiv.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(topDiv)
+        topDiv.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Scroll views (one per tab) ─────────────────────────────
+        let killSV  = makeScrollView(phrases: killPhraseList(),  disabled: AppSettings.disabledKillPhrases,  isKill: true)
+        let spareSV = makeScrollView(phrases: sparePhraseList(), disabled: AppSettings.disabledSparePhrases, isKill: false)
+        spareSV.isHidden = true
+        killScroll  = killSV
+        spareScroll = spareSV
+        for sv in [killSV, spareSV] {
+            sv.translatesAutoresizingMaskIntoConstraints = false
+            root.addArrangedSubview(sv)
+            sv.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+
+        // ── Bottom toolbar ─────────────────────────────────────────
+        let botDiv = NSBox(); botDiv.boxType = .separator
+        botDiv.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(botDiv)
+        botDiv.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let selAll   = NSButton(title: "Select All",   target: self, action: #selector(selectAll))
+        let deselAll = NSButton(title: "Deselect All", target: self, action: #selector(deselectAll))
+        selAll.bezelStyle   = .inline
+        deselAll.bezelStyle = .inline
+        let botRow = NSStackView(views: [selAll, deselAll])
+        botRow.orientation = .horizontal; botRow.spacing = 10
+        botRow.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+        root.addArrangedSubview(botRow)
+        botRow.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+    }
+
+    // ── Phrase list data (mirrors AppDelegate arrays) ─────────────
+    private func killPhraseList() -> [String] {
+        return (NSApp.delegate as? AppDelegate)?.killPhrases ?? []
+    }
+    private func sparePhraseList() -> [String] {
+        return (NSApp.delegate as? AppDelegate)?.sparePhrases ?? []
+    }
+
+    private func makeScrollView(phrases: [String], disabled: Set<String>, isKill: Bool) -> NSScrollView {
+        let stack = NSStackView()
+        stack.orientation = .vertical; stack.spacing = 0; stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        for (i, phrase) in phrases.enumerated() {
+            let btn = NSButton()
+            btn.setButtonType(.switch)
+            btn.tag   = 42   // sentinel: identifies these as phrase-toggle checkboxes
+            btn.title = phrase
+            btn.state = disabled.contains(phrase) ? .off : .on
+            btn.font  = .systemFont(ofSize: 13)
+            btn.target = self
+            btn.action = isKill ? #selector(killCheckChanged(_:)) : #selector(spareCheckChanged(_:))
+            btn.translatesAutoresizingMaskIntoConstraints = false
+
+            let row = NSView(); row.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(btn)
+            NSLayoutConstraint.activate([
+                btn.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+                btn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+                btn.topAnchor.constraint(equalTo: row.topAnchor, constant: 7),
+                btn.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -7),
+            ])
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+            if i < phrases.count - 1 {
+                let sep = NSBox(); sep.boxType = .separator
+                sep.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(sep)
+                sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+            }
+        }
+
+        let sv = NSScrollView()
+        sv.documentView = stack
+        sv.hasVerticalScroller = true; sv.autohidesScrollers = true
+        sv.hasHorizontalScroller = false; sv.horizontalScrollElasticity = .none
+        sv.drawsBackground = false
+        // Make the stack fill the scroll view width
+        stack.widthAnchor.constraint(equalTo: sv.contentView.widthAnchor).isActive = true
+        return sv
+    }
+
+    // ── Actions ───────────────────────────────────────────────────
+    @objc private func segChanged(_ sender: NSSegmentedControl) {
+        killScroll?.isHidden  = sender.selectedSegment != 0
+        spareScroll?.isHidden = sender.selectedSegment != 1
+    }
+
+    @objc private func killCheckChanged(_ sender: NSButton) {
+        var dis = AppSettings.disabledKillPhrases
+        if sender.state == .on { dis.remove(sender.title) } else { dis.insert(sender.title) }
+        AppSettings.disabledKillPhrases = dis
+        seg?.setLabel(killSegLabel(), forSegment: 0)
+    }
+
+    @objc private func spareCheckChanged(_ sender: NSButton) {
+        var dis = AppSettings.disabledSparePhrases
+        if sender.state == .on { dis.remove(sender.title) } else { dis.insert(sender.title) }
+        AppSettings.disabledSparePhrases = dis
+        seg?.setLabel(spareSegLabel(), forSegment: 1)
+    }
+
+    @objc private func selectAll() {
+        setAll(enabled: true)
+    }
+    @objc private func deselectAll() {
+        setAll(enabled: false)
+    }
+
+    private func setAll(enabled: Bool) {
+        let isKill = seg?.selectedSegment == 0
+        let sv = isKill ? killScroll : spareScroll
+        guard let stack = (sv?.documentView as? NSStackView) else { return }
+        for view in stack.arrangedSubviews {
+            for sub in view.subviews {
+                if let btn = sub as? NSButton, btn.tag == 42 {
+                    btn.state = enabled ? .on : .off
+                }
+            }
+        }
+        if isKill {
+            AppSettings.disabledKillPhrases = enabled ? [] : Set(killPhraseList())
+            seg?.setLabel(killSegLabel(), forSegment: 0)
+        } else {
+            AppSettings.disabledSparePhrases = enabled ? [] : Set(sparePhraseList())
+            seg?.setLabel(spareSegLabel(), forSegment: 1)
+        }
+    }
+
+    // ── Segment label helpers (show enabled count) ─────────────────
+    private func killSegLabel() -> String {
+        let total   = killPhraseList().count
+        let enabled = total - AppSettings.disabledKillPhrases.count
+        return "Kill Phrases (\(enabled)/\(total))"
+    }
+    private func spareSegLabel() -> String {
+        let total   = sparePhraseList().count
+        let enabled = total - AppSettings.disabledSparePhrases.count
+        return "Spare Phrases (\(enabled)/\(total))"
     }
 }
 
@@ -1115,6 +1376,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // Rotating kill-button phrases — picked once on first checkbox tick, held until cleared
     var currentKillPhrase: String = ""
+    var enabledKillPhrases: [String] {
+        let dis = AppSettings.disabledKillPhrases
+        let enabled = killPhrases.filter { !dis.contains($0) }
+        return enabled.isEmpty ? killPhrases : enabled   // always keep at least one
+    }
+    var enabledSparePhrases: [String] {
+        let dis = AppSettings.disabledSparePhrases
+        let enabled = sparePhrases.filter { !dis.contains($0) }
+        return enabled.isEmpty ? sparePhrases : enabled
+    }
+
     let killPhrases: [String] = [
         "Dracarys",                            // GoT — Daenerys burns everything
         "Et tu, Brute?",                       // Shakespeare — Julius Caesar, stabbed
@@ -2050,7 +2322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if checked > 0 {
             // Pick a new phrase on the first tick; hold it while more boxes are added
             if currentKillPhrase.isEmpty {
-                currentKillPhrase = killPhrases.randomElement() ?? "Yeet"
+                currentKillPhrase = enabledKillPhrases.randomElement() ?? "Yeet"
             }
             let btnTitle = "\(currentKillPhrase) (\(checked))"
             axeCheckedButton?.attributedTitle = NSAttributedString(
@@ -2107,8 +2379,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             alert.messageText     = "Axe \(targets.count) apps?"
             alert.informativeText = "All \(targets.count) selected apps will be terminated."
         }
-        let yesPhrase = (killPhrases.randomElement()  ?? "Do it!")        + " (yes)"
-        let noPhrase  = (sparePhrases.randomElement() ?? "Spare them for now") + " (no)"
+        let yesPhrase = (enabledKillPhrases.randomElement()  ?? "Do it!")        + " (yes)"
+        let noPhrase  = (enabledSparePhrases.randomElement() ?? "Spare them for now") + " (no)"
         alert.addButton(withTitle: yesPhrase)   // .alertFirstButtonReturn  (right/default)
         alert.addButton(withTitle: noPhrase)    // .alertSecondButtonReturn (left/cancel)
         alert.alertStyle = .warning
