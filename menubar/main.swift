@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.8.0"
+let appVersion = "1.8.1"
 
 // MARK: - Settings
 
@@ -790,6 +790,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "One does not simply exist anymore",        // LOTR meme
         "Hit the road, Jack",                       // Ray Charles
         "Here, hold this hand grenade",             // classic cartoon gag
+        "Frankly, my dear, I don't give a damn",    // Gone with the Wind
+        "Cancel Culture",                           // very 2020s
+        "That's a wrap",                            // film set dismissal
+        "Pull the plug",                            // classic shutdown
+        "Done and dusted",                          // British finality
+        "You're fired!",                            // The Apprentice
+        "I think we should see other people",       // the soft kill
+        "Death before dishonor",                    // old soldier's creed
     ]
 
     let sparePhrases: [String] = [
