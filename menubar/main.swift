@@ -287,7 +287,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.4  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v1.4.1  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -493,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         menu.addItem(.separator())
         addItem(menu, "Settings…", key: ",", action: #selector(openSettings))
         menu.addItem(.separator())
-        addItem(menu, "Quit Axe", key: "q", action: #selector(NSApp.terminate(_:)))
+        addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         DispatchQueue.main.async { self.statusItem.menu = nil }
@@ -512,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Settings
 
     @objc func openSettings() { settingsWindow.show() }
+    @objc func quitAxe()      { NSApp.terminate(nil) }
 
     // MARK: Hot key (⌥⌘K)
 
