@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.6.1"
+let appVersion = "1.6.2"
 
 // MARK: - Settings
 
@@ -739,6 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "Bye bye bye",                              // NSYNC
         "One does not simply exist anymore",        // LOTR meme
         "Hit the road, Jack",                       // Ray Charles
+        "Here, hold this hand grenade",             // classic cartoon gag
     ]
 
     // Carbon hot key
