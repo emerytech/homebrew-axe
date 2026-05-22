@@ -2,7 +2,7 @@ class Axe < Formula
   desc "Spotlight-style overlay to quickly kill running macOS apps (⌥⌘K)"
   homepage "https://github.com/emerytech/homebrew-axe"
   url "https://github.com/emerytech/homebrew-axe/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "REPLACE_WITH_SHA256"
+  sha256 "171712953da81d26035dcbc6a6a86e1bec47812d5630552a9da8e5369e1ff30c"
   license "MIT"
 
   depends_on :macos
