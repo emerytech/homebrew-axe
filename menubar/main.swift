@@ -792,7 +792,17 @@ final class SessionManager {
     }
 
     func restore(_ session: AppSession) {
+        let runningApps = NSWorkspace.shared.runningApplications
         for app in session.apps {
+            // If already running, bring it to front
+            if let running = runningApps.first(where: { $0.bundleIdentifier == app.bundleID }) {
+                if #available(macOS 14.0, *) {
+                    running.activate()
+                } else {
+                    running.activate(options: [.activateIgnoringOtherApps])
+                }
+                continue
+            }
             guard let url = NSWorkspace.shared.urlForApplication(
                 withBundleIdentifier: app.bundleID) else { continue }
             let cfg = NSWorkspace.OpenConfiguration()
@@ -2480,8 +2490,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         pendingSpaceRestoreSession = nil
         spaceRestoreHUD?.dismiss()
         spaceRestoreHUD = nil
-        // Small delay so the Space animation finishes before apps launch
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+
+        // Terminate any running copies so they relaunch fresh on this new Space
+        let runningApps = NSWorkspace.shared.runningApplications
+        let hadRunning = session.apps.compactMap { app in
+            runningApps.first(where: { $0.bundleIdentifier == app.bundleID })
+        }
+        hadRunning.forEach { $0.terminate() }
+
+        // Wait long enough for apps to quit, then launch everything on the new Space
+        let delay: Double = hadRunning.isEmpty ? 0.4 : 1.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             SessionManager.shared.restore(session)
         }
     }
