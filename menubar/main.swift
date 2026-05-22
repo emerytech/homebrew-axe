@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.9.0"
+let appVersion = "2.0.0"
 
 // MARK: - Settings
 
@@ -72,6 +72,21 @@ struct AppSettings {
         if m & UInt32(cmdKey)     != 0 { s += "⌘" }
         s += hotKeyChar
         return s
+    }
+    /// Whether the user has entered a valid license key — stops nudge reminders.
+    static var isLicensed: Bool {
+        get { d.bool(forKey: "isLicensed") }
+        set { d.set(newValue, forKey: "isLicensed") }
+    }
+    /// When the support nudge was last shown.
+    static var lastNudgeDate: Date? {
+        get { d.object(forKey: "lastNudgeDate") as? Date }
+        set { d.set(newValue, forKey: "lastNudgeDate") }
+    }
+    /// First-ever launch date — used to delay the first nudge by 24 h.
+    static var firstLaunchDate: Date {
+        if let stored = d.object(forKey: "firstLaunchDate") as? Date { return stored }
+        let now = Date(); d.set(now, forKey: "firstLaunchDate"); return now
     }
 }
 
@@ -651,6 +666,222 @@ final class RedButton: NSButton {
     }
 }
 
+// MARK: - NudgeWindow  (support reminder — shown every 6 h, stops once licensed)
+
+final class NudgeWindow: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+
+    // ── TODO: replace with your Lemon Squeezy checkout URL once your product is live
+    static let purchaseURL = "https://axe-app.com/#pricing"
+
+    func show() {
+        AppSettings.lastNudgeDate = Date()
+        if let w = window { w.makeKeyAndOrderFront(nil); return }
+        let W: CGFloat = 360
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 0),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = ""; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+        w.delegate = self
+        buildUI(in: w, width: W)
+        window = w
+        // Position bottom-right of screen like a notification
+        if let screen = NSScreen.main {
+            let sf = screen.visibleFrame
+            w.setFrameOrigin(NSPoint(x: sf.maxX - W - 20, y: sf.minY + 20))
+        } else { w.center() }
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ n: Notification) { window = nil }
+
+    private var keyField:    NSTextField?
+    private var statusLabel: NSTextField?
+    private var activateBtn: NSButton?
+    private var keyStack:    NSView?
+
+    private func buildUI(in w: NSWindow, width W: CGFloat) {
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 0; root.alignment = .centerX
+        root.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
+
+        // ── Heart + headline ─────────────────────────────────────
+        let heart = NSTextField(labelWithString: "♥")
+        heart.font = .systemFont(ofSize: 28); heart.textColor = .systemRed
+        heart.alignment = .center
+
+        let headline = NSTextField(labelWithString: "Enjoying Axe?")
+        headline.font = .systemFont(ofSize: 16, weight: .semibold); headline.alignment = .center
+
+        let body = NSTextField(labelWithString:
+            "Axe is free to keep. If it's been saving you time,\na small tip keeps the blade sharp. ⚔️")
+        body.font = .systemFont(ofSize: 12, weight: .regular)
+        body.textColor = .secondaryLabelColor; body.alignment = .center
+        body.lineBreakMode = .byWordWrapping
+
+        let topStack = NSStackView(views: [heart, headline, body])
+        topStack.orientation = .vertical; topStack.spacing = 6; topStack.alignment = .centerX
+        let topPad = padded(topStack, top: 24, left: 20, bottom: 16, right: 20)
+        root.addArrangedSubview(topPad)
+        topPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Buy + dismiss buttons ─────────────────────────────────
+        let buyBtn = NSButton(title: "Buy Axe →", target: self, action: #selector(buyTapped))
+        buyBtn.bezelStyle = .rounded; buyBtn.keyEquivalent = "\r"
+        let laterBtn = NSButton(title: "Maybe Later", target: self, action: #selector(laterTapped))
+        laterBtn.bezelStyle = .inline
+
+        let btnRow = NSStackView(views: [buyBtn, laterBtn])
+        btnRow.orientation = .horizontal; btnRow.spacing = 10; btnRow.alignment = .centerY
+        let btnPad = padded(btnRow, top: 0, left: 20, bottom: 14, right: 20)
+        root.addArrangedSubview(btnPad)
+        btnPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Divider + license key section ─────────────────────────
+        let div = NSBox(); div.boxType = .separator
+        div.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(div)
+        div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let alreadyBtn = NSButton(title: "Already bought? Enter your key →",
+                                  target: self, action: #selector(toggleKeyEntry))
+        alreadyBtn.bezelStyle = .inline; alreadyBtn.isBordered = false
+        alreadyBtn.font = .systemFont(ofSize: 11); alreadyBtn.contentTintColor = .tertiaryLabelColor
+
+        let field = NSTextField()
+        field.placeholderString = "XXXX-XXXX-XXXX-XXXX"
+        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.alignment = .center; field.bezelStyle = .roundedBezel; field.focusRingType = .none
+        keyField = field
+
+        let actBtn = NSButton(title: "Activate", target: self, action: #selector(activateTapped))
+        actBtn.bezelStyle = .rounded
+        activateBtn = actBtn
+
+        let statusLbl = NSTextField(labelWithString: "")
+        statusLbl.font = .systemFont(ofSize: 11); statusLbl.alignment = .center
+        statusLbl.textColor = .systemRed; statusLbl.lineBreakMode = .byWordWrapping
+        statusLabel = statusLbl
+
+        let kStack = NSStackView(views: [field, actBtn, statusLbl])
+        kStack.orientation = .vertical; kStack.spacing = 8; kStack.alignment = .centerX
+        kStack.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 20)
+        field.widthAnchor.constraint(equalTo: kStack.widthAnchor, constant: -40).isActive = true
+        kStack.isHidden = true
+        keyStack = kStack
+
+        let bottomStack = NSStackView(views: [alreadyBtn, kStack])
+        bottomStack.orientation = .vertical; bottomStack.spacing = 8; bottomStack.alignment = .centerX
+        bottomStack.edgeInsets = NSEdgeInsets(top: 10, left: 0, bottom: 16, right: 0)
+        root.addArrangedSubview(bottomStack)
+        bottomStack.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        w.contentView?.layoutSubtreeIfNeeded()
+        let h = root.fittingSize.height
+        var f = w.frame; f.size.height = h + 28
+        w.setFrame(f, display: false)
+    }
+
+    @objc private func buyTapped() {
+        NSWorkspace.shared.open(URL(string: NudgeWindow.purchaseURL)!)
+        window?.close()
+    }
+
+    @objc private func laterTapped() { window?.close() }
+
+    @objc private func toggleKeyEntry() {
+        guard let ks = keyStack, let w = window else { return }
+        let wasHidden = ks.isHidden
+        ks.isHidden = !wasHidden
+        // Resize window to fit new content
+        w.contentView?.layoutSubtreeIfNeeded()
+        if let root = w.contentView?.subviews.first as? NSStackView {
+            let h = root.fittingSize.height
+            var f = w.frame
+            let delta = (h + 28) - f.height
+            f.size.height += delta
+            f.origin.y    -= delta   // grow upward
+            w.setFrame(f, display: true, animate: true)
+        }
+        if wasHidden { w.makeFirstResponder(keyField) }
+    }
+
+    @objc private func activateTapped() {
+        let raw = keyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty else {
+            statusLabel?.textColor = .systemOrange
+            statusLabel?.stringValue = "Enter a license key above."; return
+        }
+        activateBtn?.isEnabled = false
+        statusLabel?.textColor = .secondaryLabelColor; statusLabel?.stringValue = "Validating…"
+
+        // Validate against Lemon Squeezy
+        // TODO: once your LS product is live this will work automatically.
+        guard let url = URL(string: "https://api.lemonsqueezy.com/v1/licenses/activate") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "license_key": raw,
+            "instance_name": Host.current().localizedName ?? "Mac",
+        ])
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.statusLabel?.textColor = .systemRed
+                    self?.statusLabel?.stringValue = "Network error: \(error.localizedDescription)"
+                    self?.activateBtn?.isEnabled = true; return
+                }
+                guard let data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else {
+                    self?.statusLabel?.textColor = .systemRed
+                    self?.statusLabel?.stringValue = "Couldn't read response."
+                    self?.activateBtn?.isEnabled = true; return
+                }
+                if let msg = json["error"] as? String, !msg.isEmpty {
+                    self?.statusLabel?.textColor = .systemRed
+                    self?.statusLabel?.stringValue = msg
+                    self?.activateBtn?.isEnabled = true; return
+                }
+                if json["activated"] as? Bool == true {
+                    AppSettings.isLicensed = true
+                    self?.statusLabel?.textColor = .systemGreen
+                    self?.statusLabel?.stringValue = "✓ Activated — thank you! 🪓"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.window?.close() }
+                } else {
+                    self?.statusLabel?.textColor = .systemRed
+                    self?.statusLabel?.stringValue = "License key not found."
+                    self?.activateBtn?.isEnabled = true
+                }
+            }
+        }.resume()
+    }
+
+    private func padded(_ v: NSView, top: CGFloat = 0, left: CGFloat = 0,
+                        bottom: CGFloat = 0, right: CGFloat = 0) -> NSView {
+        let wrap = NSView(); wrap.translatesAutoresizingMaskIntoConstraints = false
+        v.translatesAutoresizingMaskIntoConstraints = false; wrap.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: wrap.topAnchor, constant: top),
+            v.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: left),
+            v.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -right),
+            v.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -bottom),
+        ])
+        return wrap
+    }
+}
+
 // MARK: - OnboardingWindow
 
 final class OnboardingWindow: NSObject, NSWindowDelegate {
@@ -960,9 +1191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
 
-    // Settings / Onboarding
-    let settingsWindow  = SettingsWindow()
+    // Settings / Onboarding / Nudge
+    let settingsWindow   = SettingsWindow()
     let onboardingWindow = OnboardingWindow()
+    let nudgeWindow      = NudgeWindow()
+    private var nudgeTimer: Timer?
 
     // MARK: Launch
 
@@ -977,6 +1210,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 self.onboardingWindow.show()
             }
         }
+        // Support nudge — show every 6 hours, skip first 24 h and if already licensed
+        _ = AppSettings.firstLaunchDate   // ensures first-launch date is recorded
+        startNudgeTimer()
+
         // Silent background update check
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
             self.checkForUpdates(userInitiated: false)
@@ -1042,6 +1279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         menu.addItem(sessionsItem)
 
         menu.addItem(.separator())
+        if AppSettings.isLicensed {
+            let li = NSMenuItem(title: "Licensed — Thanks! ✦", action: nil, keyEquivalent: "")
+            li.isEnabled = false; menu.addItem(li)
+        } else {
+            addItem(menu, "Support Axe ♥", key: "", action: #selector(showNudgeWindow))
+        }
+        menu.addItem(.separator())
         addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
         addItem(menu, "Quick Start Guide…",  key: "",  action: #selector(showOnboarding))
         addItem(menu, "Check for Updates…",  key: "",  action: #selector(checkForUpdatesMI))
@@ -1067,6 +1311,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func openSettings()   { settingsWindow.show() }
     @objc func showOnboarding() { onboardingWindow.show() }
     @objc func quitAxe()        { NSApp.terminate(nil) }
+    @objc func showNudgeWindow() { nudgeWindow.show() }
+
+    // MARK: Support nudge timer
+
+    private let nudgeIntervalHours: Double = 6
+
+    func startNudgeTimer() {
+        nudgeTimer?.invalidate()
+        let interval = nudgeIntervalHours * 3600
+        // Check once at launch (after a short delay so the app is fully set up)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.showNudgeIfNeeded() }
+        // Then fire every 6 hours while the app stays running
+        nudgeTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.showNudgeIfNeeded()
+        }
+    }
+
+    func showNudgeIfNeeded() {
+        guard !AppSettings.isLicensed else { return }
+        // Don't nudge within the first 24 hours
+        let hoursSinceLaunch = Date().timeIntervalSince(AppSettings.firstLaunchDate) / 3600
+        guard hoursSinceLaunch >= 24 else { return }
+        // Don't nudge if we showed one less than nudgeIntervalHours ago
+        if let last = AppSettings.lastNudgeDate {
+            let hoursSinceLast = Date().timeIntervalSince(last) / 3600
+            guard hoursSinceLast >= nudgeIntervalHours else { return }
+        }
+        nudgeWindow.show()
+    }
 
     // MARK: Update checker
 
