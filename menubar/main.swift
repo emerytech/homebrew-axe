@@ -1857,8 +1857,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var sortButton:       NSButton?
     var axeCheckedButton: NSButton?
 
-    // Rotating kill-button phrases — picked once on first checkbox tick, held until cleared
+    // Rotating kill-button phrases — picked randomly on first checkbox tick,
+    // then cycled automatically every 10 s while apps remain selected.
     var currentKillPhrase: String = ""
+    var phraseIndex:       Int    = 0
+    var phraseTimer:       Timer?
 
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
     var pendingSpaceRestoreSession: AppSession?
@@ -2837,6 +2840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if let built = lastBuiltStyle, built != AppSettings.uiStyle { teardownOverlay() }
 
         checkedPIDs.removeAll()
+        stopPhraseCycling()
         currentKillPhrase = ""
         isShowingSessions = false
         refreshApps()
@@ -3385,9 +3389,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func updateHint() {
         let checked = checkedPIDs.count
         if checked > 0 {
-            // Pick a new phrase on the first tick; hold it while more boxes are added
+            // Pick a random phrase on the first tick, then let the timer cycle it
             if currentKillPhrase.isEmpty {
-                currentKillPhrase = enabledKillPhrases.randomElement() ?? "Yeet"
+                let phrases = enabledKillPhrases
+                phraseIndex = Int.random(in: 0..<max(1, phrases.count))
+                currentKillPhrase = phrases[safe: phraseIndex] ?? "Yeet"
+                startPhraseCycling()
             }
             let btnTitle = "\(currentKillPhrase) (\(checked))"
             axeCheckedButton?.attributedTitle = NSAttributedString(
@@ -3397,6 +3404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             axeCheckedButton?.isHidden = false
             hintLabel?.isHidden = true
         } else {
+            stopPhraseCycling()
             currentKillPhrase = ""   // reset so next session gets a fresh phrase
             axeCheckedButton?.isHidden = true
             hintLabel?.isHidden = false
@@ -3414,6 +3422,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
             }
         }
+    }
+
+    // MARK: Phrase cycling
+
+    private func startPhraseCycling() {
+        phraseTimer?.invalidate()
+        guard enabledKillPhrases.count > 1 else { return }   // nothing to cycle to
+        phraseTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.cycleKillPhrase()
+        }
+    }
+
+    private func stopPhraseCycling() {
+        phraseTimer?.invalidate()
+        phraseTimer = nil
+        phraseIndex = 0
+    }
+
+    @objc private func cycleKillPhrase() {
+        let phrases = enabledKillPhrases
+        guard phrases.count > 1 else { return }
+        phraseIndex = (phraseIndex + 1) % phrases.count
+        currentKillPhrase = phrases[phraseIndex]
+        updateHint()
     }
 
     // MARK: Kill logic
