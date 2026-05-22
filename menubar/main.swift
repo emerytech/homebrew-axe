@@ -132,6 +132,17 @@ struct AppSettings {
             }
         }
     }
+    /// Version the user clicked "Later" on — skip re-prompting for the same version.
+    static var dismissedUpdateVersion: String? {
+        get { d.string(forKey: "dismissedUpdateVersion") }
+        set { if let v = newValue { d.set(v, forKey: "dismissedUpdateVersion") }
+              else { d.removeObject(forKey: "dismissedUpdateVersion") } }
+    }
+    /// Timestamp of the last automatic (background) update check.
+    static var lastAutoUpdateCheck: Date? {
+        get { d.object(forKey: "lastAutoUpdateCheck") as? Date }
+        set { d.set(newValue, forKey: "lastAutoUpdateCheck") }
+    }
 }
 
 // MARK: - HotKey (Carbon — no Accessibility permission required)
@@ -1128,6 +1139,182 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
     @objc private func cancelTapped() { onCancel?(); onCancel = nil; dismiss() }
 }
 
+// MARK: - UpdateWindow
+
+final class UpdateWindow: NSObject, NSWindowDelegate {
+    private var window:   NSWindow?
+    private weak var brewBtn: NSButton?
+    private let latestVersion: String
+    private let releaseNotes:  String
+
+    init(latestVersion: String, releaseNotes: String) {
+        self.latestVersion = latestVersion
+        self.releaseNotes  = releaseNotes
+    }
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); bringToFront(); return }
+        let W: CGFloat = 460
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: W, height: 400),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        w.title = "Axe \(latestVersion) Available"
+        w.isReleasedWhenClosed = false
+        w.minSize = NSSize(width: 400, height: 300)
+        w.delegate = self
+        buildUI(in: w, width: W)
+        window = w
+        w.center()
+        w.makeKeyAndOrderFront(nil)
+        bringToFront()
+    }
+
+    private func bringToFront() {
+        if #available(macOS 14.0, *) { NSApp.activate() }
+        else { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    func windowWillClose(_ n: Notification) { window = nil }
+
+    private func buildUI(in w: NSWindow, width W: CGFloat) {
+        guard let cv = w.contentView else { return }
+
+        // ── App icon + title row ────────────────────────────────────
+        let iconView = NSImageView()
+        iconView.image = NSApp.applicationIconImage
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            iconView.widthAnchor.constraint(equalToConstant: 52),
+            iconView.heightAnchor.constraint(equalToConstant: 52),
+        ])
+
+        let titleLbl = NSTextField(labelWithString: "Axe \(latestVersion) is available")
+        titleLbl.font = .systemFont(ofSize: 14, weight: .semibold)
+
+        let subLbl = NSTextField(labelWithString: "You have version \(appVersion).")
+        subLbl.font = .systemFont(ofSize: 12)
+        subLbl.textColor = .secondaryLabelColor
+
+        let textStack = NSStackView(views: [titleLbl, subLbl])
+        textStack.orientation = .vertical
+        textStack.alignment   = .leading
+        textStack.spacing     = 3
+
+        let headerRow = NSStackView(views: [iconView, textStack])
+        headerRow.orientation = .horizontal
+        headerRow.alignment   = .centerY
+        headerRow.spacing     = 14
+
+        // ── "What's New" label ──────────────────────────────────────
+        let notesHdr = NSTextField(labelWithString: "WHAT'S NEW")
+        notesHdr.font = .systemFont(ofSize: 10, weight: .semibold)
+        notesHdr.textColor = .tertiaryLabelColor
+
+        // ── Notes text view inside a scroll view ────────────────────
+        let tv = NSTextView()
+        tv.isEditable   = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainerInset = NSSize(width: 0, height: 2)
+
+        // Render GitHub Markdown on macOS 12+, else strip symbols
+        if #available(macOS 12.0, *),
+           let attrStr = try? AttributedString(
+               markdown: releaseNotes,
+               options: AttributedString.MarkdownParsingOptions(
+                   interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+            let nsBase = NSAttributedString(attrStr)
+            let nsAttr = NSMutableAttributedString(attributedString: nsBase)
+            let fullRange = NSRange(location: 0, length: nsAttr.length)
+            // Apply base font only where the markdown parser didn't set one
+            nsAttr.enumerateAttribute(NSAttributedString.Key.font, in: fullRange) { val, range, _ in
+                if val == nil {
+                    nsAttr.addAttribute(NSAttributedString.Key.font,
+                                        value: NSFont.systemFont(ofSize: 12.5), range: range)
+                }
+            }
+            tv.textStorage?.setAttributedString(nsAttr)
+        } else {
+            let plain = releaseNotes
+                .replacingOccurrences(of: #"#{1,6} ?"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: "**", with: "")
+                .replacingOccurrences(of: "__", with: "")
+            tv.string = plain
+            tv.font   = .systemFont(ofSize: 12.5)
+        }
+
+        let sv = NSScrollView()
+        sv.documentView          = tv
+        sv.hasVerticalScroller   = true
+        sv.hasHorizontalScroller = false
+        sv.autohidesScrollers    = true
+        sv.borderType            = .bezelBorder
+        sv.translatesAutoresizingMaskIntoConstraints = false
+
+        // ── Button row ──────────────────────────────────────────────
+        let laterBtn = NSButton(title: "Later", target: self, action: #selector(laterTapped))
+        laterBtn.bezelStyle = .rounded
+
+        let dmgBtn = NSButton(title: "Download DMG", target: self, action: #selector(dmgTapped))
+        dmgBtn.bezelStyle = .rounded
+
+        let brewBtn = NSButton(title: "Update with Homebrew", target: self, action: #selector(brewTapped))
+        brewBtn.bezelStyle    = .rounded
+        brewBtn.keyEquivalent = "\r"
+        self.brewBtn = brewBtn
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let btnRow = NSStackView(views: [laterBtn, spacer, dmgBtn, brewBtn])
+        btnRow.orientation = .horizontal
+        btnRow.spacing     = 8
+
+        // ── Root stack ──────────────────────────────────────────────
+        let root = NSStackView(views: [headerRow, notesHdr, sv, btnRow])
+        root.orientation = .vertical
+        root.alignment   = .leading
+        root.spacing     = 10
+        root.edgeInsets  = NSEdgeInsets(top: 28, left: 20, bottom: 16, right: 20)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(root)
+
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: cv.topAnchor),
+            root.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            sv.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -40),
+            btnRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -40),
+            // Give the scroll view most of the vertical space
+            sv.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+        ])
+    }
+
+    @objc private func laterTapped() {
+        AppSettings.dismissedUpdateVersion = latestVersion
+        window?.close()
+    }
+
+    @objc private func dmgTapped() {
+        NSWorkspace.shared.open(
+            URL(string: "https://github.com/emerytech/homebrew-axe/releases/latest/download/Axe.dmg")!)
+        window?.close()
+    }
+
+    @objc private func brewTapped() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("brew upgrade emerytech/axe/axe", forType: .string)
+        brewBtn?.title = "Copied ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.brewBtn?.title = "Update with Homebrew"
+        }
+    }
+}
+
 // MARK: - NudgeWindow
 
 final class NudgeWindow: NSObject, NSWindowDelegate {
@@ -1634,6 +1821,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
     var pendingSpaceRestoreSession: AppSession?
     var spaceRestoreHUD: SpaceRestoreHUD?
+    var updateWindow: UpdateWindow?
     var enabledKillPhrases: [String] {
         let dis = AppSettings.disabledKillPhrases
         let enabled = killPhrases.filter { !dis.contains($0) }
@@ -1937,15 +2125,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func checkForUpdatesMI() { checkForUpdates(userInitiated: true) }
 
     func checkForUpdates(userInitiated: Bool) {
+        // Auto-checks run at most once every 24 hours
+        if !userInitiated {
+            if let last = AppSettings.lastAutoUpdateCheck,
+               Date().timeIntervalSince(last) < 86_400 { return }
+            AppSettings.lastAutoUpdateCheck = Date()
+        }
+
         guard let url = URL(string:
             "https://api.github.com/repos/emerytech/homebrew-axe/releases/latest") else { return }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
             DispatchQueue.main.async {
                 guard let data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let tag  = json["tag_name"] as? String else {
+                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag   = json["tag_name"] as? String else {
                     if userInitiated {
                         let a = NSAlert()
                         a.messageText     = "Couldn't check for updates"
@@ -1955,12 +2150,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                     return
                 }
                 let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
-                self?.handleUpdateResult(latest: latest, userInitiated: userInitiated)
+                let notes  = (json["body"] as? String) ?? ""
+                self?.handleUpdateResult(latest: latest, notes: notes, userInitiated: userInitiated)
             }
         }.resume()
     }
 
-    private func handleUpdateResult(latest: String, userInitiated: Bool) {
+    private func handleUpdateResult(latest: String, notes: String, userInitiated: Bool) {
         guard isNewerVersion(latest, than: appVersion) else {
             if userInitiated {
                 let a = NSAlert()
@@ -1971,15 +2167,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             }
             return
         }
-        let a = NSAlert()
-        a.messageText     = "Axe \(latest) is available"
-        a.informativeText = "You're running v\(appVersion). Run the command below in Terminal to update."
-        a.addButton(withTitle: "Copy Upgrade Command")
-        a.addButton(withTitle: "Later")
-        if a.runModal() == .alertFirstButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("brew upgrade emerytech/axe/axe", forType: .string)
-        }
+        // For background checks, skip if the user already dismissed this version
+        if !userInitiated, AppSettings.dismissedUpdateVersion == latest { return }
+
+        let win = UpdateWindow(latestVersion: latest, releaseNotes: notes)
+        updateWindow = win
+        win.show()
     }
 
     private func isNewerVersion(_ a: String, than b: String) -> Bool {
