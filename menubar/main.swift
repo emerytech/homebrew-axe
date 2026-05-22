@@ -287,7 +287,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.4.1  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v1.4.2  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -453,9 +453,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Data
     var allApps:      [AppEntry]  = []
     var filtered:     [AppEntry]  = []
-    var checkedPIDs:  Set<pid_t>  = []
-    var sortByMemory: Bool        = false
-    var sortButton:   NSButton?
+    var checkedPIDs:      Set<pid_t>  = []
+    var sortByMemory:     Bool        = false
+    var sortButton:       NSButton?
+    var axeCheckedButton: NSButton?
 
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
@@ -775,6 +776,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(hint)
         hintLabel = hint
 
+        // "Axe X Apps" button — shown in place of the hint text when boxes are checked
+        let axeBtn = NSButton()
+        axeBtn.bezelStyle  = .rounded
+        axeBtn.isBordered  = true
+        axeBtn.title       = ""
+        axeBtn.font        = .systemFont(ofSize: 12, weight: .medium)
+        axeBtn.contentTintColor = .white
+        if let cell = axeBtn.cell as? NSButtonCell {
+            cell.backgroundColor = NSColor.systemRed
+        }
+        axeBtn.target  = self
+        axeBtn.action  = #selector(axeCheckedApps)
+        axeBtn.isHidden = true
+        axeBtn.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(axeBtn)
+        axeCheckedButton = axeBtn
+
         NSLayoutConstraint.activate([
             botDiv.topAnchor.constraint(equalTo: sv.bottomAnchor),
             botDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
@@ -784,6 +802,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
             hint.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
             hint.heightAnchor.constraint(equalToConstant: hintH),
+            axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: bg.trailingAnchor, constant: -16),
         ])
 
         panel = p
@@ -839,6 +861,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         searchField?.placeholderString = n == 1 ? "1 app running…" : "\(n) apps running…"
     }
 
+    @objc func axeCheckedApps() { killSelected(force: false) }
+
     @objc func toggleSort() {
         sortByMemory.toggle()
         let imgName = sortByMemory ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down"
@@ -861,9 +885,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func updateHint() {
         let checked = checkedPIDs.count
         if checked > 0 {
-            let label = checked == 1 ? "1 checked" : "\(checked) checked"
-            hintLabel?.stringValue = "\(label)  ·  ↵ axe checked  ·  ⌘↵ force kill  ·  esc close"
+            // Show the prominent action button; hide the keyboard-shortcut label
+            let n = checked == 1 ? "1 App" : "\(checked) Apps"
+            axeCheckedButton?.title = "Off with their heads!  (\(n))"
+            axeCheckedButton?.isHidden = false
+            hintLabel?.isHidden = true
         } else {
+            axeCheckedButton?.isHidden = true
+            hintLabel?.isHidden = false
             let sel = tableView?.selectedRowIndexes.count ?? 0
             if sel > 1 {
                 hintLabel?.stringValue = "\(sel) selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
