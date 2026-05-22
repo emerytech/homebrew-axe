@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.5.3"
+let appVersion = "1.6.0"
 
 // MARK: - Settings
 
@@ -436,6 +436,56 @@ private extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
 }
 
+// MARK: - Session persistence
+
+struct SavedApp: Codable {
+    let bundleID: String
+    let name:     String
+}
+
+struct AppSession: Codable {
+    let id:   UUID
+    var name: String
+    let date: Date
+    let apps: [SavedApp]
+}
+
+final class SessionManager {
+    static let shared = SessionManager()
+    private let key = "savedSessions"
+    private let max = 10
+
+    var all: [AppSession] {
+        get {
+            guard let d = UserDefaults.standard.data(forKey: key),
+                  let s = try? JSONDecoder().decode([AppSession].self, from: d) else { return [] }
+            return s
+        }
+        set {
+            if let d = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(d, forKey: key)
+            }
+        }
+    }
+
+    func save(_ session: AppSession) {
+        var s = all; s.insert(session, at: 0)
+        all = Array(s.prefix(max))
+    }
+
+    func delete(id: UUID) { all = all.filter { $0.id != id } }
+
+    func restore(_ session: AppSession) {
+        for app in session.apps {
+            guard let url = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: app.bundleID) else { continue }
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.activates = false
+            NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+        }
+    }
+}
+
 // MARK: - RedButton (reliable coloured background via layer)
 
 /// NSButton subclass that draws a solid coloured rounded background via Core Animation.
@@ -675,6 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "I am become Death",                   // Oppenheimer / Bhagavad Gita
         "He's dead, Jim",                      // Star Trek
         "I am inevitable",                     // Avengers: Endgame — Thanos
+        "Sick of these MFN apps on my MFN Mac", // Snakes on a Plane
     ]
 
     // Carbon hot key
@@ -722,6 +773,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func showStatusMenu() {
         let menu = NSMenu()
         addItem(menu, "Show Axe", key: "", tip: "⌘A", action: #selector(toggleOverlay))
+        menu.addItem(.separator())
+
+        // Sessions submenu
+        let sessionsItem = NSMenuItem(title: "Sessions", action: nil, keyEquivalent: "")
+        let sessionsSub  = NSMenu()
+        let saved = SessionManager.shared.all
+        if saved.isEmpty {
+            let empty = NSMenuItem(title: "No saved sessions", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sessionsSub.addItem(empty)
+        } else {
+            for session in saved {
+                let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short
+                let sub    = NSMenu()
+                let title  = "\(session.name)  ·  \(df.string(from: session.date))"
+                let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                let restore = NSMenuItem(title: "↩  Restore \(session.apps.count) apps",
+                                         action: #selector(restoreSessionMI(_:)),
+                                         keyEquivalent: "")
+                restore.target       = self
+                restore.representedObject = session.id.uuidString
+                let delete = NSMenuItem(title: "🗑  Delete",
+                                        action: #selector(deleteSessionMI(_:)),
+                                        keyEquivalent: "")
+                delete.target        = self
+                delete.representedObject = session.id.uuidString
+                sub.addItem(restore); sub.addItem(.separator()); sub.addItem(delete)
+                parent.submenu = sub
+                sessionsSub.addItem(parent)
+            }
+        }
+        sessionsSub.addItem(.separator())
+        let saveItem = NSMenuItem(title: "Save Current Session…",
+                                  action: #selector(saveSessionMI), keyEquivalent: "")
+        saveItem.target = self
+        sessionsSub.addItem(saveItem)
+        sessionsItem.submenu = sessionsSub
+        menu.addItem(sessionsItem)
+
         menu.addItem(.separator())
         addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
         addItem(menu, "Quick Start Guide…",  key: "",  action: #selector(showOnboarding))
@@ -808,6 +898,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             if va != vb { return va > vb }
         }
         return false
+    }
+
+    // MARK: Sessions
+
+    @objc func saveSessionMI() { saveSession() }
+
+    @objc func restoreSessionMI(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr),
+              let session = SessionManager.shared.all.first(where: { $0.id == id })
+        else { return }
+        SessionManager.shared.restore(session)
+    }
+
+    @objc func deleteSessionMI(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr) else { return }
+        SessionManager.shared.delete(id: id)
+    }
+
+    func saveSession() {
+        let selfPID  = ProcessInfo.processInfo.processIdentifier
+        let running  = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+            .compactMap { app -> SavedApp? in
+                guard let bid = app.bundleIdentifier,
+                      let name = app.localizedName else { return nil }
+                return SavedApp(bundleID: bid, name: name)
+            }
+
+        guard !running.isEmpty else {
+            let a = NSAlert()
+            a.messageText     = "Nothing to save"
+            a.informativeText = "No regular apps are running right now."
+            a.runModal(); return
+        }
+
+        // Name prompt
+        let df = DateFormatter(); df.dateFormat = "MMM d, h:mma"
+        let defaultName = df.string(from: Date())
+        let alert = NSAlert()
+        alert.messageText     = "Save Session"
+        alert.informativeText = "\(running.count) apps will be saved. You can restore them any time from the Sessions menu."
+        alert.addButton(withTitle: "Save & Quit All")
+        alert.addButton(withTitle: "Save Only")
+        alert.addButton(withTitle: "Cancel")
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        tf.placeholderString = "Session name (e.g. Work, Pre-meeting…)"
+        tf.stringValue       = defaultName
+        alert.accessoryView  = tf
+        alert.window.initialFirstResponder = tf
+
+        let resp = alert.runModal()
+        guard resp != .alertThirdButtonReturn else { return }   // Cancel
+
+        let name = tf.stringValue.trimmingCharacters(in: .whitespaces)
+        let session = AppSession(id: UUID(),
+                                 name: name.isEmpty ? defaultName : name,
+                                 date: Date(),
+                                 apps: running)
+        SessionManager.shared.save(session)
+
+        if resp == .alertFirstButtonReturn {
+            // Quit every saved app
+            running.forEach { saved in
+                NSWorkspace.shared.runningApplications
+                    .first { $0.bundleIdentifier == saved.bundleID }?
+                    .terminate()
+            }
+        }
     }
 
     // MARK: Hot key (⌥⌘K)
