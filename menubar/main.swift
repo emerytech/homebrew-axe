@@ -78,6 +78,12 @@ struct AppSettings {
         get { d.bool(forKey: "isLicensed") }
         set { d.set(newValue, forKey: "isLicensed") }
     }
+    /// Lemon Squeezy instance UUID for this activation — used to deactivate if user moves to a new Mac.
+    static var licenseInstanceID: String? {
+        get { d.string(forKey: "licenseInstanceID") }
+        set { if let v = newValue { d.set(v, forKey: "licenseInstanceID") }
+              else { d.removeObject(forKey: "licenseInstanceID") } }
+    }
     /// When the support nudge was last shown.
     static var lastNudgeDate: Date? {
         get { d.object(forKey: "lastNudgeDate") as? Date }
@@ -1117,8 +1123,9 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
 final class NudgeWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    // ── TODO: replace with your Lemon Squeezy checkout URL once your product is live
-    static let purchaseURL = "https://axe-app.com/#pricing"
+    // ── TODO: replace XXXX with your Lemon Squeezy product checkout UUIDs
+    static let purchaseURL  = "https://ets3d.lemonsqueezy.com/buy/XXXX"   // $9.99 — 3 seats
+    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/buy/YYYY"   // $4.99 — 1 extra seat
 
     func show() {
         AppSettings.lastNudgeDate = Date()
@@ -1143,10 +1150,11 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ n: Notification) { window = nil }
 
-    private var keyField:    NSTextField?
-    private var statusLabel: NSTextField?
-    private var activateBtn: NSButton?
-    private var keyStack:    NSView?
+    private var keyField:      NSTextField?
+    private var statusLabel:   NSTextField?
+    private var activateBtn:   NSButton?
+    private var keyStack:      NSView?
+    private var extraSeatBtn:  NSButton?   // shown only when activation limit is reached
 
     private func buildUI(in w: NSWindow, width W: CGFloat) {
         let root = NSStackView()
@@ -1218,7 +1226,13 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
         statusLbl.textColor = .systemRed; statusLbl.lineBreakMode = .byWordWrapping
         statusLabel = statusLbl
 
-        let kStack = NSStackView(views: [field, actBtn, statusLbl])
+        let extraBtn = NSButton(title: "Buy an extra seat — $4.99 →",
+                               target: self, action: #selector(extraSeatTapped))
+        extraBtn.bezelStyle = .rounded
+        extraBtn.isHidden = true
+        extraSeatBtn = extraBtn
+
+        let kStack = NSStackView(views: [field, actBtn, statusLbl, extraBtn])
         kStack.orientation = .vertical; kStack.spacing = 8; kStack.alignment = .centerX
         kStack.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 20)
         field.widthAnchor.constraint(equalTo: kStack.widthAnchor, constant: -40).isActive = true
@@ -1268,50 +1282,89 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
             statusLabel?.stringValue = "Enter a license key above."; return
         }
         activateBtn?.isEnabled = false
+        extraSeatBtn?.isHidden = true
         statusLabel?.textColor = .secondaryLabelColor; statusLabel?.stringValue = "Validating…"
 
-        // Validate against Lemon Squeezy
-        // TODO: once your LS product is live this will work automatically.
         guard let url = URL(string: "https://api.lemonsqueezy.com/v1/licenses/activate") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "license_key": raw,
+            "license_key":   raw,
             "instance_name": Host.current().localizedName ?? "Mac",
         ])
         URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
             DispatchQueue.main.async {
+                guard let self else { return }
                 if let error {
-                    self?.statusLabel?.textColor = .systemRed
-                    self?.statusLabel?.stringValue = "Network error: \(error.localizedDescription)"
-                    self?.activateBtn?.isEnabled = true; return
+                    self.statusLabel?.textColor = .systemRed
+                    self.statusLabel?.stringValue = "Network error: \(error.localizedDescription)"
+                    self.activateBtn?.isEnabled = true; return
                 }
                 guard let data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else {
-                    self?.statusLabel?.textColor = .systemRed
-                    self?.statusLabel?.stringValue = "Couldn't read response."
-                    self?.activateBtn?.isEnabled = true; return
+                    self.statusLabel?.textColor = .systemRed
+                    self.statusLabel?.stringValue = "Couldn't read response."
+                    self.activateBtn?.isEnabled = true; return
                 }
-                if let msg = json["error"] as? String, !msg.isEmpty {
-                    self?.statusLabel?.textColor = .systemRed
-                    self?.statusLabel?.stringValue = msg
-                    self?.activateBtn?.isEnabled = true; return
+
+                if let errorMsg = json["error"] as? String, !errorMsg.isEmpty {
+                    // ── Activation limit reached — show extra seat upsell ──
+                    let isLimit = errorMsg.lowercased().contains("activation limit") ||
+                                  errorMsg.lowercased().contains("activation_limit")
+                    self.statusLabel?.textColor = .systemRed
+                    if isLimit {
+                        let limit = (json["license_key"] as? [String: Any])?["activation_limit"] as? Int ?? 3
+                        self.statusLabel?.stringValue = "All \(limit) seats on this key are in use."
+                        self.extraSeatBtn?.isHidden = false
+                        self.resizeWindow()
+                    } else {
+                        self.statusLabel?.stringValue = errorMsg
+                    }
+                    self.activateBtn?.isEnabled = true; return
                 }
+
                 if json["activated"] as? Bool == true {
+                    // Store the instance ID so we can deactivate later if needed
+                    if let instance = json["instance"] as? [String: Any],
+                       let instanceID = instance["id"] as? String {
+                        AppSettings.licenseInstanceID = instanceID
+                    }
+                    // Show seat info (e.g. "2 of 3 seats used")
+                    var seatInfo = ""
+                    if let lk = json["license_key"] as? [String: Any],
+                       let used  = lk["activation_usage"] as? Int,
+                       let limit = lk["activation_limit"] as? Int {
+                        seatInfo = "  (\(used) of \(limit) seats used)"
+                    }
                     AppSettings.isLicensed = true
-                    self?.statusLabel?.textColor = .systemGreen
-                    self?.statusLabel?.stringValue = "✓ Activated — thank you! 🪓"
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.window?.close() }
+                    self.statusLabel?.textColor = .systemGreen
+                    self.statusLabel?.stringValue = "✓ Activated — thank you! 🪓\(seatInfo)"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.window?.close() }
                 } else {
-                    self?.statusLabel?.textColor = .systemRed
-                    self?.statusLabel?.stringValue = "License key not found."
-                    self?.activateBtn?.isEnabled = true
+                    self.statusLabel?.textColor = .systemRed
+                    self.statusLabel?.stringValue = "License key not recognised."
+                    self.activateBtn?.isEnabled = true
                 }
             }
         }.resume()
+    }
+
+    @objc private func extraSeatTapped() {
+        NSWorkspace.shared.open(URL(string: NudgeWindow.extraSeatURL)!)
+    }
+
+    private func resizeWindow() {
+        guard let w = window,
+              let root = w.contentView?.subviews.first as? NSStackView else { return }
+        w.contentView?.layoutSubtreeIfNeeded()
+        let h = root.fittingSize.height
+        var f = w.frame
+        let delta = (h + 28) - f.height
+        f.size.height += delta; f.origin.y -= delta
+        w.setFrame(f, display: true, animate: true)
     }
 
     private func padded(_ v: NSView, top: CGFloat = 0, left: CGFloat = 0,
