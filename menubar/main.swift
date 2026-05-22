@@ -236,9 +236,13 @@ private final class AutoFitTableView: NSTableView {
         super.layout()
         guard let col = tableColumns.first,
               let sv  = enclosingScrollView else { return }
-        let available = sv.contentView.bounds.width
+        // Use documentVisibleRect width so the vertical scroller's width is
+        // already subtracted — this prevents the horizontal-overflow feedback loop.
+        let available = sv.documentVisibleRect.width
         if available > 1 && abs(col.width - available) > 0.5 {
             col.width = available
+            // Reset horizontal offset so content is never clipped on the left
+            sv.contentView.scroll(to: NSPoint(x: 0, y: sv.contentView.bounds.origin.y))
         }
     }
 }
@@ -3105,7 +3109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Build overlay panel
 
     func buildPanel() {
-        let W: CGFloat  = 560
+        let W: CGFloat  = 620
         let searchH: CGFloat = 54
         let rowH: CGFloat    = 46
         let maxRows: CGFloat = 7
@@ -3225,7 +3229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.target       = self
         if #available(macOS 12.0, *) { tv.style = .sourceList }
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
-        col.minWidth = 100; col.maxWidth = 10_000; col.width = W
+        col.minWidth = 100; col.maxWidth = 10_000; col.width = 1   // AutoFitTableView corrects on first layout
         tv.addTableColumn(col)
         tv.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView = tv
@@ -3414,7 +3418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.target = self
         if #available(macOS 12.0, *) { tv.style = .sourceList }
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
-        col.minWidth = 100; col.maxWidth = 10_000; col.width = W
+        col.minWidth = 100; col.maxWidth = 10_000; col.width = 1   // AutoFitTableView corrects on first layout
         tv.addTableColumn(col)
         tv.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView = tv
