@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.5.0"
+let appVersion = "1.5.1"
 
 // MARK: - Settings
 
@@ -1150,8 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let checked = checkedPIDs.count
         if checked > 0 {
             // Show the prominent action button; hide the keyboard-shortcut label
-            let n = checked == 1 ? "1 App" : "\(checked) Apps"
-            let btnTitle = "Off with their heads!  (\(n))"
+            let btnTitle = checked == 1 ? "Yeet (1)" : "Yeet (\(checked))"
             axeCheckedButton?.attributedTitle = NSAttributedString(
                 string: btnTitle,
                 attributes: [.foregroundColor: NSColor.white,
