@@ -8,7 +8,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.4.1"
+let appVersion = "2.5.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -173,6 +173,11 @@ struct AppSettings {
                 d.set(data, forKey: "disabledSparePhrases")
             }
         }
+    }
+    /// When true, background update checks install silently and restart the app.
+    static var autoUpdate: Bool {
+        get { d.bool(forKey: "autoUpdate") }
+        set { d.set(newValue, forKey: "autoUpdate") }
     }
     /// Version the user clicked "Later" on — skip re-prompting for the same version.
     static var dismissedUpdateVersion: String? {
@@ -428,6 +433,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits",
                       on: AppSettings.autoClose)     { AppSettings.autoClose = $0 },
+            toggleRow("Automatically install updates",
+                      on: AppSettings.autoUpdate)    { AppSettings.autoUpdate = $0 },
         ])
 
         addSection("Kill Behaviour", to: root, rows: [
@@ -1181,6 +1188,150 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
     @objc private func cancelTapped() { onCancel?(); onCancel = nil; dismiss() }
 }
 
+// MARK: - SelfUpdater
+
+/// Downloads the latest release zip, swaps the app bundle via a helper script, and relaunches.
+final class SelfUpdater: NSObject, NSWindowDelegate {
+    private var window:       NSWindow?
+    private var progressBar:  NSProgressIndicator?
+    private var statusLabel:  NSTextField?
+    private var downloadTask: URLSessionDownloadTask?
+    private var cancelled = false
+
+    func install(version: String) {
+        showProgress(version: version)
+        let urlStr = "https://github.com/emerytech/homebrew-axe/releases/download/v\(version)/Axe.zip"
+        guard let url = URL(string: urlStr) else { fail(); return }
+        downloadTask = URLSession.shared.downloadTask(with: url) { [weak self] tmp, _, err in
+            DispatchQueue.main.async {
+                guard let self, !self.cancelled else { return }
+                guard let tmp, err == nil else { self.fail(); return }
+                self.statusLabel?.stringValue = "Installing…"
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let ok = Self.applyUpdate(from: tmp, version: version)
+                    DispatchQueue.main.async {
+                        if ok {
+                            self.statusLabel?.stringValue = "Restarting Axe…"
+                            self.progressBar?.isHidden = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                NSApp.terminate(nil)   // installer script relaunches
+                            }
+                        } else { self.fail() }
+                    }
+                }
+            }
+        }
+        downloadTask?.resume()
+    }
+
+    // MARK: Apply
+
+    private static func applyUpdate(from zip: URL, version: String) -> Bool {
+        let fm  = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+                      .appendingPathComponent("axe-update-\(version)")
+        try? fm.removeItem(at: tmp)
+        guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil
+        else { return false }
+
+        // Unzip the download
+        let uz = Process()
+        uz.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        uz.arguments = ["-q", "-o", zip.path, "-d", tmp.path]
+        guard (try? uz.run()) != nil else { return false }
+        uz.waitUntilExit()
+        guard uz.terminationStatus == 0 else { return false }
+
+        let newApp = tmp.appendingPathComponent("Axe.app")
+        guard fm.fileExists(atPath: newApp.path) else { return false }
+
+        // Shell script: wait for app to quit, swap bundle, relaunch
+        let cur    = Bundle.main.bundlePath
+        let script = """
+        #!/bin/bash
+        sleep 1.5
+        cp -rf \(newApp.path.shellQuoted) \(cur.shellQuoted)
+        open \(cur.shellQuoted)
+        rm -rf \(tmp.path.shellQuoted)
+        """
+        let scriptURL = tmp.appendingPathComponent("install.sh")
+        guard (try? script.write(to: scriptURL, atomically: true, encoding: .utf8)) != nil
+        else { return false }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let installer = Process()
+        installer.executableURL = URL(fileURLWithPath: "/bin/bash")
+        installer.arguments     = [scriptURL.path]
+        guard (try? installer.run()) != nil else { return false }
+        return true
+    }
+
+    // MARK: UI
+
+    private func showProgress(version: String) {
+        let W: CGFloat = 300
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 110),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = ""; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false; w.level = .floating; w.delegate = self
+
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 10; root.alignment = .centerX
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
+
+        let title = NSTextField(labelWithString: "Updating to Axe \(version)…")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        root.addArrangedSubview(title)
+
+        let bar = NSProgressIndicator()
+        bar.style = .bar; bar.isIndeterminate = true; bar.startAnimation(nil)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: W - 40).isActive = true
+        root.addArrangedSubview(bar)
+        progressBar = bar
+
+        let lbl = NSTextField(labelWithString: "Downloading…")
+        lbl.font = .systemFont(ofSize: 11); lbl.textColor = .secondaryLabelColor
+        root.addArrangedSubview(lbl)
+        statusLabel = lbl
+
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelTapped))
+        cancel.bezelStyle = .rounded
+        root.addArrangedSubview(cancel)
+
+        window = w
+        if let sf = NSScreen.main?.visibleFrame {
+            w.setFrameOrigin(NSPoint(x: sf.maxX - W - 20, y: sf.minY + 20))
+        } else { w.center() }
+        w.makeKeyAndOrderFront(nil)
+        if #available(macOS 14.0, *) { NSApp.activate() }
+        else { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    private func fail() {
+        progressBar?.isHidden = true
+        statusLabel?.stringValue = "Update failed — try again later."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.window?.close() }
+    }
+
+    @objc private func cancelTapped() { cancelled = true; downloadTask?.cancel(); window?.close() }
+    func windowWillClose(_ n: Notification) { window = nil }
+}
+
+private extension String {
+    /// Wraps a path in single quotes, escaping any embedded single quotes.
+    var shellQuoted: String { "'" + replacingOccurrences(of: "'", with: "'\\''") + "'" }
+}
+
 // MARK: - UpdateWindow
 
 final class UpdateWindow: NSObject, NSWindowDelegate {
@@ -1867,6 +2018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var pendingSpaceRestoreSession: AppSession?
     var spaceRestoreHUD: SpaceRestoreHUD?
     var updateWindow: UpdateWindow?
+    var selfUpdater:  SelfUpdater?
     var enabledKillPhrases: [String] {
         let dis = AppSettings.disabledKillPhrases
         let enabled = killPhrases.filter { !dis.contains($0) }
@@ -2214,6 +2366,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         // For background checks, skip if the user already dismissed this version
         if !userInitiated, AppSettings.dismissedUpdateVersion == latest { return }
+
+        // Auto-install silently when the user has opted in and this is a background check
+        if !userInitiated, AppSettings.autoUpdate {
+            let updater = SelfUpdater()
+            selfUpdater = updater
+            updater.install(version: latest)
+            return
+        }
 
         let win = UpdateWindow(latestVersion: latest, releaseNotes: notes)
         updateWindow = win
