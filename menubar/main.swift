@@ -1124,7 +1124,7 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
     static let purchaseURL  = "https://ets3d.lemonsqueezy.com/checkout/buy/a1a1da63-ceee-40ae-81ef-2927e5fbbcb3"  // $9.99 — 3 seats
-    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/buy/YYYY"   // TODO: replace YYYY once extra seat product is live
+    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/checkout/buy/7cf62599-8c8e-4dd1-bd5c-3e7643bbb7c2"  // $4.99 — 1 extra seat
 
     func show() {
         AppSettings.lastNudgeDate = Date()
