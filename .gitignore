@@ -9,3 +9,6 @@ menubar/AppIcon.iconset/
 
 # Editor / local config
 .claude/
+
+# Signing credentials — never commit
+menubar/.env

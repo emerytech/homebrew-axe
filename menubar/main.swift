@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.2.0"
+let appVersion = "2.3.0"
 
 // MARK: - Settings
 
@@ -177,6 +177,13 @@ private final class AutoFitTableView: NSTableView {
             col.width = available
         }
     }
+}
+
+/// NSStackView whose coordinate system is flipped (origin at top-left).
+/// Used as the NSScrollView documentView so stacked content appears at the top
+/// rather than floating to the bottom of the visible area.
+private final class FlippedStackView: NSStackView {
+    override var isFlipped: Bool { return true }
 }
 
 // MARK: - RoundedIconView
@@ -571,6 +578,26 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
 }
 
+// ── SessionRowView: NSStackView row with right-click context menu ─────────────
+private final class SessionRowView: NSStackView {
+    var sessionID: UUID?
+    var onRename:  (() -> Void)?
+    var onDelete:  (() -> Void)?
+
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        let rename = NSMenuItem(title: "Rename…", action: #selector(handleRename), keyEquivalent: "")
+        rename.target = self
+        let delete = NSMenuItem(title: "Delete",  action: #selector(handleDelete), keyEquivalent: "")
+        delete.target = self
+        menu.addItem(rename); menu.addItem(.separator()); menu.addItem(delete)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func handleRename() { onRename?() }
+    @objc private func handleDelete() { onDelete?() }
+}
+
 // Tiny helper objects to connect controls to closures without using objc bridging tricks
 private final class ToggleBox: NSView {
     let sw: NSSwitch; let handler: (Bool) -> Void
@@ -700,10 +727,11 @@ struct SavedApp: Codable {
 }
 
 struct AppSession: Codable {
-    let id:   UUID
-    var name: String
-    let date: Date
-    let apps: [SavedApp]
+    let id:         UUID
+    var name:       String
+    let date:       Date
+    let apps:       [SavedApp]
+    var isFavorite: Bool = false   // true = "Workflow", sorts to top
 }
 
 final class SessionManager {
@@ -730,6 +758,21 @@ final class SessionManager {
     }
 
     func delete(id: UUID) { all = all.filter { $0.id != id } }
+
+    func toggleFavorite(id: UUID) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].isFavorite.toggle()
+        // Keep favorites grouped at front; stable sort within each group preserves insertion order
+        all = s.filter { $0.isFavorite } + s.filter { !$0.isFavorite }
+    }
+
+    func rename(id: UUID, to newName: String) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].name = newName
+        all = s
+    }
 
     func restore(_ session: AppSession) {
         for app in session.apps {
@@ -1561,40 +1604,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func showStatusMenu() {
         let menu = NSMenu()
+
+        // ── Favorite workflows — direct one-click access at the very top ──
+        let saved = SessionManager.shared.all
+        let workflows = saved.filter { $0.isFavorite }
+        if !workflows.isEmpty {
+            let hdr = NSMenuItem(title: "Workflows", action: nil, keyEquivalent: "")
+            hdr.isEnabled = false
+            menu.addItem(hdr)
+            for session in workflows {
+                let icon = NSImage(systemSymbolName: "star.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+                let item = NSMenuItem(title: session.name,
+                                      action: #selector(restoreSessionMI(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.image  = icon
+                item.representedObject = session.id.uuidString
+                menu.addItem(item)
+            }
+            menu.addItem(.separator())
+        }
+
         addItem(menu, "Show Axe", key: "", tip: "⌘Z", action: #selector(toggleOverlay))
         menu.addItem(.separator())
 
-        // Sessions submenu
-        let sessionsItem = NSMenuItem(title: "Sessions", action: nil, keyEquivalent: "")
+        // Sessions submenu (all sessions)
+        let sessionsItem = NSMenuItem(title: "All Sessions", action: nil, keyEquivalent: "")
         let sessionsSub  = NSMenu()
-        let saved = SessionManager.shared.all
         if saved.isEmpty {
             let empty = NSMenuItem(title: "No saved sessions", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             sessionsSub.addItem(empty)
         } else {
+            let df = DateFormatter(); df.dateFormat = "MMM d · h:mma"
             for session in saved {
-                let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short
                 let sub    = NSMenu()
-                let title  = "\(session.name)  ·  \(df.string(from: session.date))"
+                let star   = session.isFavorite ? "⭐ " : ""
+                let title  = "\(star)\(session.name)  ·  \(df.string(from: session.date))"
                 let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                let restore = NSMenuItem(title: "↩  Restore \(session.apps.count) apps",
+
+                let restore = NSMenuItem(title: "▶  Restore \(session.apps.count) apps",
                                          action: #selector(restoreSessionMI(_:)),
                                          keyEquivalent: "")
-                restore.target       = self
+                restore.target = self
                 restore.representedObject = session.id.uuidString
+
+                let favTitle = session.isFavorite ? "☆  Remove from Workflows" : "⭐  Add to Workflows"
+                let favItem = NSMenuItem(title: favTitle,
+                                         action: #selector(toggleFavoriteMI(_:)),
+                                         keyEquivalent: "")
+                favItem.target = self
+                favItem.representedObject = session.id.uuidString
+
+                let rename = NSMenuItem(title: "✏️  Rename…",
+                                        action: #selector(renameSessionMI(_:)),
+                                        keyEquivalent: "")
+                rename.target = self
+                rename.representedObject = session.id.uuidString
+
                 let delete = NSMenuItem(title: "🗑  Delete",
                                         action: #selector(deleteSessionMI(_:)),
                                         keyEquivalent: "")
-                delete.target        = self
+                delete.target = self
                 delete.representedObject = session.id.uuidString
-                sub.addItem(restore); sub.addItem(.separator()); sub.addItem(delete)
+
+                sub.addItem(restore)
+                sub.addItem(.separator())
+                sub.addItem(favItem)
+                sub.addItem(rename)
+                sub.addItem(.separator())
+                sub.addItem(delete)
                 parent.submenu = sub
                 sessionsSub.addItem(parent)
             }
         }
         sessionsSub.addItem(.separator())
-        let saveItem = NSMenuItem(title: "Save Current Session…",
+        let saveItem = NSMenuItem(title: "Save Current Workflow…",
                                   action: #selector(saveSessionMI), keyEquivalent: "")
         saveItem.target = self
         sessionsSub.addItem(saveItem)
@@ -1741,6 +1827,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         guard let idStr = sender.representedObject as? String,
               let id = UUID(uuidString: idStr) else { return }
         SessionManager.shared.delete(id: id)
+        refreshSessionsPanel()
+    }
+
+    @objc func toggleFavoriteMI(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr) else { return }
+        SessionManager.shared.toggleFavorite(id: id)
+        refreshSessionsPanel()
+    }
+
+    @objc func renameSessionMI(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr),
+              let session = SessionManager.shared.all.first(where: { $0.id == id })
+        else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename Workflow"
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        tf.stringValue       = session.name
+        tf.placeholderString = "Workflow name"
+        alert.accessoryView  = tf
+        alert.window.initialFirstResponder = tf
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newName = tf.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty else { return }
+        SessionManager.shared.rename(id: id, to: newName)
+        refreshSessionsPanel()
     }
 
     func saveSession() {
@@ -1762,16 +1876,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         // Name prompt
         let df = DateFormatter(); df.dateFormat = "MMM d, h:mma"
-        let defaultName = df.string(from: Date())
+        let fallbackName = df.string(from: Date())
         let alert = NSAlert()
-        alert.messageText     = "Save Session"
-        alert.informativeText = "\(running.count) apps will be saved. You can restore them any time from the Sessions menu."
+        alert.messageText     = "Save Workflow"
+        alert.informativeText = "\(running.count) apps will be saved. Name it after what you're working on so you can switch back to it anytime."
         alert.addButton(withTitle: "Save & Quit All")
         alert.addButton(withTitle: "Save Only")
         alert.addButton(withTitle: "Cancel")
         let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
-        tf.placeholderString = "Session name (e.g. Work, Pre-meeting…)"
-        tf.stringValue       = defaultName
+        tf.placeholderString = "e.g. Design, Dev, Client meetings…"
+        tf.stringValue       = ""
         alert.accessoryView  = tf
         alert.window.initialFirstResponder = tf
 
@@ -1780,7 +1894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let name = tf.stringValue.trimmingCharacters(in: .whitespaces)
         let session = AppSession(id: UUID(),
-                                 name: name.isEmpty ? defaultName : name,
+                                 name: name.isEmpty ? fallbackName : name,
                                  date: Date(),
                                  apps: running)
         SessionManager.shared.save(session)
@@ -1839,8 +1953,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         header.addSubview(backBtn)
 
         let titleLbl = NSTextField(labelWithString: "Sessions")
-        titleLbl.font = .systemFont(ofSize: 11, weight: .semibold)
-        titleLbl.textColor = .secondaryLabelColor; titleLbl.alignment = .center
+        titleLbl.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLbl.textColor = .labelColor; titleLbl.alignment = .center
         titleLbl.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(titleLbl)
 
@@ -1886,7 +2000,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ])
 
         // ── Scrollable sessions list ────────────────────────────────
-        let listStack = NSStackView()
+        let listStack = FlippedStackView()
         listStack.orientation = .vertical; listStack.spacing = 0; listStack.alignment = .leading
         listStack.translatesAutoresizingMaskIntoConstraints = false
         sessionsListStack = listStack
@@ -1915,9 +2029,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         guard let stack = sessionsListStack else { return }
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
-        let sessions = SessionManager.shared.all
-        if sessions.isEmpty {
-            let empty = NSTextField(labelWithString: "No sessions saved yet.\nPress + to save the current apps.")
+        let all      = SessionManager.shared.all
+        let workflows = all.filter { $0.isFavorite }
+        let recents   = all.filter { !$0.isFavorite }
+
+        if all.isEmpty {
+            let empty = NSTextField(labelWithString: "No workflows saved yet.\nPress + to save the current apps.")
             empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
             empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
             empty.translatesAutoresizingMaskIntoConstraints = false
@@ -1926,56 +2043,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             NSLayoutConstraint.activate([
                 empty.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 16),
                 empty.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -16),
-                empty.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 20),
-                empty.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -20),
+                empty.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 24),
+                empty.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -24),
             ])
             stack.addArrangedSubview(wrap)
             wrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             return
         }
 
-        let fmt = DateFormatter(); fmt.dateStyle = .medium; fmt.timeStyle = .short
-        for (i, session) in sessions.enumerated() {
-            let row = NSStackView(); row.orientation = .horizontal; row.spacing = 10
+        let fmt = DateFormatter(); fmt.dateFormat = "MMM d · h:mma"
+
+        func addSectionHeader(_ title: String) {
+            let lbl = NSTextField(labelWithString: title.uppercased())
+            lbl.font = .systemFont(ofSize: 9, weight: .semibold)
+            lbl.textColor = .tertiaryLabelColor
+            lbl.translatesAutoresizingMaskIntoConstraints = false
+            let wrap = NSView(); wrap.translatesAutoresizingMaskIntoConstraints = false
+            wrap.addSubview(lbl)
+            NSLayoutConstraint.activate([
+                lbl.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 15),
+                lbl.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -15),
+                lbl.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 10),
+                lbl.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -4),
+            ])
+            stack.addArrangedSubview(wrap)
+            wrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        func addRow(_ session: AppSession, index: Int, isFav: Bool, lastInGroup: Bool) {
+            let row = SessionRowView()
+            row.orientation = .horizontal; row.spacing = 8
             row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 12)
             row.alignment = .centerY
+            row.wantsLayer = true
+            row.layer?.backgroundColor = isFav
+                ? NSColor.systemYellow.withAlphaComponent(0.05).cgColor
+                : NSColor.clear.cgColor
 
-            // icon
-            let iconView = NSImageView()
-            if let sym = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: nil) {
-                iconView.image = sym.withSymbolConfiguration(
-                    NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+            // ── Star / workflow toggle
+            let starBtn = NSButton()
+            starBtn.isBordered = false
+            let starSym = isFav ? "star.fill" : "star"
+            if let sym = NSImage(systemSymbolName: starSym, accessibilityDescription: isFav ? "Remove from Workflows" : "Add to Workflows") {
+                starBtn.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 12, weight: .medium))
             }
-            iconView.contentTintColor = .secondaryLabelColor
-            iconView.translatesAutoresizingMaskIntoConstraints = false
-            iconView.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            starBtn.contentTintColor = isFav ? .systemYellow : .tertiaryLabelColor
+            starBtn.target = self; starBtn.action = #selector(toggleFavoriteFromPanel(_:))
+            starBtn.tag = index; starBtn.toolTip = isFav ? "Remove from Workflows" : "Add to Workflows"
+            starBtn.translatesAutoresizingMaskIntoConstraints = false
+            starBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
 
-            // text stack
+            // ── Icon
+            let iconView = NSImageView()
+            let iconSym = isFav ? "tray.full" : "tray"
+            if let sym = NSImage(systemSymbolName: iconSym, accessibilityDescription: nil) {
+                iconView.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+            }
+            iconView.contentTintColor = isFav
+                ? .controlAccentColor
+                : .secondaryLabelColor
+            iconView.translatesAutoresizingMaskIntoConstraints = false
+            iconView.widthAnchor.constraint(equalToConstant: 18).isActive = true
+
+            // ── Text
             let nameLabel = NSTextField(labelWithString: session.name)
-            nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+            nameLabel.font = .systemFont(ofSize: 13, weight: isFav ? .semibold : .medium)
+            nameLabel.textColor = isFav ? .labelColor : .labelColor
             nameLabel.lineBreakMode = .byTruncatingTail
-            let metaLabel = NSTextField(labelWithString:
-                "\(session.apps.count) app\(session.apps.count == 1 ? "" : "s")  ·  \(fmt.string(from: session.date))")
-            metaLabel.font = .systemFont(ofSize: 11); metaLabel.textColor = .tertiaryLabelColor
+            nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let appCount = session.apps.count
+            let metaStr = "\(appCount) app\(appCount == 1 ? "" : "s")  ·  \(fmt.string(from: session.date))"
+            let metaLabel = NSTextField(labelWithString: metaStr)
+            metaLabel.font = .systemFont(ofSize: 11)
+            metaLabel.textColor = .tertiaryLabelColor
+            metaLabel.lineBreakMode = .byTruncatingTail
+            metaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
             let textStack = NSStackView(views: [nameLabel, metaLabel])
             textStack.orientation = .vertical; textStack.spacing = 2; textStack.alignment = .leading
             textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-            // restore button
+            // ── Restore
             let restoreBtn = NSButton()
             restoreBtn.isBordered = false
-            if let sym = NSImage(systemSymbolName: "play.circle", accessibilityDescription: "Restore") {
+            if let sym = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: "Restore") {
                 restoreBtn.image = sym.withSymbolConfiguration(
-                    NSImage.SymbolConfiguration(pointSize: 16, weight: .regular))
+                    NSImage.SymbolConfiguration(pointSize: 17, weight: .regular))
             }
             restoreBtn.contentTintColor = .controlAccentColor
             restoreBtn.target = self; restoreBtn.action = #selector(restoreSessionFromPanel(_:))
-            restoreBtn.tag = i
-            restoreBtn.toolTip = "Restore session"
+            restoreBtn.tag = index; restoreBtn.toolTip = "Restore workflow"
             restoreBtn.translatesAutoresizingMaskIntoConstraints = false
-            restoreBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            restoreBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
 
-            // delete button
+            // ── Delete
             let delBtn = NSButton()
             delBtn.isBordered = false
             if let sym = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Delete") {
@@ -1984,25 +2149,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             }
             delBtn.contentTintColor = .tertiaryLabelColor
             delBtn.target = self; delBtn.action = #selector(deleteSessionFromPanel(_:))
-            delBtn.tag = i
-            delBtn.toolTip = "Delete session"
+            delBtn.tag = index; delBtn.toolTip = "Delete"
             delBtn.translatesAutoresizingMaskIntoConstraints = false
             delBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
 
+            row.addArrangedSubview(starBtn)
             row.addArrangedSubview(iconView)
             row.addArrangedSubview(textStack)
             row.addArrangedSubview(restoreBtn)
             row.addArrangedSubview(delBtn)
+
+            // right-click → Rename / Delete
+            row.sessionID = session.id
+            row.onRename  = { [weak self] in self?.renameSessionInPanel(id: session.id) }
+            row.onDelete  = { [weak self] in
+                SessionManager.shared.delete(id: session.id)
+                self?.refreshSessionsPanel()
+            }
+
             stack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-            if i < sessions.count - 1 {
+            if !lastInGroup {
                 let sep = NSBox(); sep.boxType = .separator
                 sep.translatesAutoresizingMaskIntoConstraints = false
                 stack.addArrangedSubview(sep)
                 sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
             }
         }
+
+        // Workflows section
+        if !workflows.isEmpty {
+            addSectionHeader("Workflows")
+            for (i, session) in workflows.enumerated() {
+                // tag = index in the full `all` array so selectors work correctly
+                let fullIndex = all.firstIndex(where: { $0.id == session.id }) ?? i
+                addRow(session, index: fullIndex, isFav: true, lastInGroup: i == workflows.count - 1)
+            }
+        }
+
+        // Recent section
+        if !recents.isEmpty {
+            if !workflows.isEmpty {
+                let sep = NSBox(); sep.boxType = .separator
+                sep.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(sep)
+                sep.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            addSectionHeader("Recent")
+            for (i, session) in recents.enumerated() {
+                let fullIndex = all.firstIndex(where: { $0.id == session.id }) ?? i
+                addRow(session, index: fullIndex, isFav: false, lastInGroup: i == recents.count - 1)
+            }
+        }
+    }
+
+    private func renameSessionInPanel(id: UUID) {
+        guard let session = SessionManager.shared.all.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename"
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        tf.stringValue = session.name; tf.placeholderString = "Workflow name"
+        alert.accessoryView = tf; alert.window.initialFirstResponder = tf
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newName = tf.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty else { return }
+        SessionManager.shared.rename(id: id, to: newName)
+        refreshSessionsPanel()
     }
 
     @objc func toggleSessionsPanel() {
@@ -2038,6 +2252,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let sessions = SessionManager.shared.all
         guard sender.tag < sessions.count else { return }
         SessionManager.shared.delete(id: sessions[sender.tag].id)
+        refreshSessionsPanel()
+    }
+
+    @objc func toggleFavoriteFromPanel(_ sender: NSButton) {
+        let sessions = SessionManager.shared.all
+        guard sender.tag < sessions.count else { return }
+        SessionManager.shared.toggleFavorite(id: sessions[sender.tag].id)
         refreshSessionsPanel()
     }
 
