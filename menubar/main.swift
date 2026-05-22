@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.7.1"
+let appVersion = "1.7.2"
 
 // MARK: - Settings
 
@@ -143,7 +143,7 @@ final class AppRowCell: NSTableCellView {
 
             memLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             memLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            memLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
+            memLabel.widthAnchor.constraint(equalToConstant: 74),
 
             appName.leadingAnchor.constraint(equalTo: checkBox.trailingAnchor, constant: 8),
             appName.trailingAnchor.constraint(lessThanOrEqualTo: memLabel.leadingAnchor, constant: -8),
@@ -1288,12 +1288,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.target       = self
         if #available(macOS 12.0, *) { tv.style = .sourceList }
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
-        col.width = W; tv.addTableColumn(col)
+        col.minWidth = 100; col.maxWidth = 10_000; col.width = W
+        tv.addTableColumn(col)
+        tv.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView = tv
 
         let sv = NSScrollView()
         sv.documentView = tv; sv.hasVerticalScroller = true
-        sv.hasHorizontalScroller = false; sv.drawsBackground = false
+        sv.hasHorizontalScroller = false
+        sv.horizontalScrollElasticity = .none
+        sv.autohidesScrollers = true
+        sv.drawsBackground = false
         sv.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sv)
 
@@ -1442,12 +1447,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.target = self
         if #available(macOS 12.0, *) { tv.style = .sourceList }
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
-        col.width = W; tv.addTableColumn(col)
+        col.minWidth = 100; col.maxWidth = 10_000; col.width = W
+        tv.addTableColumn(col)
+        tv.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView = tv
 
         let sv2 = NSScrollView()
         sv2.documentView = tv; sv2.hasVerticalScroller = true
-        sv2.hasHorizontalScroller = false; sv2.drawsBackground = false
+        sv2.hasHorizontalScroller = false
+        sv2.horizontalScrollElasticity = .none
+        sv2.autohidesScrollers = true
+        sv2.drawsBackground = false
         sv2.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sv2)
 
