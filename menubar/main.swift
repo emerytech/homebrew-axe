@@ -116,6 +116,7 @@ final class AppRowCell: NSTableCellView {
 
             memLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             memLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            memLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
 
             appName.leadingAnchor.constraint(equalTo: appIcon.trailingAnchor, constant: 10),
             appName.trailingAnchor.constraint(lessThanOrEqualTo: memLabel.leadingAnchor, constant: -8),
@@ -251,7 +252,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         ])
 
         addSection("Keyboard Shortcut", to: root, rows: [
-            labelRow("Open overlay", value: "⌥ ⌘ K"),
+            labelRow("Open overlay", value: "⌘ A"),
         ])
 
         // Bottom divider + version
@@ -260,7 +261,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.0  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v1.2  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -424,8 +425,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var hintLabel:   NSTextField?
 
     // Data
-    var allApps:  [AppEntry] = []
-    var filtered: [AppEntry] = []
+    var allApps:      [AppEntry] = []
+    var filtered:     [AppEntry] = []
+    var sortByMemory: Bool       = false
+    var sortButton:   NSButton?
 
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
@@ -603,7 +606,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Build overlay panel
 
     func buildPanel() {
-        let W: CGFloat  = 540
+        let W: CGFloat  = 560
         let searchH: CGFloat = 54
         let rowH: CGFloat    = 46
         let maxRows: CGFloat = 7
@@ -630,13 +633,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         p.contentView = bg
 
         // ── Search bar ─────────────────────────────────────────────
-        let searchIcon = NSTextField(labelWithString: " 🔍")
-        searchIcon.font = .systemFont(ofSize: 15)
+        let searchIcon = NSImageView()
+        if let sym = NSImage(systemSymbolName: "magnifyingglass",
+                             accessibilityDescription: nil) {
+            searchIcon.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 15, weight: .regular))
+        }
+        searchIcon.contentTintColor = .tertiaryLabelColor
         searchIcon.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(searchIcon)
 
+        let sortBtn = NSButton()
+        sortBtn.isBordered = false
+        if let sym = NSImage(systemSymbolName: "arrow.up.arrow.down",
+                             accessibilityDescription: "Sort") {
+            sortBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sortBtn.contentTintColor = .tertiaryLabelColor
+        sortBtn.target           = self
+        sortBtn.action           = #selector(toggleSort)
+        sortBtn.toolTip          = "Sort by name / memory"
+        sortBtn.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sortBtn)
+        sortButton = sortBtn
+
         let sf = NSTextField(frame: .zero)
-        sf.placeholderString = "Filter running apps…"
+        let initialCount = allApps.count
+        sf.placeholderString = initialCount == 1 ? "1 app running…" : "\(initialCount) apps running…"
         sf.isBordered = false; sf.isBezeled = false; sf.drawsBackground = false
         sf.font = .systemFont(ofSize: 18); sf.focusRingType = .none
         sf.delegate = self
@@ -645,10 +669,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         searchField = sf
 
         NSLayoutConstraint.activate([
-            searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
             searchIcon.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
-            sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 4),
-            sf.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
+            searchIcon.widthAnchor.constraint(equalToConstant: 16),
+            searchIcon.heightAnchor.constraint(equalToConstant: 16),
+            sortBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            sortBtn.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            sortBtn.widthAnchor.constraint(equalToConstant: 26),
+            sortBtn.heightAnchor.constraint(equalToConstant: 26),
+            sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 8),
+            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -8),
             sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
             sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
@@ -741,15 +771,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func refreshApps() {
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        allApps = NSWorkspace.shared.runningApplications
+        let entries = NSWorkspace.shared.runningApplications
             .filter {
                 $0.processIdentifier != selfPID
                 && (AppSettings.showBackground
                     ? $0.activationPolicy != .prohibited
                     : $0.activationPolicy == .regular)
             }
-            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
             .map(AppEntry.init)
+        allApps = sortByMemory
+            ? entries.sorted { ($0.memMB ?? -1) > ($1.memMB ?? -1) }
+            : entries.sorted { $0.name < $1.name }
+        updatePlaceholder()
     }
 
     func applyFilter(_ query: String) {
@@ -767,6 +800,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func refreshAndFilter() {
         refreshApps()
         applyFilter(searchField?.stringValue ?? "")
+    }
+
+    private func updatePlaceholder() {
+        let n = allApps.count
+        searchField?.placeholderString = n == 1 ? "1 app running…" : "\(n) apps running…"
+    }
+
+    @objc func toggleSort() {
+        sortByMemory.toggle()
+        let imgName = sortByMemory ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down"
+        if let sym = NSImage(systemSymbolName: imgName, accessibilityDescription: nil) {
+            sortButton?.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sortButton?.contentTintColor = sortByMemory ? .controlAccentColor : .tertiaryLabelColor
+        refreshAndFilter()
     }
 
     private func updateEmptyState(query: String) {
@@ -815,8 +864,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.refreshAndFilter()
+        // Animate the row out, then refresh the list
+        let pid = entry.app.processIdentifier
+        if let row = filtered.firstIndex(where: { $0.app.processIdentifier == pid }),
+           let rv = tableView?.rowView(atRow: row, makeIfNecessary: false) {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                rv.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                self?.refreshAndFilter()
+            })
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.refreshAndFilter()
+            }
         }
     }
 
