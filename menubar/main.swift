@@ -8,7 +8,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.5.0"
+let appVersion = "2.6.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -3413,6 +3413,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(axeBtn)
         axeCheckedButton = axeBtn
 
+        // Settings + About icon buttons (trailing edge of hint bar)
+        let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
+        let aboutBtn    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        bg.addSubview(settingsBtn)
+        bg.addSubview(aboutBtn)
+
         NSLayoutConstraint.activate([
             botDiv.topAnchor.constraint(equalTo: sv.bottomAnchor),
             botDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
@@ -3420,12 +3426,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             botDiv.heightAnchor.constraint(equalToConstant: 1),
             hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            hint.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            hint.trailingAnchor.constraint(equalTo: settingsBtn.leadingAnchor, constant: -4),
             hint.heightAnchor.constraint(equalToConstant: hintH),
             axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
             axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
             axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
-            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: bg.trailingAnchor, constant: -16),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: settingsBtn.leadingAnchor, constant: -4),
+            // Settings button
+            settingsBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            settingsBtn.trailingAnchor.constraint(equalTo: aboutBtn.leadingAnchor, constant: -2),
+            settingsBtn.widthAnchor.constraint(equalToConstant: 22),
+            settingsBtn.heightAnchor.constraint(equalToConstant: 22),
+            // About button
+            aboutBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            aboutBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            aboutBtn.widthAnchor.constraint(equalToConstant: 22),
+            aboutBtn.heightAnchor.constraint(equalToConstant: 22),
         ])
 
         panel = p
@@ -3590,6 +3606,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         axeBtn.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(axeBtn); axeCheckedButton = axeBtn
 
+        // Settings + About icon buttons (trailing edge of hint bar)
+        let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
+        let aboutBtn2    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        bg.addSubview(settingsBtn2)
+        bg.addSubview(aboutBtn2)
+
         NSLayoutConstraint.activate([
             botDiv.topAnchor.constraint(equalTo: sv2.bottomAnchor),
             botDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
@@ -3597,12 +3619,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             botDiv.heightAnchor.constraint(equalToConstant: 1),
             hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            hint.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            hint.trailingAnchor.constraint(equalTo: settingsBtn2.leadingAnchor, constant: -4),
             hint.heightAnchor.constraint(equalToConstant: hintH),
             axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
             axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
             axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
-            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: bg.trailingAnchor, constant: -16),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: settingsBtn2.leadingAnchor, constant: -4),
+            // Settings button
+            settingsBtn2.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            settingsBtn2.trailingAnchor.constraint(equalTo: aboutBtn2.leadingAnchor, constant: -2),
+            settingsBtn2.widthAnchor.constraint(equalToConstant: 22),
+            settingsBtn2.heightAnchor.constraint(equalToConstant: 22),
+            // About button
+            aboutBtn2.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            aboutBtn2.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            aboutBtn2.widthAnchor.constraint(equalToConstant: 22),
+            aboutBtn2.heightAnchor.constraint(equalToConstant: 22),
         ])
 
         let pop = NSPopover()
@@ -3617,6 +3649,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let v = NSBox(); v.boxType = .separator
         v.translatesAutoresizingMaskIntoConstraints = false
         return v
+    }
+
+    /// Small SF Symbol icon button for the hint bar (subtle, tertiary color, no border)
+    private func makeHintIconButton(symbolName: String, action: Selector) -> NSButton {
+        let btn = NSButton()
+        btn.isBordered = false
+        btn.bezelStyle = .inline
+        btn.target = self
+        btn.action = action
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+            btn.image = img.withSymbolConfiguration(cfg)
+        }
+        btn.contentTintColor = .tertiaryLabelColor
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        return btn
     }
 
     // MARK: App data
