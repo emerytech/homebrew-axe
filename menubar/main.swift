@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.7.2"
+let appVersion = "1.8.0"
 
 // MARK: - Settings
 
@@ -33,7 +33,7 @@ struct AppSettings {
         set { d.set(newValue, forKey: "autoClose") }
     }
     static var uiStyle: UIStyle {
-        get { UIStyle(rawValue: d.integer(forKey: "uiStyle")) ?? .spotlight }
+        get { UIStyle(rawValue: d.integer(forKey: "uiStyle")) ?? .popover }
         set { d.set(newValue.rawValue, forKey: "uiStyle") }
     }
     // Require a confirmation alert before killing any app
@@ -229,7 +229,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     func show() {
         if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 0),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 0),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Axe Settings"
         w.isReleasedWhenClosed = false
@@ -261,8 +261,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("General", to: root, rows: [
             popupRow("Interface style",
-                     options: ["Spotlight overlay", "Menu bar popover"],
-                     selected: AppSettings.uiStyle.rawValue) { AppSettings.uiStyle = UIStyle(rawValue: $0) ?? .spotlight },
+                     options: ["Menu bar popover", "Spotlight overlay"],
+                     selected: AppSettings.uiStyle == .popover ? 0 : 1) {
+                         AppSettings.uiStyle = $0 == 0 ? .popover : .spotlight },
             toggleRow("Launch at Login",
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits",
@@ -271,8 +272,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("Kill Behaviour", to: root, rows: [
             popupRow("Default mode",
-                     options: ["Graceful  (SIGTERM → SIGKILL after grace period)",
-                               "Force  (SIGKILL immediately)"],
+                     options: ["Graceful  (SIGTERM → SIGKILL)", "Force  (immediate SIGKILL)"],
                      selected: AppSettings.killMode.rawValue) { AppSettings.killMode = KillMode(rawValue: $0) ?? .graceful },
             popupRow("Grace period",
                      options: ["Instant", "2 seconds", "5 seconds"],
@@ -316,14 +316,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private func addSection(_ title: String, to stack: NSStackView, rows: [NSView]) {
         let header = NSTextField(labelWithString: title.uppercased())
         header.font = .systemFont(ofSize: 11, weight: .semibold)
-        header.textColor = .tertiaryLabelColor
-        let hPad = padded(header, top: 18, left: 20, bottom: 6)
+        header.textColor = .secondaryLabelColor
+        let hPad = padded(header, top: 22, left: 20, bottom: 7)
         stack.addArrangedSubview(hPad)
         hPad.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         let box = NSBox(); box.boxType = .custom
-        box.fillColor = NSColor.separatorColor.withAlphaComponent(0.5)
-        box.borderColor = .clear; box.cornerRadius = 8; box.borderWidth = 0
+        box.fillColor   = NSColor.controlBackgroundColor
+        box.borderColor = NSColor.separatorColor.withAlphaComponent(0.8)
+        box.cornerRadius = 10; box.borderWidth = 0.5
         box.translatesAutoresizingMaskIntoConstraints = false
         let inner = NSStackView(); inner.orientation = .vertical; inner.spacing = 0; inner.alignment = .leading
         inner.translatesAutoresizingMaskIntoConstraints = false
@@ -351,8 +352,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     private func toggleRow(_ label: String, on: Bool, handler: @escaping (Bool) -> Void) -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
-        row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
-        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
+        row.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        let lbl = NSTextField(labelWithString: label)
+        lbl.font = .systemFont(ofSize: 13, weight: .regular)
+        lbl.textColor = .labelColor
         lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let sw = NSSwitch(); sw.state = on ? .on : .off
         let box = ToggleBox(sw, handler: handler)
@@ -363,9 +366,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private func popupRow(_ label: String, options: [String], selected: Int,
                           handler: @escaping (Int) -> Void) -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
-        row.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
-        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
-        lbl.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        let lbl = NSTextField(labelWithString: label)
+        lbl.font = .systemFont(ofSize: 13, weight: .regular)
+        lbl.textColor = .labelColor
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let pop = NSPopUpButton()
         for opt in options { pop.addItem(withTitle: opt) }
         pop.selectItem(at: min(selected, options.count - 1))
@@ -376,11 +381,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     private func labelRow(_ label: String, value: String) -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
-        row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
-        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
+        row.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        let lbl = NSTextField(labelWithString: label)
+        lbl.font = .systemFont(ofSize: 13, weight: .regular)
+        lbl.textColor = .labelColor
         lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let val = NSTextField(labelWithString: value)
-        val.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        val.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
         val.textColor = .secondaryLabelColor
         row.addArrangedSubview(lbl); row.addArrangedSubview(val)
         return row
@@ -648,6 +655,30 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(sep2)
         sep2.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
+        // ── Interface style picker ──────────────────────────────────
+        let pickerTitle = label("Choose how Axe opens", size: 13, weight: .semibold)
+
+        let seg = NSSegmentedControl(
+            labels: ["Menu Bar Popover", "Spotlight Overlay"],
+            trackingMode: .selectOne, target: self,
+            action: #selector(stylePickerChanged(_:)))
+        seg.selectedSegment = AppSettings.uiStyle == .popover ? 0 : 1
+        seg.translatesAutoresizingMaskIntoConstraints = false
+
+        let pickerHint = label("Popover drops from the menu bar icon  ·  Spotlight floats center-screen",
+                               size: 11, weight: .regular, color: .tertiaryLabelColor)
+
+        let pickerStack = NSStackView(views: [pickerTitle, seg, pickerHint])
+        pickerStack.orientation = .vertical; pickerStack.spacing = 8; pickerStack.alignment = .centerX
+        pickerStack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        root.addArrangedSubview(pickerStack)
+        pickerStack.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let sep3 = NSBox(); sep3.boxType = .separator
+        sep3.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(sep3)
+        sep3.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
         // ── Get Started button ──────────────────────────────────────
         let btn = NSButton(title: "Get Started", target: self, action: #selector(dismiss))
         btn.bezelStyle = .rounded; btn.keyEquivalent = "\r"
@@ -662,6 +693,11 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func dismiss() { window?.close() }
+
+    @objc private func stylePickerChanged(_ sender: NSSegmentedControl) {
+        // segment 0 = Menu bar popover, segment 1 = Spotlight overlay
+        AppSettings.uiStyle = sender.selectedSegment == 0 ? .popover : .spotlight
+    }
 
     private func label(_ s: String, size: CGFloat, weight: NSFont.Weight,
                        color: NSColor = .labelColor) -> NSTextField {
