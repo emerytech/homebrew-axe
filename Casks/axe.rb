@@ -1,6 +1,6 @@
 cask "axe" do
-  version "1.0.0"
-  sha256 "89b36e1b41437032651a7e6f71cdfe3c46adca3e2aca68a1b130ffbc6f5790da"
+  version "1.1.0"
+  sha256 "621bf1d2e99a45f2f997d3544e3c1e827ac01a6bc10fb132c39617183a3eb8ad"
 
   url "https://github.com/emerytech/homebrew-axe/releases/download/v#{version}/Axe.zip"
   name "Axe"
@@ -12,7 +12,8 @@ cask "axe" do
   app "Axe.app"
 
   caveats <<~EOS
-    Press ⌥⌘K (Option+Command+K) from anywhere to pop the overlay.
+    Press ⌘A from anywhere to pop the overlay.
+    While the overlay is open, ⌘A selects all apps in the list.
     No Accessibility permission required.
   EOS
 end

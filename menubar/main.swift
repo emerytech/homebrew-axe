@@ -1,7 +1,45 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
+import ServiceManagement
 
-// ─────────────────────── HotKey helpers ───────────────────────────
+// MARK: - Settings
+
+enum KillMode: Int { case graceful = 0, force = 1 }
+
+struct AppSettings {
+    private static let d = UserDefaults.standard
+
+    static var killMode: KillMode {
+        get { KillMode(rawValue: d.integer(forKey: "killMode")) ?? .graceful }
+        set { d.set(newValue.rawValue, forKey: "killMode") }
+    }
+    // Seconds to wait before following up with SIGKILL (graceful mode only)
+    static var gracePeriod: Double {
+        get { d.object(forKey: "gracePeriod") == nil ? 2 : d.double(forKey: "gracePeriod") }
+        set { d.set(newValue, forKey: "gracePeriod") }
+    }
+    // Show apps with non-regular activation policy (agents, helpers, etc.)
+    static var showBackground: Bool {
+        get { d.bool(forKey: "showBackground") }
+        set { d.set(newValue, forKey: "showBackground") }
+    }
+    // Dismiss the overlay automatically after the last selected app is killed
+    static var autoClose: Bool {
+        get { d.object(forKey: "autoClose") == nil ? true : d.bool(forKey: "autoClose") }
+        set { d.set(newValue, forKey: "autoClose") }
+    }
+    static var launchAtLogin: Bool {
+        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
+        return false
+    }
+    static func setLaunchAtLogin(_ on: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+    }
+}
+
+// MARK: - HotKey (Carbon — no Accessibility permission required)
 
 private func fourCC(_ s: StaticString) -> FourCharCode {
     let b = s.utf8Start
@@ -9,80 +47,406 @@ private func fourCC(_ s: StaticString) -> FourCharCode {
          | FourCharCode(b[2]) << 8  | FourCharCode(b[3])
 }
 
-// C-compatible callback required by Carbon's InstallApplicationEventHandler.
-private let hotKeyCallback: EventHandlerUPP = { _, _, userData -> OSStatus in
-    guard let ud = userData else { return noErr }
+private let hotKeyCallback: EventHandlerUPP = { _, _, ud -> OSStatus in
+    guard let ud else { return noErr }
     let d = Unmanaged<AppDelegate>.fromOpaque(ud).takeUnretainedValue()
-    DispatchQueue.main.async { d.toggleOverlay() }
+    DispatchQueue.main.async { d.hotkeyPressed() }
     return noErr
 }
 
-// ─────────────────────────── App entry ────────────────────────────
+// MARK: - Memory (proc_pidinfo — works without entitlements for user processes)
 
-struct AppEntry {
-    let app: NSRunningApplication
-    var name: String { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
-    var icon: NSImage? { app.icon }
+private func residentMB(for pid: pid_t) -> Int? {
+    var info = proc_taskinfo()
+    let sz = Int32(MemoryLayout<proc_taskinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, sz) == sz else { return nil }
+    return Int(info.pti_resident_size / 1_048_576)
 }
 
-// ──────────────────────── App row cell view ───────────────────────
+// MARK: - AppEntry
+
+struct AppEntry {
+    let app:   NSRunningApplication
+    let memMB: Int?
+    var name:  String    { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
+    var icon:  NSImage?  { app.icon }
+    init(_ a: NSRunningApplication) { app = a; memMB = residentMB(for: a.processIdentifier) }
+}
+
+// MARK: - RoundedIconView
+
+final class RoundedIconView: NSImageView {
+    override func draw(_ dirty: NSRect) {
+        NSBezierPath(roundedRect: bounds,
+                     xRadius: bounds.width * 0.22,
+                     yRadius: bounds.height * 0.22).addClip()
+        super.draw(dirty)
+    }
+}
+
+// MARK: - AppRowCell
 
 final class AppRowCell: NSTableCellView {
-    let appIcon = NSImageView()
-    let appName = NSTextField(labelWithString: "")
+    let appIcon  = RoundedIconView()
+    let appName  = NSTextField(labelWithString: "")
+    let memLabel = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         appIcon.imageScaling = .scaleAxesIndependently
-        appName.font = .systemFont(ofSize: 14, weight: .regular)
+
+        appName.font = .systemFont(ofSize: 14)
         appName.lineBreakMode = .byTruncatingTail
-        for v in [appIcon, appName] as [NSView] {
+
+        memLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        memLabel.textColor = .tertiaryLabelColor
+        memLabel.alignment = .right
+        memLabel.setContentHuggingPriority(.required, for: .horizontal)
+        memLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        for v in [appIcon, appName, memLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
         NSLayoutConstraint.activate([
             appIcon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             appIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            appIcon.widthAnchor.constraint(equalToConstant: 26),
-            appIcon.heightAnchor.constraint(equalToConstant: 26),
+            appIcon.widthAnchor.constraint(equalToConstant: 28),
+            appIcon.heightAnchor.constraint(equalToConstant: 28),
+
+            memLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            memLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
             appName.leadingAnchor.constraint(equalTo: appIcon.trailingAnchor, constant: 10),
-            appName.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            appName.trailingAnchor.constraint(lessThanOrEqualTo: memLabel.leadingAnchor, constant: -8),
             appName.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// ─────────────────────────── App Delegate ─────────────────────────
+// MARK: - EmptyStateView
+
+final class EmptyStateView: NSView {
+    private let label = NSTextField(labelWithString: "")
+    init() {
+        super.init(frame: .zero)
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = .quaternaryLabelColor
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func show(_ msg: String) { label.stringValue = msg; isHidden = false }
+    func hide()              { isHidden = true }
+}
+
+// MARK: - Menu bar icon (drawn programmatically to match the app icon)
+
+private func drawAxeIcon(px: CGFloat) {
+    let inset = px * 0.08
+    let body  = NSRect(x: inset, y: inset, width: px - inset * 2, height: px - inset * 2)
+    let bg    = NSBezierPath(roundedRect: body, xRadius: px * 0.2, yRadius: px * 0.2)
+    NSGradient(colors: [
+        NSColor(srgbRed: 0.14, green: 0.14, blue: 0.16, alpha: 1),
+        NSColor(srgbRed: 0.08, green: 0.08, blue: 0.10, alpha: 1),
+    ])!.draw(in: bg, angle: -90)
+
+    let arm: CGFloat = px * 0.27, thick: CGFloat = px * 0.14
+    let cx = px / 2, cy = px / 2
+    NSGraphicsContext.saveGraphicsState()
+    bg.setClip()
+    NSColor(srgbRed: 0.96, green: 0.28, blue: 0.28, alpha: 1).setFill()
+    for angle: CGFloat in [45, -45] {
+        let t = NSAffineTransform()
+        t.translateX(by: cx, yBy: cy); t.rotate(byDegrees: angle); t.concat()
+        NSBezierPath(roundedRect: NSRect(x: -arm, y: -thick / 2, width: arm * 2, height: thick),
+                     xRadius: thick / 2, yRadius: thick / 2).fill()
+        let u = NSAffineTransform()
+        u.translateX(by: -cx, yBy: -cy); u.rotate(byDegrees: -angle); u.concat()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+}
+
+private func makeMenuBarIcon() -> NSImage {
+    let size: CGFloat = 18
+    let img = NSImage(size: NSSize(width: size, height: size))
+    for scale: CGFloat in [1, 2] {
+        let px = size * scale
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: Int(px), pixelsHigh: Int(px),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        drawAxeIcon(px: px)
+        NSGraphicsContext.current = nil
+        img.addRepresentation(rep)
+    }
+    return img
+}
+
+// MARK: - Settings window
+
+final class SettingsWindow: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 0),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Axe Settings"
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.center()
+        buildUI(in: w)
+        window = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) { window = nil }
+
+    // ── UI construction ──────────────────────────────────────────
+
+    private func buildUI(in w: NSWindow) {
+        let root = NSStackView()
+        root.orientation     = .vertical
+        root.spacing         = 0
+        root.alignment       = .leading
+        root.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
+
+        addSection("General", to: root, rows: [
+            toggleRow("Launch at Login",
+                      on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
+            toggleRow("Close overlay when last app quits",
+                      on: AppSettings.autoClose)     { AppSettings.autoClose = $0 },
+        ])
+
+        addSection("Kill Behaviour", to: root, rows: [
+            popupRow("Default mode",
+                     options: ["Graceful  (SIGTERM → SIGKILL after grace period)",
+                               "Force  (SIGKILL immediately)"],
+                     selected: AppSettings.killMode.rawValue) { AppSettings.killMode = KillMode(rawValue: $0) ?? .graceful },
+            popupRow("Grace period",
+                     options: ["Instant", "2 seconds", "5 seconds"],
+                     selected: [0.0, 2.0, 5.0].firstIndex(of: AppSettings.gracePeriod) ?? 1)
+                { AppSettings.gracePeriod = [0.0, 2.0, 5.0][safe: $0] ?? 2 },
+        ])
+
+        addSection("App List", to: root, rows: [
+            toggleRow("Show background agents and helpers",
+                      on: AppSettings.showBackground) { AppSettings.showBackground = $0 },
+        ])
+
+        addSection("Keyboard Shortcut", to: root, rows: [
+            labelRow("Open overlay", value: "⌥ ⌘ K"),
+        ])
+
+        // Bottom divider + version
+        let div = NSBox(); div.boxType = .separator
+        div.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(div)
+        div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let ver = NSTextField(labelWithString: "Axe v1.0  ·  emerytech/homebrew-axe")
+        ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
+        ver.alignment = .center
+        let verPad = padded(ver, top: 10, bottom: 12)
+        root.addArrangedSubview(verPad)
+        verPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        w.contentView?.layoutSubtreeIfNeeded()
+        let h = root.fittingSize.height
+        var f = w.frame; f.size.height = h + 28; f.origin.y -= (h - w.frame.height) / 2
+        w.setFrame(f, display: false)
+        w.center()
+    }
+
+    // ── Section builders ─────────────────────────────────────────
+
+    private func addSection(_ title: String, to stack: NSStackView, rows: [NSView]) {
+        let header = NSTextField(labelWithString: title.uppercased())
+        header.font = .systemFont(ofSize: 11, weight: .semibold)
+        header.textColor = .tertiaryLabelColor
+        let hPad = padded(header, top: 18, left: 20, bottom: 6)
+        stack.addArrangedSubview(hPad)
+        hPad.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let box = NSBox(); box.boxType = .custom
+        box.fillColor = NSColor.separatorColor.withAlphaComponent(0.5)
+        box.borderColor = .clear; box.cornerRadius = 8; box.borderWidth = 0
+        box.translatesAutoresizingMaskIntoConstraints = false
+        let inner = NSStackView(); inner.orientation = .vertical; inner.spacing = 0; inner.alignment = .leading
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: box.topAnchor),
+            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            inner.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+        ])
+        for (i, row) in rows.enumerated() {
+            inner.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: inner.widthAnchor).isActive = true
+            if i < rows.count - 1 {
+                let sep = NSBox(); sep.boxType = .separator
+                sep.translatesAutoresizingMaskIntoConstraints = false
+                inner.addArrangedSubview(sep)
+                sep.widthAnchor.constraint(equalTo: inner.widthAnchor, constant: -32).isActive = true
+            }
+        }
+        let wrapper = padded(box, top: 0, left: 16, bottom: 0, right: 16)
+        stack.addArrangedSubview(wrapper)
+        wrapper.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    private func toggleRow(_ label: String, on: Bool, handler: @escaping (Bool) -> Void) -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let sw = NSSwitch(); sw.state = on ? .on : .off
+        let box = ToggleBox(sw, handler: handler)
+        row.addArrangedSubview(lbl); row.addArrangedSubview(box)
+        return row
+    }
+
+    private func popupRow(_ label: String, options: [String], selected: Int,
+                          handler: @escaping (Int) -> Void) -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
+        lbl.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+        let pop = NSPopUpButton()
+        for opt in options { pop.addItem(withTitle: opt) }
+        pop.selectItem(at: min(selected, options.count - 1))
+        let box = PopupBox(pop, handler: handler)
+        row.addArrangedSubview(lbl); row.addArrangedSubview(box)
+        return row
+    }
+
+    private func labelRow(_ label: String, value: String) -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        let lbl = NSTextField(labelWithString: label); lbl.font = .systemFont(ofSize: 13)
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let val = NSTextField(labelWithString: value)
+        val.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        val.textColor = .secondaryLabelColor
+        row.addArrangedSubview(lbl); row.addArrangedSubview(val)
+        return row
+    }
+
+    // Helper to wrap a view with padding
+    private func padded(_ v: NSView, top: CGFloat = 0, left: CGFloat = 0,
+                        bottom: CGFloat = 0, right: CGFloat = 0) -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        v.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: wrap.topAnchor, constant: top),
+            v.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: left),
+            v.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -right),
+            v.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -bottom),
+        ])
+        return wrap
+    }
+}
+
+// Tiny helper objects to connect controls to closures without using objc bridging tricks
+private final class ToggleBox: NSView {
+    let sw: NSSwitch; let handler: (Bool) -> Void
+    init(_ sw: NSSwitch, handler: @escaping (Bool) -> Void) {
+        self.sw = sw; self.handler = handler
+        super.init(frame: .zero)
+        sw.target = self; sw.action = #selector(changed)
+        sw.translatesAutoresizingMaskIntoConstraints = false; addSubview(sw)
+        NSLayoutConstraint.activate([
+            sw.topAnchor.constraint(equalTo: topAnchor),
+            sw.leadingAnchor.constraint(equalTo: leadingAnchor),
+            sw.trailingAnchor.constraint(equalTo: trailingAnchor),
+            sw.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc func changed() { handler(sw.state == .on) }
+}
+
+private final class PopupBox: NSView {
+    let pop: NSPopUpButton; let handler: (Int) -> Void
+    init(_ pop: NSPopUpButton, handler: @escaping (Int) -> Void) {
+        self.pop = pop; self.handler = handler
+        super.init(frame: .zero)
+        pop.target = self; pop.action = #selector(changed)
+        pop.translatesAutoresizingMaskIntoConstraints = false; addSubview(pop)
+        NSLayoutConstraint.activate([
+            pop.topAnchor.constraint(equalTo: topAnchor),
+            pop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            pop.trailingAnchor.constraint(equalTo: trailingAnchor),
+            pop.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc func changed() { handler(pop.indexOfSelectedItem) }
+}
+
+private extension Array {
+    subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+// MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate,
                           NSTableViewDataSource, NSTableViewDelegate,
                           NSTextFieldDelegate {
 
-    var statusItem:  NSStatusItem!
+    // Status bar
+    var statusItem: NSStatusItem!
+
+    // Overlay
     var panel:       NSPanel?
     var searchField: NSTextField?
     var tableView:   NSTableView?
-    var hotKeyRef:   EventHotKeyRef?
+    var emptyView:   EmptyStateView?
+    var hintLabel:   NSTextField?
 
+    // Data
     var allApps:  [AppEntry] = []
     var filtered: [AppEntry] = []
+
+    // Carbon hot key
+    var hotKeyRef: EventHotKeyRef?
+
+    // Settings
+    let settingsWindow = SettingsWindow()
 
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
         registerHotKey()
+        watchWorkspace()
     }
 
-    // MARK: Status item — left-click toggles overlay; right-click shows menu
+    // MARK: Status item
 
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let btn = statusItem.button!
-        let img = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Axe")
-        img?.isTemplate = true
-        btn.image = img
+        btn.image  = makeMenuBarIcon()
         btn.action = #selector(statusItemClicked)
         btn.target = self
         btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -90,44 +454,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     @objc func statusItemClicked() {
         guard let event = NSApp.currentEvent else { return }
-        if event.type == .rightMouseUp {
-            let menu = NSMenu()
-            let show = NSMenuItem(title: "Show Axe  ⌥⌘K",
-                                  action: #selector(toggleOverlay), keyEquivalent: "")
-            show.target = self
-            menu.addItem(show)
-            menu.addItem(.separator())
-            menu.addItem(NSMenuItem(title: "Quit Axe",
-                                    action: #selector(NSApp.terminate(_:)),
-                                    keyEquivalent: ""))
-            statusItem.menu = menu
-            statusItem.button?.performClick(nil)
-            DispatchQueue.main.async { self.statusItem.menu = nil }
-        } else {
-            toggleOverlay()
-        }
+        if event.type == .rightMouseUp { showStatusMenu() } else { toggleOverlay() }
     }
 
-    // MARK: Global hotkey (⌥⌘K) — registered via Carbon; no Accessibility required
+    func showStatusMenu() {
+        let menu = NSMenu()
+        addItem(menu, "Show Axe", key: "", tip: "⌘A", action: #selector(toggleOverlay))
+        menu.addItem(.separator())
+        addItem(menu, "Settings…", key: ",", action: #selector(openSettings))
+        menu.addItem(.separator())
+        addItem(menu, "Quit Axe", key: "q", action: #selector(NSApp.terminate(_:)))
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        DispatchQueue.main.async { self.statusItem.menu = nil }
+    }
+
+    @discardableResult
+    private func addItem(_ menu: NSMenu, _ title: String, key: String,
+                         tip: String? = nil, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        if let tip { item.toolTip = tip }
+        menu.addItem(item)
+        return item
+    }
+
+    // MARK: Settings
+
+    @objc func openSettings() { settingsWindow.show() }
+
+    // MARK: Hot key (⌥⌘K)
 
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind:  OSType(kEventHotKeyPressed))
-        // InstallApplicationEventHandler is a C macro; call the underlying function directly.
-        var handlerRef: EventHandlerRef?
-        InstallEventHandler(GetApplicationEventTarget(), hotKeyCallback,
-                            1, &spec,
-                            Unmanaged.passUnretained(self).toOpaque(),
-                            &handlerRef)
-        let hkID = EventHotKeyID(signature: fourCC("axe!"), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_K), UInt32(cmdKey | optionKey),
-                            hkID, GetApplicationEventTarget(), 0, &hotKeyRef)
+        var ref: EventHandlerRef?
+        InstallEventHandler(GetApplicationEventTarget(), hotKeyCallback, 1, &spec,
+                            Unmanaged.passUnretained(self).toOpaque(), &ref)
+        let id = EventHotKeyID(signature: fourCC("axe!"), id: 1)
+        // ⌘A — when the overlay is already frontmost, hotkeyPressed() lets
+        // the in-overlay selectAll: fire instead of toggling.
+        RegisterEventHotKey(UInt32(kVK_ANSI_A), UInt32(cmdKey),
+                            id, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    // Called by the Carbon hot key. Skips the toggle when the overlay is
+    // already key so ⌘A can be handled as "select all" inside the panel.
+    func hotkeyPressed() {
+        if let p = panel, p.isVisible, p.isKeyWindow { return }
+        toggleOverlay()
+    }
+
+    // MARK: Live app list — updates while overlay is open
+
+    func watchWorkspace() {
+        let nc = NSWorkspace.shared.notificationCenter
+        for n in [NSWorkspace.didLaunchApplicationNotification,
+                  NSWorkspace.didTerminateApplicationNotification] {
+            nc.addObserver(self, selector: #selector(workspaceChanged), name: n, object: nil)
+        }
+    }
+
+    @objc func workspaceChanged() {
+        guard let p = panel, p.isVisible else { return }
+        NSObject.cancelPreviousPerformRequests(withTarget: self,
+                                               selector: #selector(liveRefresh), object: nil)
+        perform(#selector(liveRefresh), with: nil, afterDelay: 0.25)
+    }
+
+    @objc func liveRefresh() {
+        let query = searchField?.stringValue ?? ""
+        refreshApps()
+        applyFilter(query)
     }
 
     // MARK: Overlay lifecycle
 
     @objc func toggleOverlay() {
-        if let p = panel, p.isVisible { hideOverlay() } else { showOverlay() }
+        DispatchQueue.main.async {
+            if let p = self.panel, p.isVisible { self.hideOverlay() } else { self.showOverlay() }
+        }
     }
 
     func showOverlay() {
@@ -135,10 +541,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if panel == nil { buildPanel() }
         searchField?.stringValue = ""
         applyFilter("")
-        panel?.center()
-        NSApp.activate(ignoringOtherApps: true)
+
+        // Position: center of the screen with the frontmost window
+        if let screen = NSScreen.main {
+            let sf = screen.visibleFrame
+            let pw = panel!.frame
+            panel?.setFrameOrigin(NSPoint(
+                x: sf.midX - pw.width  / 2,
+                y: sf.midY - pw.height / 2 + sf.height * 0.08))
+        }
+
+        // Animate in: fade + subtle scale
+        let cv = panel!.contentView!
+        cv.wantsLayer = true
+        cv.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.95, y: 0.95))
+        panel?.alphaValue = 0
         panel?.makeKeyAndOrderFront(nil)
-        // Give the window a tick to become key before forwarding focus.
+        NSApp.activate(ignoringOtherApps: true)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel?.animator().alphaValue = 1
+        }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            cv.animator().layer?.setAffineTransform(.identity)
+        }
+
+        NotificationCenter.default.addObserver(self, selector: #selector(panelResignedKey),
+                                               name: NSWindow.didResignKeyNotification,
+                                               object: panel)
+
         DispatchQueue.main.async { [weak self] in
             guard let sf = self?.searchField else { return }
             sf.window?.makeFirstResponder(sf)
@@ -146,29 +580,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func hideOverlay() {
-        panel?.orderOut(nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification,
+                                                  object: panel)
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            panel?.animator().alphaValue = 0
+        }, completionHandler: {
+            self.panel?.orderOut(nil)
+            self.panel?.alphaValue = 1
+        })
     }
 
-    // MARK: Build the Spotlight-style panel
+    @objc func panelResignedKey() {
+        // Don't dismiss if a child window (e.g. settings) just opened
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self, let p = self.panel, p.isVisible,
+                  !p.isKeyWindow else { return }
+            self.hideOverlay()
+        }
+    }
+
+    // MARK: Build overlay panel
 
     func buildPanel() {
-        let W: CGFloat = 520
-        let searchH: CGFloat = 52
-        let rowH: CGFloat = 44
+        let W: CGFloat  = 540
+        let searchH: CGFloat = 54
+        let rowH: CGFloat    = 46
         let maxRows: CGFloat = 7
-        let H = searchH + 1 + rowH * maxRows   // 361
+        let hintH: CGFloat   = 34
+        let H = searchH + 1 + rowH * maxRows + 1 + hintH  // 412
 
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                         styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
                         backing: .buffered, defer: false)
-        p.titleVisibility              = .hidden
-        p.titlebarAppearsTransparent   = true
-        p.isMovableByWindowBackground  = true
-        p.level                        = .floating
-        p.isReleasedWhenClosed         = false
-        p.backgroundColor              = .clear
+        p.titleVisibility             = .hidden
+        p.titlebarAppearsTransparent  = true
+        p.isMovableByWindowBackground = true
+        p.level              = .floating
+        p.isReleasedWhenClosed = false
+        p.backgroundColor    = .clear
 
-        // Frosted glass background with rounded corners
         let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: W, height: H))
         bg.blendingMode = .behindWindow
         bg.material     = .popover
@@ -178,87 +629,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.layer?.masksToBounds = true
         p.contentView = bg
 
-        // Search field
+        // ── Search bar ─────────────────────────────────────────────
+        let searchIcon = NSTextField(labelWithString: " 🔍")
+        searchIcon.font = .systemFont(ofSize: 15)
+        searchIcon.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(searchIcon)
+
         let sf = NSTextField(frame: .zero)
-        sf.placeholderString = "Type to filter running apps…"
-        sf.isBordered    = false
-        sf.isBezeled     = false
-        sf.drawsBackground = false
-        sf.font          = .systemFont(ofSize: 18, weight: .regular)
-        sf.focusRingType = .none
-        sf.delegate      = self
+        sf.placeholderString = "Filter running apps…"
+        sf.isBordered = false; sf.isBezeled = false; sf.drawsBackground = false
+        sf.font = .systemFont(ofSize: 18); sf.focusRingType = .none
+        sf.delegate = self
         sf.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sf)
         searchField = sf
 
-        // Subtle search icon label
-        let lupa = NSTextField(labelWithString: " 🔍")
-        lupa.font = .systemFont(ofSize: 16)
-        lupa.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(lupa)
-
         NSLayoutConstraint.activate([
-            lupa.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            lupa.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
-
-            sf.leadingAnchor.constraint(equalTo: lupa.trailingAnchor, constant: 6),
+            searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            searchIcon.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 4),
             sf.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
-            sf.centerYAnchor.constraint(equalTo: lupa.centerYAnchor),
+            sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
             sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
 
-        // Divider
-        let div = NSBox(frame: .zero)
-        div.boxType = .separator
-        div.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(div)
+        // ── Top divider ────────────────────────────────────────────
+        let topDiv = divider()
+        bg.addSubview(topDiv)
         NSLayoutConstraint.activate([
-            div.topAnchor.constraint(equalTo: bg.topAnchor, constant: searchH),
-            div.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            div.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            div.heightAnchor.constraint(equalToConstant: 1),
+            topDiv.topAnchor.constraint(equalTo: bg.topAnchor, constant: searchH),
+            topDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            topDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            topDiv.heightAnchor.constraint(equalToConstant: 1),
         ])
 
-        // App table
+        // ── Table (app list) ───────────────────────────────────────
         let tv = NSTableView()
-        tv.headerView              = nil
-        tv.rowHeight               = rowH
-        tv.gridStyleMask           = []
+        tv.headerView  = nil
+        tv.rowHeight   = rowH
+        tv.gridStyleMask = []
+        tv.backgroundColor = .clear
+        tv.dataSource  = self
+        tv.delegate    = self
+        tv.allowsMultipleSelection = true
+        tv.action       = #selector(tableClicked)
+        tv.doubleAction = #selector(tableDoubleClicked)
+        tv.target       = self
         if #available(macOS 12.0, *) { tv.style = .sourceList }
-        else { tv.selectionHighlightStyle = .sourceList }
-        tv.backgroundColor         = .clear
-        tv.dataSource              = self
-        tv.delegate                = self
-        tv.action                  = #selector(tableClicked)
-        tv.target                  = self
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
-        col.width = W
-        tv.addTableColumn(col)
+        col.width = W; tv.addTableColumn(col)
         tableView = tv
 
-        let sv = NSScrollView(frame: .zero)
-        sv.documentView          = tv
-        sv.hasVerticalScroller   = true
-        sv.hasHorizontalScroller = false
-        sv.drawsBackground       = false
+        let sv = NSScrollView()
+        sv.documentView = tv; sv.hasVerticalScroller = true
+        sv.hasHorizontalScroller = false; sv.drawsBackground = false
         sv.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sv)
+
+        // ── Empty state ────────────────────────────────────────────
+        let ev = EmptyStateView()
+        ev.translatesAutoresizingMaskIntoConstraints = false
+        ev.isHidden = true
+        bg.addSubview(ev)
+        emptyView = ev
+
         NSLayoutConstraint.activate([
-            sv.topAnchor.constraint(equalTo: div.bottomAnchor),
+            sv.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
             sv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            sv.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+            sv.heightAnchor.constraint(equalToConstant: rowH * maxRows),
+            ev.topAnchor.constraint(equalTo: sv.topAnchor),
+            ev.leadingAnchor.constraint(equalTo: sv.leadingAnchor),
+            ev.trailingAnchor.constraint(equalTo: sv.trailingAnchor),
+            ev.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
+        ])
+
+        // ── Bottom divider + hint bar ──────────────────────────────
+        let botDiv = divider()
+        bg.addSubview(botDiv)
+
+        let hint = NSTextField(labelWithString: "")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .quaternaryLabelColor
+        hint.alignment = .center
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(hint)
+        hintLabel = hint
+
+        NSLayoutConstraint.activate([
+            botDiv.topAnchor.constraint(equalTo: sv.bottomAnchor),
+            botDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            botDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            botDiv.heightAnchor.constraint(equalToConstant: 1),
+            hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
+            hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            hint.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            hint.heightAnchor.constraint(equalToConstant: hintH),
         ])
 
         panel = p
+        updateHint()
     }
 
-    // MARK: Running app list
+    private func divider() -> NSView {
+        let v = NSBox(); v.boxType = .separator
+        v.translatesAutoresizingMaskIntoConstraints = false
+        return v
+    }
+
+    // MARK: App data
 
     func refreshApps() {
         let selfPID = ProcessInfo.processInfo.processIdentifier
         allApps = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+            .filter {
+                $0.processIdentifier != selfPID
+                && (AppSettings.showBackground
+                    ? $0.activationPolicy != .prohibited
+                    : $0.activationPolicy == .regular)
+            }
             .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
             .map(AppEntry.init)
     }
@@ -271,40 +760,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if !filtered.isEmpty {
             tableView?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
+        updateEmptyState(query: query)
+        updateHint()
+    }
+
+    func refreshAndFilter() {
+        refreshApps()
+        applyFilter(searchField?.stringValue ?? "")
+    }
+
+    private func updateEmptyState(query: String) {
+        if filtered.isEmpty {
+            emptyView?.show(query.isEmpty ? "No apps running" : "No matches for \"\(query)\"")
+        } else {
+            emptyView?.hide()
+        }
+    }
+
+    private func updateHint() {
+        let sel = tableView?.selectedRowIndexes.count ?? 0
+        if sel > 1 {
+            hintLabel?.stringValue = "\(sel) apps selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close"
+        } else {
+            hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill  ·  ⌘A select all  ·  esc close"
+        }
     }
 
     // MARK: Kill logic
 
     func killSelected(force: Bool) {
-        let row = tableView?.selectedRow ?? -1
-        guard row >= 0, row < filtered.count else { return }
-        killEntry(filtered[row], force: force)
+        let rows = tableView?.selectedRowIndexes ?? IndexSet()
+        guard !rows.isEmpty else { return }
+        let targets = rows.compactMap { filtered[safe: $0] }
+        targets.forEach { killEntry($0, force: force) }
+
+        if AppSettings.autoClose && targets.count >= filtered.count {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                if self?.filtered.isEmpty == true { self?.hideOverlay() }
+            }
+        }
     }
 
     func killEntry(_ entry: AppEntry, force: Bool) {
-        if force {
+        let resolved = force ? KillMode.force : AppSettings.killMode
+        if resolved == .force {
             entry.app.forceTerminate()
         } else {
             let pid = entry.app.processIdentifier
             entry.app.terminate()
-            // Follow-up force-kill after 2 s if the app is still alive
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                NSRunningApplication(processIdentifier: pid)?.forceTerminate()
+            let delay = AppSettings.gracePeriod
+            if delay > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    NSRunningApplication(processIdentifier: pid)?.forceTerminate()
+                }
             }
         }
-        // Refresh the list after a short tick so the app has time to exit
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self else { return }
-            self.refreshApps()
-            self.applyFilter(self.searchField?.stringValue ?? "")
+            self?.refreshAndFilter()
         }
     }
 
-    // MARK: Table click — single click kills; ⌘-click force-kills
+    // MARK: Table interactions
 
     @objc func tableClicked() {
+        updateHint()
+    }
+
+    @objc func tableDoubleClicked() {
         let row = tableView?.clickedRow ?? -1
         guard row >= 0, row < filtered.count else { return }
+        // Double-click always kills just the clicked row
         let force = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
         killEntry(filtered[row], force: force)
     }
@@ -319,13 +844,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let id = NSUserInterfaceItemIdentifier("AppRow")
         let cell = tv.makeView(withIdentifier: id, owner: nil) as? AppRowCell
                    ?? { let c = AppRowCell(frame: .zero); c.identifier = id; return c }()
-        let entry = filtered[row]
-        cell.appName.stringValue = entry.name
-        cell.appIcon.image       = entry.icon
+        let e = filtered[row]
+        cell.appName.stringValue  = e.name
+        cell.appIcon.image        = e.icon
+        cell.memLabel.stringValue = e.memMB.map { "\($0) MB" } ?? "—"
         return cell
     }
 
-    // MARK: NSTextFieldDelegate — search filtering + keyboard nav
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        updateHint()
+    }
+
+    // MARK: NSTextFieldDelegate — search + keyboard navigation
 
     func controlTextDidChange(_ note: Notification) {
         applyFilter(searchField?.stringValue ?? "")
@@ -334,22 +864,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func control(_ control: NSControl, textView: NSTextView,
                  doCommandBy sel: Selector) -> Bool {
         switch sel {
-        case #selector(NSResponder.cancelOperation(_:)):        // Esc
-            hideOverlay()
-            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            hideOverlay(); return true
 
-        case #selector(NSResponder.insertNewline(_:)):          // Return / ⌘Return
+        case #selector(NSResponder.insertNewline(_:)):
             let force = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
-            killSelected(force: force)
-            return true
+            killSelected(force: force); return true
 
-        case #selector(NSResponder.moveUp(_:)):                 // ↑
-            moveSelection(by: -1)
-            return true
+        case #selector(NSResponder.deleteBackward(_:)),
+             #selector(NSResponder.deleteForward(_:)):
+            // Delete with empty search field = kill selected
+            if searchField?.stringValue.isEmpty == true {
+                killSelected(force: false); return true
+            }
+            return false
 
-        case #selector(NSResponder.moveDown(_:)):               // ↓
-            moveSelection(by: 1)
-            return true
+        case #selector(NSResponder.moveUp(_:)):
+            moveSelection(by: -1); return true
+
+        case #selector(NSResponder.moveDown(_:)):
+            moveSelection(by: 1); return true
+
+        case #selector(NSResponder.selectAll(_:)):
+            tableView?.selectAll(nil)
+            updateHint(); return true
 
         default:
             return false
@@ -358,13 +896,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func moveSelection(by delta: Int) {
         guard let tv = tableView, tv.numberOfRows > 0 else { return }
-        let next = max(0, min(tv.numberOfRows - 1, (tv.selectedRow < 0 ? 0 : tv.selectedRow) + delta))
+        let cur  = tv.selectedRow < 0 ? (delta > 0 ? -1 : 0) : tv.selectedRow
+        let next = max(0, min(tv.numberOfRows - 1, cur + delta))
         tv.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
         tv.scrollRowToVisible(next)
+        updateHint()
     }
 }
 
-// ─────────────────────────── Entry point ──────────────────────────
+// MARK: - Entry point
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
