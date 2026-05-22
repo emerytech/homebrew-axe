@@ -1192,6 +1192,119 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
     @objc private func cancelTapped() { onCancel?(); onCancel = nil; dismiss() }
 }
 
+// MARK: - AboutWindow
+
+final class AboutWindow: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); bringToFront(); return }
+
+        let W: CGFloat = 340
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 260),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "About Axe"
+        w.titleVisibility            = .hidden
+        w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed       = false
+        w.delegate                   = self
+
+        guard let cv = w.contentView else { return }
+
+        // App icon
+        let icon = NSImageView()
+        icon.image        = NSApp.applicationIconImage
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 80),
+            icon.heightAnchor.constraint(equalToConstant: 80),
+        ])
+
+        // "Axe" title
+        let title = NSTextField(labelWithString: "Axe")
+        title.font = .systemFont(ofSize: 24, weight: .bold)
+
+        // Version
+        let version = NSTextField(labelWithString: "Version \(appVersion)")
+        version.font      = .systemFont(ofSize: 12)
+        version.textColor = .secondaryLabelColor
+
+        // Tagline
+        let tagline = NSTextField(labelWithString: "Kill running apps — fast.")
+        tagline.font      = .systemFont(ofSize: 12)
+        tagline.textColor = .secondaryLabelColor
+
+        // Copyright
+        let copy = NSTextField(labelWithString: "© 2025 Taylor Emery. All rights reserved.")
+        copy.font      = .systemFont(ofSize: 10)
+        copy.textColor = .tertiaryLabelColor
+
+        // Website link
+        let websiteBtn = NSButton(title: "axe-app.com", target: self, action: #selector(openWebsite))
+        websiteBtn.bezelStyle     = .inline
+        websiteBtn.isBordered     = false
+        websiteBtn.font           = .systemFont(ofSize: 11)
+        websiteBtn.contentTintColor = .controlAccentColor
+
+        // Text stack
+        let textStack = NSStackView(views: [title, version, tagline])
+        textStack.orientation = .vertical
+        textStack.alignment   = .leading
+        textStack.spacing     = 3
+
+        // Top row: icon + text
+        let topRow = NSStackView(views: [icon, textStack])
+        topRow.orientation = .horizontal
+        topRow.alignment   = .centerY
+        topRow.spacing     = 16
+
+        // Divider
+        let sep = NSBox(); sep.boxType = .separator
+
+        // Bottom row
+        let bottomStack = NSStackView(views: [copy, websiteBtn])
+        bottomStack.orientation = .vertical
+        bottomStack.alignment   = .centerX
+        bottomStack.spacing     = 4
+
+        // Root
+        let root = NSStackView(views: [topRow, sep, bottomStack])
+        root.orientation = .vertical
+        root.alignment   = .centerX
+        root.spacing     = 16
+        root.edgeInsets  = NSEdgeInsets(top: 28, left: 24, bottom: 20, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(root)
+
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: cv.topAnchor),
+            root.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            sep.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+            topRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+        ])
+
+        window = w
+        w.center()
+        w.makeKeyAndOrderFront(nil)
+        bringToFront()
+    }
+
+    func windowWillClose(_ n: Notification) { window = nil }
+
+    private func bringToFront() {
+        if #available(macOS 14.0, *) { NSApp.activate() }
+        else { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    @objc private func openWebsite() {
+        NSWorkspace.shared.open(URL(string: "https://emerytech.github.io/homebrew-axe/")!)
+    }
+}
+
 // MARK: - SelfUpdater
 
 /// Downloads the latest release zip, swaps the app bundle via a helper script, and relaunches.
@@ -2285,6 +2398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
         addItem(menu, "Quick Start Guide…",  key: "",  action: #selector(showOnboarding))
         addItem(menu, "Check for Updates…",  key: "",  action: #selector(checkForUpdatesMI))
+        addItem(menu, "About Axe",           key: "",  action: #selector(showAbout))
         menu.addItem(.separator())
         addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
         statusItem.menu = menu
@@ -2307,6 +2421,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func openSettings()   { settingsWindow.show() }
     @objc func showOnboarding() { onboardingWindow.show() }
     @objc func quitAxe()        { NSApp.terminate(nil) }
+    @objc func showAbout()      { aboutWindow.show() }
+
+    lazy var aboutWindow = AboutWindow()
     @objc func showNudgeWindow() { nudgeWindow.show() }
 
     // MARK: Support nudge timer
