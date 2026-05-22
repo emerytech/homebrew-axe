@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.1.0"
+let appVersion = "2.1.1"
 
 // MARK: - Settings
 
@@ -51,7 +51,7 @@ struct AppSettings {
     }
     // Global hotkey stored as Carbon key code + Carbon modifier flags + display character
     static var hotKeyCode: UInt32 {
-        get { d.object(forKey: "hotKeyCode") == nil ? UInt32(kVK_ANSI_A) : UInt32(d.integer(forKey: "hotKeyCode")) }
+        get { d.object(forKey: "hotKeyCode") == nil ? UInt32(kVK_ANSI_Z) : UInt32(d.integer(forKey: "hotKeyCode")) }
         set { d.set(Int(newValue), forKey: "hotKeyCode") }
     }
     static var hotKeyMods: UInt32 {
@@ -59,7 +59,7 @@ struct AppSettings {
         set { d.set(Int(newValue), forKey: "hotKeyMods") }
     }
     static var hotKeyChar: String {
-        get { d.string(forKey: "hotKeyChar") ?? "A" }
+        get { d.string(forKey: "hotKeyChar") ?? "Z" }
         set { d.set(newValue, forKey: "hotKeyChar") }
     }
     /// Human-readable shortcut string, e.g. "⌘A" or "⌥⇧B"
@@ -1199,7 +1199,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
         // ── Feature rows ────────────────────────────────────────────
         let features: [(String, String, String)] = [
-            ("⌘A",                       "Open Axe from anywhere — no Accessibility needed",       ""),
+            ("⌘Z",                       "Open Axe from anywhere — no Accessibility needed",       ""),
             ("magnifyingglass",           "Type to instantly filter your running apps",              "sf"),
             ("cursorarrow.click.2",       "Double-click a row to quit  ·  ⌘-double-click to force kill", "sf"),
             ("checkmark.square",          "Tick checkboxes to build a batch list, then confirm",    "sf"),
@@ -1510,7 +1510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func showStatusMenu() {
         let menu = NSMenu()
-        addItem(menu, "Show Axe", key: "", tip: "⌘A", action: #selector(toggleOverlay))
+        addItem(menu, "Show Axe", key: "", tip: "⌘Z", action: #selector(toggleOverlay))
         menu.addItem(.separator())
 
         // Sessions submenu
