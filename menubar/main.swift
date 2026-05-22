@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.6.2"
+let appVersion = "1.6.3"
 
 // MARK: - Settings
 
@@ -742,6 +742,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "Here, hold this hand grenade",             // classic cartoon gag
     ]
 
+    let sparePhrases: [String] = [
+        "Nah, you're good",
+        "My bad, live",
+        "Walk it off",
+        "Fine. Stay.",
+        "Changed my mind",
+        "Not today",
+        "I'll allow it",
+        "Abort! Abort!",
+        "Retreat!",
+        "Run. Run far away.",
+        "Lucky. Very lucky.",
+        "Consider this a warning",
+        "Don't make me regret this",
+        "You didn't see anything",
+        "Everyone gets one",
+        "Godspeed, little app",
+        "You live to crash another day",
+        "Let's not and say we did",
+        "As you were",
+        "Touch grass instead",
+        "Carry on, nothing to see here",
+        "Move along, move along",
+        "This is your last warning",
+        "On second thought…",
+    ]
+
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
 
@@ -1095,10 +1122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc func panelResignedKey() {
-        // Don't dismiss if a child window (e.g. settings) just opened
+        // Don't dismiss if a child window (settings) or a sheet (confirm dialog) is open.
+        // beginSheetModal makes the sheet key, not the panel, so isKeyWindow goes false —
+        // checking attachedSheet prevents the overlay from vanishing mid-confirmation.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self, let p = self.panel, p.isVisible,
-                  !p.isKeyWindow else { return }
+                  !p.isKeyWindow,
+                  p.attachedSheet == nil else { return }
             self.hideOverlay()
         }
     }
@@ -1405,8 +1435,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             alert.messageText     = "Axe \(targets.count) apps?"
             alert.informativeText = "All \(targets.count) selected apps will be terminated."
         }
-        alert.addButton(withTitle: "Off with its head!")   // .alertFirstButtonReturn
-        alert.addButton(withTitle: "Spare them for now")   // .alertSecondButtonReturn
+        let yesPhrase = killPhrases.randomElement()  ?? "Do it!"
+        let noPhrase  = sparePhrases.randomElement() ?? "Spare them for now"
+        alert.addButton(withTitle: yesPhrase)   // .alertFirstButtonReturn  (right/default)
+        alert.addButton(withTitle: noPhrase)    // .alertSecondButtonReturn (left/cancel)
         alert.alertStyle = .warning
 
         if let p = panel, p.isVisible {
