@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.7.0"
+let appVersion = "1.7.1"
 
 // MARK: - Settings
 
@@ -1633,8 +1633,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             alert.messageText     = "Axe \(targets.count) apps?"
             alert.informativeText = "All \(targets.count) selected apps will be terminated."
         }
-        let yesPhrase = killPhrases.randomElement()  ?? "Do it!"
-        let noPhrase  = sparePhrases.randomElement() ?? "Spare them for now"
+        let yesPhrase = (killPhrases.randomElement()  ?? "Do it!")        + " (yes)"
+        let noPhrase  = (sparePhrases.randomElement() ?? "Spare them for now") + " (no)"
         alert.addButton(withTitle: yesPhrase)   // .alertFirstButtonReturn  (right/default)
         alert.addButton(withTitle: noPhrase)    // .alertSecondButtonReturn (left/cancel)
         alert.alertStyle = .warning
