@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.6.0"
+let appVersion = "1.6.1"
 
 // MARK: - Settings
 
@@ -724,8 +724,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "Off with their heads!",               // Alice in Wonderland
         "I am become Death",                   // Oppenheimer / Bhagavad Gita
         "He's dead, Jim",                      // Star Trek
-        "I am inevitable",                     // Avengers: Endgame — Thanos
-        "Sick of these MFN apps on my MFN Mac", // Snakes on a Plane
+        "I am inevitable",                          // Avengers: Endgame — Thanos
+        "Sick of these MFN apps on my MFN Mac",     // Snakes on a Plane
+        "Just die already",                         // universal exasperation
+        "Go on, get",                               // classic Southern sendoff
+        "To the train station",                     // Yellowstone
+        "Rock, paper, you're dead",                 // original
+        "You're going to the farm upstate",         // the classic parent lie
+        "You are the weakest link. Goodbye.",       // The Weakest Link
+        "The tribe has spoken",                     // Survivor
+        "Derezz",                                   // TRON — programs being killed
+        "Exit stage left",                          // Snagglepuss
+        "Get off my lawn!",                         // Gran Torino
+        "Bye bye bye",                              // NSYNC
+        "One does not simply exist anymore",        // LOTR meme
+        "Hit the road, Jack",                       // Ray Charles
     ]
 
     // Carbon hot key
