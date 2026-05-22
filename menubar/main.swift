@@ -3,11 +3,12 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.6.3"
+let appVersion = "1.7.0"
 
 // MARK: - Settings
 
-enum KillMode: Int { case graceful = 0, force = 1 }
+enum KillMode: Int  { case graceful = 0, force = 1 }
+enum UIStyle:  Int  { case spotlight = 0, popover = 1 }
 
 struct AppSettings {
     private static let d = UserDefaults.standard
@@ -30,6 +31,10 @@ struct AppSettings {
     static var autoClose: Bool {
         get { d.object(forKey: "autoClose") == nil ? true : d.bool(forKey: "autoClose") }
         set { d.set(newValue, forKey: "autoClose") }
+    }
+    static var uiStyle: UIStyle {
+        get { UIStyle(rawValue: d.integer(forKey: "uiStyle")) ?? .spotlight }
+        set { d.set(newValue.rawValue, forKey: "uiStyle") }
     }
     // Require a confirmation alert before killing any app
     static var confirmKill: Bool {
@@ -255,6 +260,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         ])
 
         addSection("General", to: root, rows: [
+            popupRow("Interface style",
+                     options: ["Spotlight overlay", "Menu bar popover"],
+                     selected: AppSettings.uiStyle.rawValue) { AppSettings.uiStyle = UIStyle(rawValue: $0) ?? .spotlight },
             toggleRow("Launch at Login",
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits",
@@ -687,8 +695,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Status bar
     var statusItem: NSStatusItem!
 
-    // Overlay
-    var panel:       NSPanel?
+    // Overlay — spotlight mode
+    var panel:          NSPanel?
+    // Overlay — popover mode
+    var popover:        NSPopover?
+    var popoverVC:      NSViewController?
+    // Tracks which style was used to build the current overlay (detects setting changes)
+    var lastBuiltStyle: UIStyle?
+
     var searchField: NSTextField?
     var tableView:   NSTableView?
     var emptyView:   EmptyStateView?
@@ -1026,10 +1040,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                             id, GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
-    // Called by the Carbon hot key. Skips the toggle when the overlay is
-    // already key so ⌘A can be handled as "select all" inside the panel.
+    // Called by the Carbon hot key. In spotlight mode, skip the toggle when
+    // the panel is already key so ⌘A fires "select all" inside the search field.
     func hotkeyPressed() {
-        if let p = panel, p.isVisible, p.isKeyWindow { return }
+        if AppSettings.uiStyle == .spotlight,
+           let p = panel, p.isVisible, p.isKeyWindow { return }
         toggleOverlay()
     }
 
@@ -1060,19 +1075,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     @objc func toggleOverlay() {
         DispatchQueue.main.async {
-            if let p = self.panel, p.isVisible { self.hideOverlay() } else { self.showOverlay() }
+            if self.isOverlayVisible { self.hideOverlay() } else { self.showOverlay() }
         }
     }
 
+    var isOverlayVisible: Bool {
+        switch AppSettings.uiStyle {
+        case .spotlight: return panel?.isVisible ?? false
+        case .popover:   return popover?.isShown  ?? false
+        }
+    }
+
+    // Tear down the built overlay so it's rebuilt fresh (called when style changes).
+    func teardownOverlay() {
+        panel?.orderOut(nil); panel = nil
+        popover?.close();     popover = nil; popoverVC = nil
+        searchField = nil; tableView = nil; emptyView = nil
+        hintLabel = nil; sortButton = nil; axeCheckedButton = nil
+        lastBuiltStyle = nil
+    }
+
     func showOverlay() {
+        // Rebuild if the user switched styles since last open
+        if let built = lastBuiltStyle, built != AppSettings.uiStyle { teardownOverlay() }
+
         checkedPIDs.removeAll()
         currentKillPhrase = ""
         refreshApps()
-        if panel == nil { buildPanel() }
+
+        switch AppSettings.uiStyle {
+        case .spotlight: showSpotlight()
+        case .popover:   showPopover()
+        }
+
         searchField?.stringValue = ""
         applyFilter("")
+        DispatchQueue.main.async { [weak self] in
+            guard let sf = self?.searchField else { return }
+            sf.window?.makeFirstResponder(sf)
+        }
+    }
 
-        // Position: center of the screen with the frontmost window
+    // MARK: Spotlight mode
+
+    private func showSpotlight() {
+        if panel == nil { buildPanel(); lastBuiltStyle = .spotlight }
+
         if let screen = NSScreen.main {
             let sf = screen.visibleFrame
             let pw = panel!.frame
@@ -1081,7 +1129,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 y: sf.midY - pw.height / 2 + sf.height * 0.08))
         }
 
-        // Animate in: fade + subtle scale
         let cv = panel!.contentView!
         cv.wantsLayer = true
         cv.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.95, y: 0.95))
@@ -1089,36 +1136,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.duration = 0.18; ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel?.animator().alphaValue = 1
         }
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.duration = 0.22; ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             cv.animator().layer?.setAffineTransform(.identity)
         }
-
         NotificationCenter.default.addObserver(self, selector: #selector(panelResignedKey),
-                                               name: NSWindow.didResignKeyNotification,
-                                               object: panel)
+                                               name: NSWindow.didResignKeyNotification, object: panel)
+    }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let sf = self?.searchField else { return }
-            sf.window?.makeFirstResponder(sf)
-        }
+    // MARK: Popover mode
+
+    private func showPopover() {
+        if popover == nil { buildPopover(); lastBuiltStyle = .popover }
+        guard let btn = statusItem.button else { return }
+        popover?.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func hideOverlay() {
-        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification,
-                                                  object: panel)
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
-            panel?.animator().alphaValue = 0
-        }, completionHandler: {
-            self.panel?.orderOut(nil)
-            self.panel?.alphaValue = 1
-        })
+        switch lastBuiltStyle ?? AppSettings.uiStyle {
+        case .spotlight:
+            NotificationCenter.default.removeObserver(self,
+                name: NSWindow.didResignKeyNotification, object: panel)
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.12
+                panel?.animator().alphaValue = 0
+            }, completionHandler: {
+                self.panel?.orderOut(nil)
+                self.panel?.alphaValue = 1
+            })
+        case .popover:
+            popover?.close()
+        }
     }
 
     @objc func panelResignedKey() {
@@ -1127,8 +1179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // checking attachedSheet prevents the overlay from vanishing mid-confirmation.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self, let p = self.panel, p.isVisible,
-                  !p.isKeyWindow,
-                  p.attachedSheet == nil else { return }
+                  !p.isKeyWindow, p.attachedSheet == nil else { return }
             self.hideOverlay()
         }
     }
@@ -1303,6 +1354,153 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ])
 
         panel = p
+        updateHint()
+    }
+
+    // MARK: Build popover
+
+    private func buildPopover() {
+        let W: CGFloat       = 420
+        let searchH: CGFloat = 50
+        let rowH: CGFloat    = 46
+        let maxRows: CGFloat = 8
+        let hintH: CGFloat   = 34
+        let H = searchH + 1 + rowH * maxRows + 1 + hintH
+
+        let vc = NSViewController()
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        vc.view = bg
+        vc.preferredContentSize = NSSize(width: W, height: H)
+        popoverVC = vc
+
+        // ── Search bar ─────────────────────────────────────────────
+        let searchIcon = NSImageView()
+        if let sym = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) {
+            searchIcon.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+        }
+        searchIcon.contentTintColor = .tertiaryLabelColor
+        searchIcon.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(searchIcon)
+
+        let sortBtn = NSButton()
+        sortBtn.isBordered = false
+        if let sym = NSImage(systemSymbolName: sortByMemory ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down",
+                             accessibilityDescription: "Sort") {
+            sortBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sortBtn.contentTintColor = sortByMemory ? .controlAccentColor : .tertiaryLabelColor
+        sortBtn.target = self; sortBtn.action = #selector(toggleSort)
+        sortBtn.toolTip = "Sort by name / memory"
+        sortBtn.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sortBtn)
+        sortButton = sortBtn
+
+        let count = allApps.count
+        let sf = NSTextField(frame: .zero)
+        sf.placeholderString = count == 1 ? "1 app running…" : "\(count) apps running…"
+        sf.isBordered = false; sf.isBezeled = false; sf.drawsBackground = false
+        sf.font = .systemFont(ofSize: 16); sf.focusRingType = .none
+        sf.delegate = self
+        sf.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sf)
+        searchField = sf
+
+        NSLayoutConstraint.activate([
+            searchIcon.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            searchIcon.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            searchIcon.widthAnchor.constraint(equalToConstant: 16),
+            searchIcon.heightAnchor.constraint(equalToConstant: 16),
+            sortBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            sortBtn.centerYAnchor.constraint(equalTo: bg.topAnchor, constant: searchH / 2),
+            sortBtn.widthAnchor.constraint(equalToConstant: 26),
+            sortBtn.heightAnchor.constraint(equalToConstant: 26),
+            sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 6),
+            sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -6),
+            sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
+            sf.heightAnchor.constraint(equalToConstant: searchH),
+        ])
+
+        // ── Divider ────────────────────────────────────────────────
+        let topDiv = divider()
+        bg.addSubview(topDiv)
+        NSLayoutConstraint.activate([
+            topDiv.topAnchor.constraint(equalTo: bg.topAnchor, constant: searchH),
+            topDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            topDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            topDiv.heightAnchor.constraint(equalToConstant: 1),
+        ])
+
+        // ── Table ──────────────────────────────────────────────────
+        let tv = NSTableView()
+        tv.headerView = nil; tv.rowHeight = rowH
+        tv.gridStyleMask = []; tv.backgroundColor = .clear
+        tv.dataSource = self; tv.delegate = self
+        tv.allowsMultipleSelection = true
+        tv.action = #selector(tableClicked); tv.doubleAction = #selector(tableDoubleClicked)
+        tv.target = self
+        if #available(macOS 12.0, *) { tv.style = .sourceList }
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
+        col.width = W; tv.addTableColumn(col)
+        tableView = tv
+
+        let sv2 = NSScrollView()
+        sv2.documentView = tv; sv2.hasVerticalScroller = true
+        sv2.hasHorizontalScroller = false; sv2.drawsBackground = false
+        sv2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(sv2)
+
+        let ev = EmptyStateView()
+        ev.translatesAutoresizingMaskIntoConstraints = false; ev.isHidden = true
+        bg.addSubview(ev); emptyView = ev
+
+        NSLayoutConstraint.activate([
+            sv2.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            sv2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            sv2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            sv2.heightAnchor.constraint(equalToConstant: rowH * maxRows),
+            ev.topAnchor.constraint(equalTo: sv2.topAnchor),
+            ev.leadingAnchor.constraint(equalTo: sv2.leadingAnchor),
+            ev.trailingAnchor.constraint(equalTo: sv2.trailingAnchor),
+            ev.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
+        ])
+
+        // ── Hint bar ───────────────────────────────────────────────
+        let botDiv = divider(); bg.addSubview(botDiv)
+        let hint = NSTextField(labelWithString: "")
+        hint.font = .systemFont(ofSize: 11); hint.textColor = .quaternaryLabelColor
+        hint.alignment = .center
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(hint); hintLabel = hint
+
+        let axeBtn = RedButton()
+        axeBtn.isBordered = false; axeBtn.wantsLayer = true
+        axeBtn.target = self; axeBtn.action = #selector(axeCheckedApps)
+        axeBtn.isHidden = true
+        axeBtn.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(axeBtn); axeCheckedButton = axeBtn
+
+        NSLayoutConstraint.activate([
+            botDiv.topAnchor.constraint(equalTo: sv2.bottomAnchor),
+            botDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            botDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            botDiv.heightAnchor.constraint(equalToConstant: 1),
+            hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
+            hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            hint.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            hint.heightAnchor.constraint(equalToConstant: hintH),
+            axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: bg.trailingAnchor, constant: -16),
+        ])
+
+        let pop = NSPopover()
+        pop.contentViewController = vc
+        pop.behavior  = .transient
+        pop.animates  = true
+        popover = pop
         updateHint()
     }
 
