@@ -3,6 +3,8 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
+let appVersion = "1.5.0"
+
 // MARK: - Settings
 
 enum KillMode: Int { case graceful = 0, force = 1 }
@@ -287,7 +289,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.4.2  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v\(appVersion)  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -434,6 +436,198 @@ private extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
 }
 
+// MARK: - RedButton (reliable coloured background via layer)
+
+/// NSButton subclass that draws a solid coloured rounded background via Core Animation.
+/// NSButtonCell.backgroundColor is unreliable for bezel styles — this is the safe way.
+final class RedButton: NSButton {
+    var fillColor: NSColor = .systemRed { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        super.updateLayer()
+        layer?.backgroundColor = (isHighlighted
+            ? fillColor.withAlphaComponent(0.7)
+            : fillColor).cgColor
+        layer?.cornerRadius = 7
+    }
+    // Keep intrinsic height tidy
+    override var intrinsicContentSize: NSSize {
+        var s = super.intrinsicContentSize; s.height = 26; return s
+    }
+}
+
+// MARK: - OnboardingWindow
+
+final class OnboardingWindow: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+
+    var onDismiss: (() -> Void)?
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let W: CGFloat = 460
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 0),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = ""; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        buildUI(in: w, width: W)
+        window = w
+        w.center()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ n: Notification) { onDismiss?(); window = nil }
+
+    private func buildUI(in w: NSWindow, width W: CGFloat) {
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 0; root.alignment = .centerX
+        root.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
+
+        // ── Icon + heading ──────────────────────────────────────────
+        let iconView = NSImageView()
+        iconView.image = NSApp.applicationIconImage
+        iconView.imageScaling = .scaleAxesIndependently
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 72).isActive = true
+
+        let title = label("Welcome to Axe", size: 22, weight: .bold)
+        let sub   = label("The fastest way to quit running apps", size: 13,
+                          weight: .regular, color: .secondaryLabelColor)
+
+        let heading = NSStackView(views: [iconView, title, sub])
+        heading.orientation = .vertical; heading.spacing = 6; heading.alignment = .centerX
+        let hPad = padded(heading, top: 32, left: 0, bottom: 24)
+        root.addArrangedSubview(hPad); hPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Feature rows ────────────────────────────────────────────
+        let features: [(String, String, String)] = [
+            ("⌘A",                       "Open Axe from anywhere — no Accessibility needed",       ""),
+            ("magnifyingglass",           "Type to instantly filter your running apps",              "sf"),
+            ("cursorarrow.click.2",       "Double-click a row to quit  ·  ⌘-double-click to force kill", "sf"),
+            ("checkmark.square",          "Tick checkboxes to build a batch list, then confirm",    "sf"),
+            ("keyboard",                  "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill",              "sf"),
+            ("escape",                    "Esc to close the overlay",                               "sf"),
+        ]
+
+        let sep1 = NSBox(); sep1.boxType = .separator
+        sep1.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(sep1)
+        sep1.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let featureStack = NSStackView()
+        featureStack.orientation = .vertical; featureStack.spacing = 0; featureStack.alignment = .leading
+        featureStack.translatesAutoresizingMaskIntoConstraints = false
+
+        for (i, (sym, desc, kind)) in features.enumerated() {
+            let row = NSStackView(); row.orientation = .horizontal
+            row.spacing = 14; row.alignment = .centerY
+            row.edgeInsets = NSEdgeInsets(top: 10, left: 20, bottom: 10, right: 20)
+
+            let badge = NSView()
+            badge.wantsLayer = true
+            badge.layer?.backgroundColor = NSColor.tertiaryLabelColor.withAlphaComponent(0.15).cgColor
+            badge.layer?.cornerRadius = 5
+            badge.translatesAutoresizingMaskIntoConstraints = false
+            badge.widthAnchor.constraint(equalToConstant: 32).isActive = true
+            badge.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+            if kind == "sf", let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil) {
+                let iv = NSImageView()
+                iv.image = img.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 13, weight: .medium))
+                iv.contentTintColor = .secondaryLabelColor
+                iv.translatesAutoresizingMaskIntoConstraints = false
+                badge.addSubview(iv)
+                NSLayoutConstraint.activate([
+                    iv.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+                    iv.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+                ])
+            } else {
+                let kl = NSTextField(labelWithString: sym)
+                kl.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+                kl.textColor = .secondaryLabelColor
+                kl.alignment = .center
+                kl.translatesAutoresizingMaskIntoConstraints = false
+                badge.addSubview(kl)
+                NSLayoutConstraint.activate([
+                    kl.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+                    kl.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+                    kl.widthAnchor.constraint(equalTo: badge.widthAnchor),
+                ])
+            }
+
+            let dl = NSTextField(labelWithString: desc)
+            dl.font = .systemFont(ofSize: 13); dl.lineBreakMode = .byWordWrapping
+            dl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            row.addArrangedSubview(badge); row.addArrangedSubview(dl)
+            featureStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: featureStack.widthAnchor).isActive = true
+
+            if i < features.count - 1 {
+                let s = NSBox(); s.boxType = .separator
+                s.translatesAutoresizingMaskIntoConstraints = false
+                featureStack.addArrangedSubview(s)
+                s.widthAnchor.constraint(equalTo: featureStack.widthAnchor, constant: -40).isActive = true
+            }
+        }
+        root.addArrangedSubview(featureStack)
+        featureStack.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let sep2 = NSBox(); sep2.boxType = .separator
+        sep2.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(sep2)
+        sep2.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Get Started button ──────────────────────────────────────
+        let btn = NSButton(title: "Get Started", target: self, action: #selector(dismiss))
+        btn.bezelStyle = .rounded; btn.keyEquivalent = "\r"
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        let btnPad = padded(btn, top: 14, left: 0, bottom: 18)
+        root.addArrangedSubview(btnPad); btnPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        w.contentView?.layoutSubtreeIfNeeded()
+        let h = root.fittingSize.height
+        var f = w.frame; f.size.height = h + 28
+        w.setFrame(f, display: false); w.center()
+    }
+
+    @objc private func dismiss() { window?.close() }
+
+    private func label(_ s: String, size: CGFloat, weight: NSFont.Weight,
+                       color: NSColor = .labelColor) -> NSTextField {
+        let f = NSTextField(labelWithString: s)
+        f.font = .systemFont(ofSize: size, weight: weight)
+        f.textColor = color; f.alignment = .center
+        return f
+    }
+
+    private func padded(_ v: NSView, top: CGFloat = 0, left: CGFloat = 0,
+                        bottom: CGFloat = 0, right: CGFloat = 0) -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        v.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: wrap.topAnchor, constant: top),
+            v.centerXAnchor.constraint(equalTo: wrap.centerXAnchor),
+            v.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -bottom),
+        ])
+        return wrap
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate,
@@ -461,8 +655,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
 
-    // Settings
-    let settingsWindow = SettingsWindow()
+    // Settings / Onboarding
+    let settingsWindow  = SettingsWindow()
+    let onboardingWindow = OnboardingWindow()
 
     // MARK: Launch
 
@@ -470,6 +665,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         setupStatusItem()
         registerHotKey()
         watchWorkspace()
+        // Show onboarding on very first launch
+        if !UserDefaults.standard.bool(forKey: "hasSeenOnboarding") {
+            UserDefaults.standard.set(true, forKey: "hasSeenOnboarding")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.onboardingWindow.show()
+            }
+        }
+        // Silent background update check
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
+            self.checkForUpdates(userInitiated: false)
+        }
     }
 
     // MARK: Status item
@@ -492,7 +698,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let menu = NSMenu()
         addItem(menu, "Show Axe", key: "", tip: "⌘A", action: #selector(toggleOverlay))
         menu.addItem(.separator())
-        addItem(menu, "Settings…", key: ",", action: #selector(openSettings))
+        addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
+        addItem(menu, "Quick Start Guide…",  key: "",  action: #selector(showOnboarding))
+        addItem(menu, "Check for Updates…",  key: "",  action: #selector(checkForUpdatesMI))
         menu.addItem(.separator())
         addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
         statusItem.menu = menu
@@ -510,10 +718,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         return item
     }
 
-    // MARK: Settings
+    // MARK: Settings / Onboarding
 
-    @objc func openSettings() { settingsWindow.show() }
-    @objc func quitAxe()      { NSApp.terminate(nil) }
+    @objc func openSettings()   { settingsWindow.show() }
+    @objc func showOnboarding() { onboardingWindow.show() }
+    @objc func quitAxe()        { NSApp.terminate(nil) }
+
+    // MARK: Update checker
+
+    @objc func checkForUpdatesMI() { checkForUpdates(userInitiated: true) }
+
+    func checkForUpdates(userInitiated: Bool) {
+        guard let url = URL(string:
+            "https://api.github.com/repos/emerytech/homebrew-axe/releases/latest") else { return }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag  = json["tag_name"] as? String else {
+                    if userInitiated {
+                        let a = NSAlert()
+                        a.messageText     = "Couldn't check for updates"
+                        a.informativeText = "Make sure you're connected to the internet and try again."
+                        a.runModal()
+                    }
+                    return
+                }
+                let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+                self?.handleUpdateResult(latest: latest, userInitiated: userInitiated)
+            }
+        }.resume()
+    }
+
+    private func handleUpdateResult(latest: String, userInitiated: Bool) {
+        guard isNewerVersion(latest, than: appVersion) else {
+            if userInitiated {
+                let a = NSAlert()
+                a.messageText     = "Axe is up to date"
+                a.informativeText = "You're running the latest version (v\(appVersion))."
+                a.addButton(withTitle: "OK")
+                a.runModal()
+            }
+            return
+        }
+        let a = NSAlert()
+        a.messageText     = "Axe \(latest) is available"
+        a.informativeText = "You're running v\(appVersion). Run the command below in Terminal to update."
+        a.addButton(withTitle: "Copy Upgrade Command")
+        a.addButton(withTitle: "Later")
+        if a.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew upgrade emerytech/axe/axe", forType: .string)
+        }
+    }
+
+    private func isNewerVersion(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<max(pa.count, pb.count) {
+            let va = i < pa.count ? pa[i] : 0
+            let vb = i < pb.count ? pb[i] : 0
+            if va != vb { return va > vb }
+        }
+        return false
+    }
 
     // MARK: Hot key (⌥⌘K)
 
@@ -777,15 +1047,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         hintLabel = hint
 
         // "Axe X Apps" button — shown in place of the hint text when boxes are checked
-        let axeBtn = NSButton()
-        axeBtn.bezelStyle  = .rounded
-        axeBtn.isBordered  = true
-        axeBtn.title       = ""
-        axeBtn.font        = .systemFont(ofSize: 12, weight: .medium)
-        axeBtn.contentTintColor = .white
-        if let cell = axeBtn.cell as? NSButtonCell {
-            cell.backgroundColor = NSColor.systemRed
-        }
+        let axeBtn = RedButton()
+        axeBtn.isBordered = false
+        axeBtn.wantsLayer = true
         axeBtn.target  = self
         axeBtn.action  = #selector(axeCheckedApps)
         axeBtn.isHidden = true
@@ -887,7 +1151,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if checked > 0 {
             // Show the prominent action button; hide the keyboard-shortcut label
             let n = checked == 1 ? "1 App" : "\(checked) Apps"
-            axeCheckedButton?.title = "Off with their heads!  (\(n))"
+            let btnTitle = "Off with their heads!  (\(n))"
+            axeCheckedButton?.attributedTitle = NSAttributedString(
+                string: btnTitle,
+                attributes: [.foregroundColor: NSColor.white,
+                             .font: NSFont.systemFont(ofSize: 12, weight: .semibold)])
             axeCheckedButton?.isHidden = false
             hintLabel?.isHidden = true
         } else {
