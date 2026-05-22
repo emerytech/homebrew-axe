@@ -10,6 +10,43 @@ import ServiceManagement
 
 let appVersion = "2.4.1"
 
+// MARK: - Private CoreGraphics Services (Space management)
+// Resolved at runtime via dlsym — no link-time dependency on private symbols.
+// These have been stable since macOS 10.8; used by Moom, Swish, etc.
+// No Accessibility permission required.
+private enum CGSSpace {
+    typealias ConnFn = @convention(c) () -> UInt32
+    typealias AddFn  = @convention(c) (UInt32, Int32) -> UInt64
+    typealias ShowFn = @convention(c) (UInt32, CFArray) -> Int32
+
+    /// Creates a new desktop Space and switches to it. Returns false if the
+    /// private APIs are unavailable (caller should fall back to the manual HUD).
+    static func createAndSwitch() -> Bool {
+        // CoreGraphics is always loaded alongside AppKit
+        guard let lib = dlopen(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                Int32(RTLD_NOLOAD | RTLD_LAZY))
+        else { return false }
+        defer { dlclose(lib) }
+
+        guard let pConn = dlsym(lib, "CGSMainConnection"),
+              let pAdd  = dlsym(lib, "CGSAddSpace"),
+              let pShow = dlsym(lib, "CGSShowSpaces")
+        else { return false }
+
+        let conn = unsafeBitCast(pConn, to: ConnFn.self)
+        let add  = unsafeBitCast(pAdd,  to: AddFn.self)
+        let show = unsafeBitCast(pShow, to: ShowFn.self)
+
+        let cid = conn()
+        guard cid != 0 else { return false }
+        let sid = add(cid, 0)   // 0 = normal desktop Space
+        guard sid != 0 else { return false }
+        _ = show(cid, [NSNumber(value: sid)] as CFArray)
+        return true
+    }
+}
+
 // MARK: - Settings
 
 enum KillMode: Int  { case graceful = 0, force = 1 }
@@ -2673,14 +2710,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func restoreOnNewSpace(_ session: AppSession) {
-        pendingSpaceRestoreSession = session
+        // Confirm before creating a new Space and restarting apps
+        let n = session.apps.count
+        let alert = NSAlert()
+        alert.messageText     = "Open \"\(session.name)\" on a New Space?"
+        alert.informativeText = "\(n) app\(n == 1 ? "" : "s") will open on a new desktop Space. " +
+                                "Any already running will be restarted there."
+        alert.addButton(withTitle: "Create Space & Open")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
         hideOverlay()
+        pendingSpaceRestoreSession = session
+
+        // Try to create and switch to a new Space automatically.
+        // activeSpaceDidChangeNotification will fire → activeSpaceChanged handles the rest.
+        if createAndSwitchToNewSpace() { return }
+
+        // Fallback: CGS APIs unavailable — show the manual HUD instead.
         let hud = SpaceRestoreHUD(sessionName: session.name) { [weak self] in
             self?.pendingSpaceRestoreSession = nil
             self?.spaceRestoreHUD = nil
         }
         hud.show()
         spaceRestoreHUD = hud
+    }
+
+    /// Creates a fresh desktop Space and switches to it. Returns true on success.
+    @discardableResult
+    private func createAndSwitchToNewSpace() -> Bool {
+        CGSSpace.createAndSwitch()
     }
 
     @objc func activeSpaceChanged(_ note: Notification) {
