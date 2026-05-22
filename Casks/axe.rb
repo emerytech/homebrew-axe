@@ -11,6 +11,13 @@ cask "axe" do
 
   app "Axe.app"
 
+  uninstall quit: "com.emerytech.axe"
+
+  zap trash: [
+    "~/Library/Preferences/com.emerytech.axe.plist",
+    "~/Library/Saved Application State/com.emerytech.axe.savedState",
+  ]
+
   caveats <<~EOS
     Press ⌘Z from anywhere to pop the overlay.
     You can change the shortcut anytime in Settings.
