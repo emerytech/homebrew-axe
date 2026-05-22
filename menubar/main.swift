@@ -1,3 +1,8 @@
+// Copyright © 2025 Taylor Emery. All rights reserved.
+// Licensed under the Elastic License 2.0 — see LICENSE in the repository root.
+// You may view and build this software, but you may not resell it or offer it
+// as a competing product or service.
+
 import AppKit
 import Carbon.HIToolbox
 import Darwin
