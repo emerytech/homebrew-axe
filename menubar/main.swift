@@ -1123,9 +1123,8 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
 final class NudgeWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    // ── TODO: replace XXXX with your Lemon Squeezy product checkout UUIDs
-    static let purchaseURL  = "https://ets3d.lemonsqueezy.com/buy/XXXX"   // $9.99 — 3 seats
-    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/buy/YYYY"   // $4.99 — 1 extra seat
+    static let purchaseURL  = "https://ets3d.lemonsqueezy.com/checkout/buy/a1a1da63-ceee-40ae-81ef-2927e5fbbcb3"  // $9.99 — 3 seats
+    static let extraSeatURL = "https://ets3d.lemonsqueezy.com/buy/YYYY"   // TODO: replace YYYY once extra seat product is live
 
     func show() {
         AppSettings.lastNudgeDate = Date()
