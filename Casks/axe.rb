@@ -4,8 +4,10 @@ cask "axe" do
 
   url "https://github.com/emerytech/homebrew-axe/releases/download/v#{version}/Axe.zip"
   name "Axe"
-  desc "Spotlight-style overlay to quickly kill running macOS apps (⌥⌘K)"
+  desc "Spotlight-style overlay to quickly kill running apps"
   homepage "https://github.com/emerytech/homebrew-axe"
+
+  depends_on :macos
 
   app "Axe.app"
 
