@@ -29,6 +29,11 @@ struct AppSettings {
         get { d.object(forKey: "autoClose") == nil ? true : d.bool(forKey: "autoClose") }
         set { d.set(newValue, forKey: "autoClose") }
     }
+    // Require a confirmation alert before killing any app
+    static var confirmKill: Bool {
+        get { d.bool(forKey: "confirmKill") }
+        set { d.set(newValue, forKey: "confirmKill") }
+    }
     static var launchAtLogin: Bool {
         if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
         return false
@@ -244,6 +249,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                      options: ["Instant", "2 seconds", "5 seconds"],
                      selected: [0.0, 2.0, 5.0].firstIndex(of: AppSettings.gracePeriod) ?? 1)
                 { AppSettings.gracePeriod = [0.0, 2.0, 5.0][safe: $0] ?? 2 },
+            toggleRow("Confirm before killing",
+                      on: AppSettings.confirmKill) { AppSettings.confirmKill = $0 },
         ])
 
         addSection("App List", to: root, rows: [
@@ -261,7 +268,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v1.2  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v1.3  ·  emerytech/homebrew-axe")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -841,8 +848,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let rows = tableView?.selectedRowIndexes ?? IndexSet()
         guard !rows.isEmpty else { return }
         let targets = rows.compactMap { filtered[safe: $0] }
-        targets.forEach { killEntry($0, force: force) }
+        confirmAndExecuteKill(targets: targets, force: force)
+    }
 
+    // Shows a confirmation sheet when "Confirm before killing" is on, then kills.
+    private func confirmAndExecuteKill(targets: [AppEntry], force: Bool) {
+        guard !targets.isEmpty else { return }
+
+        guard AppSettings.confirmKill else {
+            executeKill(targets: targets, force: force)
+            return
+        }
+
+        let alert = NSAlert()
+        if targets.count == 1 {
+            alert.messageText     = "Axe \(targets[0].name)?"
+            alert.informativeText = "\(targets[0].name) will be terminated."
+        } else {
+            alert.messageText     = "Axe \(targets.count) apps?"
+            alert.informativeText = "All \(targets.count) selected apps will be terminated."
+        }
+        alert.addButton(withTitle: "Off with its head!")   // .alertFirstButtonReturn
+        alert.addButton(withTitle: "Spare them for now")   // .alertSecondButtonReturn
+        alert.alertStyle = .warning
+
+        if let p = panel, p.isVisible {
+            alert.beginSheetModal(for: p) { [weak self] response in
+                if response == .alertFirstButtonReturn {
+                    self?.executeKill(targets: targets, force: force)
+                }
+            }
+        } else {
+            if alert.runModal() == .alertFirstButtonReturn {
+                executeKill(targets: targets, force: force)
+            }
+        }
+    }
+
+    private func executeKill(targets: [AppEntry], force: Bool) {
+        targets.forEach { killEntry($0, force: force) }
         if AppSettings.autoClose && targets.count >= filtered.count {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 if self?.filtered.isEmpty == true { self?.hideOverlay() }
@@ -891,9 +935,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func tableDoubleClicked() {
         let row = tableView?.clickedRow ?? -1
         guard row >= 0, row < filtered.count else { return }
-        // Double-click always kills just the clicked row
         let force = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
-        killEntry(filtered[row], force: force)
+        confirmAndExecuteKill(targets: [filtered[row]], force: force)
     }
 
     // MARK: NSTableViewDataSource
