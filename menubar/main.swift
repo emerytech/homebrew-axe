@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "1.5.2"
+let appVersion = "1.5.3"
 
 // MARK: - Settings
 
@@ -655,26 +655,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Rotating kill-button phrases — picked once on first checkbox tick, held until cleared
     var currentKillPhrase: String = ""
     let killPhrases: [String] = [
-        "Yeet",
-        "Darth Maul 'em",
-        "Get to the choppa!",
-        "Ain't nobody got time for that",
-        "Hasta la vista",
-        "Execute Order 66",
-        "Bye Felicia",
-        "You're fired!",
-        "He's dead, Jim",
-        "I am inevitable",
-        "You shall not pass",
-        "It's not you, it's me",
-        "This is the way",
-        "Thanos snap",
-        "git rm -rf",
-        "No more Mr. Nice App",
-        "Send to the shadow realm",
-        "Winter is here",
-        "Mess around and find out",
-        "Let 'er rip",
+        "Dracarys",                            // GoT — Daenerys burns everything
+        "Et tu, Brute?",                       // Shakespeare — Julius Caesar, stabbed
+        "Avada Kedavra",                       // Harry Potter — killing curse
+        "Valar Morghulis",                     // GoT — "all men must die"
+        "Finish him!",                         // Mortal Kombat
+        "FATALITY",                            // Mortal Kombat
+        "Execute Order 66",                    // Star Wars — Jedi purge
+        "Hasta la vista, baby",                // Terminator 2
+        "The Lannisters send their regards",   // GoT — Red Wedding
+        "Yippee-ki-yay",                       // Die Hard
+        "Here's Johnny!",                      // The Shining
+        "This is Sparta!",                     // 300 — kicked into the pit
+        "Another one bites the dust",          // Queen
+        "Set phasers to kill",                 // Star Trek
+        "Luca Brasi sleeps with the fishes",   // The Godfather
+        "Redrum",                              // The Shining
+        "Off with their heads!",               // Alice in Wonderland
+        "I am become Death",                   // Oppenheimer / Bhagavad Gita
+        "He's dead, Jim",                      // Star Trek
+        "I am inevitable",                     // Avengers: Endgame — Thanos
     ]
 
     // Carbon hot key
