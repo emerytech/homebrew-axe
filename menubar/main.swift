@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.3.0"
+let appVersion = "2.4.0"
 
 // MARK: - Settings
 
@@ -580,22 +580,33 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
 // ── SessionRowView: NSStackView row with right-click context menu ─────────────
 private final class SessionRowView: NSStackView {
-    var sessionID: UUID?
-    var onRename:  (() -> Void)?
-    var onDelete:  (() -> Void)?
+    var sessionID:  UUID?
+    var onRename:   (() -> Void)?
+    var onDelete:   (() -> Void)?
+    var onNewSpace: (() -> Void)?
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
-        let rename = NSMenuItem(title: "Rename…", action: #selector(handleRename), keyEquivalent: "")
+        let newSpace = NSMenuItem(title: "Restore on New Space…",
+                                  action: #selector(handleNewSpace), keyEquivalent: "")
+        newSpace.target = self
+        let rename = NSMenuItem(title: "Rename…",
+                                action: #selector(handleRename), keyEquivalent: "")
         rename.target = self
-        let delete = NSMenuItem(title: "Delete",  action: #selector(handleDelete), keyEquivalent: "")
+        let delete = NSMenuItem(title: "Delete",
+                                action: #selector(handleDelete), keyEquivalent: "")
         delete.target = self
-        menu.addItem(rename); menu.addItem(.separator()); menu.addItem(delete)
+        menu.addItem(newSpace)
+        menu.addItem(.separator())
+        menu.addItem(rename)
+        menu.addItem(.separator())
+        menu.addItem(delete)
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    @objc private func handleRename() { onRename?() }
-    @objc private func handleDelete() { onDelete?() }
+    @objc private func handleNewSpace() { onNewSpace?() }
+    @objc private func handleRename()   { onRename?()   }
+    @objc private func handleDelete()   { onDelete?()   }
 }
 
 // Tiny helper objects to connect controls to closures without using objc bridging tricks
@@ -1007,6 +1018,101 @@ final class PhrasesWindow: NSObject, NSWindowDelegate {
 }
 
 // MARK: - NudgeWindow  (support reminder — shown every 6 h, stops once licensed)
+
+// MARK: - SpaceRestoreHUD
+
+/// Floating top-center banner shown while waiting for the user to switch to a new Space.
+/// When NSWorkspace fires activeSpaceDidChangeNotification the apps are launched there.
+final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
+    private var window:    NSWindow?
+    private var onCancel:  (() -> Void)?
+    let sessionName: String
+
+    init(sessionName: String, onCancel: @escaping () -> Void) {
+        self.sessionName = sessionName
+        self.onCancel    = onCancel
+        super.init()
+    }
+
+    func show() {
+        if let w = window { w.makeKeyAndOrderFront(nil); return }
+        let W: CGFloat = 380
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 0),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = ""; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false; w.level = .floating; w.delegate = self
+        buildUI(in: w, width: W)
+        window = w
+        if let screen = NSScreen.main {
+            let sf = screen.visibleFrame
+            w.setFrameOrigin(NSPoint(x: sf.midX - W/2, y: sf.maxY - w.frame.height - 60))
+        } else { w.center() }
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    func dismiss() { window?.close() }
+
+    func windowWillClose(_ n: Notification) {
+        onCancel?(); onCancel = nil; window = nil
+    }
+
+    private func buildUI(in w: NSWindow, width W: CGFloat) {
+        let cv = w.contentView!
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 10; root.alignment = .centerX
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: cv.topAnchor),
+            root.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+
+        // Icon
+        let iconView = NSImageView()
+        if let sym = NSImage(systemSymbolName: "macwindow.on.rectangle",
+                             accessibilityDescription: nil) {
+            iconView.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 30, weight: .light))
+        }
+        iconView.contentTintColor = .controlAccentColor
+        root.addArrangedSubview(iconView)
+
+        // Headline
+        let headline = NSTextField(labelWithString: "Restore \"\(sessionName)\" on a new Space")
+        headline.font = .systemFont(ofSize: 14, weight: .semibold)
+        headline.alignment = .center; headline.lineBreakMode = .byWordWrapping
+        headline.preferredMaxLayoutWidth = W - 48
+        root.addArrangedSubview(headline)
+
+        // Instructions
+        let body = NSTextField(labelWithString:
+            "Switch to any Space and the workflow will open there.\n\nPress ⌃↑ to open Mission Control, then click + to create a new Space.")
+        body.font = .systemFont(ofSize: 12); body.textColor = .secondaryLabelColor
+        body.alignment = .center; body.lineBreakMode = .byWordWrapping
+        body.preferredMaxLayoutWidth = W - 48
+        root.addArrangedSubview(body)
+
+        // Pulse label
+        let waiting = NSTextField(labelWithString: "Waiting for you to switch Spaces…")
+        waiting.font = .systemFont(ofSize: 11); waiting.textColor = .tertiaryLabelColor
+        waiting.alignment = .center
+        root.addArrangedSubview(waiting)
+
+        root.setCustomSpacing(16, after: body)
+
+        let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancelTapped))
+        cancelBtn.bezelStyle = .rounded; cancelBtn.keyEquivalent = "\u{1B}"
+        root.addArrangedSubview(cancelBtn)
+    }
+
+    @objc private func cancelTapped() { onCancel?(); onCancel = nil; dismiss() }
+}
+
+// MARK: - NudgeWindow
 
 final class NudgeWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
@@ -1462,6 +1568,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // Rotating kill-button phrases — picked once on first checkbox tick, held until cleared
     var currentKillPhrase: String = ""
+
+    // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
+    var pendingSpaceRestoreSession: AppSession?
+    var spaceRestoreHUD: SpaceRestoreHUD?
     var enabledKillPhrases: [String] {
         let dis = AppSettings.disabledKillPhrases
         let enabled = killPhrases.filter { !dis.contains($0) }
@@ -1561,6 +1671,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         setupStatusItem()
         registerHotKey()
         watchWorkspace()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceChanged(_:)),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         // Show onboarding on very first launch
         if !UserDefaults.standard.bool(forKey: "hasSeenOnboarding") {
             UserDefaults.standard.set(true, forKey: "hasSeenOnboarding")
@@ -1650,6 +1763,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 restore.target = self
                 restore.representedObject = session.id.uuidString
 
+                let newSpace = NSMenuItem(title: "⊞  Restore on New Space…",
+                                          action: #selector(restoreOnNewSpaceMI(_:)),
+                                          keyEquivalent: "")
+                newSpace.target = self
+                newSpace.representedObject = session.id.uuidString
+
                 let favTitle = session.isFavorite ? "☆  Remove from Workflows" : "⭐  Add to Workflows"
                 let favItem = NSMenuItem(title: favTitle,
                                          action: #selector(toggleFavoriteMI(_:)),
@@ -1670,6 +1789,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 delete.representedObject = session.id.uuidString
 
                 sub.addItem(restore)
+                sub.addItem(newSpace)
                 sub.addItem(.separator())
                 sub.addItem(favItem)
                 sub.addItem(rename)
@@ -2127,18 +2247,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
             textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-            // ── Restore
+            // ── Restore (current space)
             let restoreBtn = NSButton()
             restoreBtn.isBordered = false
-            if let sym = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: "Restore") {
+            if let sym = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: "Restore here") {
                 restoreBtn.image = sym.withSymbolConfiguration(
                     NSImage.SymbolConfiguration(pointSize: 17, weight: .regular))
             }
             restoreBtn.contentTintColor = .controlAccentColor
             restoreBtn.target = self; restoreBtn.action = #selector(restoreSessionFromPanel(_:))
-            restoreBtn.tag = index; restoreBtn.toolTip = "Restore workflow"
+            restoreBtn.tag = index; restoreBtn.toolTip = "Restore here"
             restoreBtn.translatesAutoresizingMaskIntoConstraints = false
             restoreBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
+
+            // ── Restore on New Space
+            let newSpaceBtn = NSButton()
+            newSpaceBtn.isBordered = false
+            if let sym = NSImage(systemSymbolName: "macwindow.on.rectangle",
+                                 accessibilityDescription: "Restore on New Space") {
+                newSpaceBtn.image = sym.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+            }
+            newSpaceBtn.contentTintColor = .secondaryLabelColor
+            newSpaceBtn.target = self; newSpaceBtn.action = #selector(restoreOnNewSpaceFromPanel(_:))
+            newSpaceBtn.tag = index; newSpaceBtn.toolTip = "Restore on New Space"
+            newSpaceBtn.translatesAutoresizingMaskIntoConstraints = false
+            newSpaceBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
 
             // ── Delete
             let delBtn = NSButton()
@@ -2157,12 +2291,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             row.addArrangedSubview(iconView)
             row.addArrangedSubview(textStack)
             row.addArrangedSubview(restoreBtn)
+            row.addArrangedSubview(newSpaceBtn)
             row.addArrangedSubview(delBtn)
 
-            // right-click → Rename / Delete
-            row.sessionID = session.id
-            row.onRename  = { [weak self] in self?.renameSessionInPanel(id: session.id) }
-            row.onDelete  = { [weak self] in
+            // right-click → Restore on New Space / Rename / Delete
+            row.sessionID  = session.id
+            row.onNewSpace = { [weak self] in self?.restoreOnNewSpace(session) }
+            row.onRename   = { [weak self] in self?.renameSessionInPanel(id: session.id) }
+            row.onDelete   = { [weak self] in
                 SessionManager.shared.delete(id: session.id)
                 self?.refreshSessionsPanel()
             }
@@ -2260,6 +2396,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         guard sender.tag < sessions.count else { return }
         SessionManager.shared.toggleFavorite(id: sessions[sender.tag].id)
         refreshSessionsPanel()
+    }
+
+    @objc func restoreOnNewSpaceFromPanel(_ sender: NSButton) {
+        let sessions = SessionManager.shared.all
+        guard sender.tag < sessions.count else { return }
+        restoreOnNewSpace(sessions[sender.tag])
+    }
+
+    @objc func restoreOnNewSpaceMI(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr),
+              let session = SessionManager.shared.all.first(where: { $0.id == id })
+        else { return }
+        restoreOnNewSpace(session)
+    }
+
+    func restoreOnNewSpace(_ session: AppSession) {
+        pendingSpaceRestoreSession = session
+        hideOverlay()
+        let hud = SpaceRestoreHUD(sessionName: session.name) { [weak self] in
+            self?.pendingSpaceRestoreSession = nil
+            self?.spaceRestoreHUD = nil
+        }
+        hud.show()
+        spaceRestoreHUD = hud
+    }
+
+    @objc func activeSpaceChanged(_ note: Notification) {
+        guard let session = pendingSpaceRestoreSession else { return }
+        pendingSpaceRestoreSession = nil
+        spaceRestoreHUD?.dismiss()
+        spaceRestoreHUD = nil
+        // Small delay so the Space animation finishes before apps launch
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            SessionManager.shared.restore(session)
+        }
     }
 
     func reregisterHotKey() {
