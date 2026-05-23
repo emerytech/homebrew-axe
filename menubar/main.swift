@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.7.1"
+let appVersion = "2.7.2"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -4347,11 +4347,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         SessionManager.shared.save(session)
 
         if resp == .alertFirstButtonReturn {
-            // Quit every saved app
-            running.forEach { saved in
-                NSWorkspace.shared.runningApplications
-                    .first { $0.bundleIdentifier == saved.bundleID }?
-                    .terminate()
+            hideOverlay()
+            // Brief delay so the overlay fully dismisses before apps receive the
+            // quit signal — prevents their "save changes?" sheets from appearing
+            // behind the floating Axe panel.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                running.forEach { saved in
+                    NSWorkspace.shared.runningApplications
+                        .first { $0.bundleIdentifier == saved.bundleID }?
+                        .terminate()
+                }
             }
         }
     }
