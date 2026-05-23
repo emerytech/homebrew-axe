@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.6.2"
+let appVersion = "2.7.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -411,6 +411,11 @@ struct AppSettings {
         get { d.bool(forKey: "autoRestoreLastSession") }
         set { d.set(newValue, forKey: "autoRestoreLastSession") }
     }
+    /// UUID of the last workflow the user explicitly restored or switched to.
+    static var activeWorkflowID: UUID? {
+        get { d.string(forKey: "activeWorkflowID").flatMap { UUID(uuidString: $0) } }
+        set { d.set(newValue?.uuidString, forKey: "activeWorkflowID") }
+    }
     /// On restore: first quit running (non-system) apps not in the session so
     /// you land in a clean workspace.
     static var closeOthersOnRestore: Bool {
@@ -487,8 +492,13 @@ private func fourCC(_ s: StaticString) -> FourCharCode {
          | FourCharCode(b[2]) << 8  | FourCharCode(b[3])
 }
 
-private let hotKeyCallback: EventHandlerUPP = { _, _, ud -> OSStatus in
-    guard let ud else { return noErr }
+private let hotKeyCallback: EventHandlerUPP = { _, inEvent, ud -> OSStatus in
+    guard let inEvent, let ud else { return noErr }
+    var hkID = EventHotKeyID()
+    GetEventParameter(inEvent, EventParamName(kEventParamDirectObject),
+                      EventParamType(typeEventHotKeyID), nil,
+                      MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+    guard hkID.signature == fourCC("axe!") else { return noErr }
     let d = Unmanaged<AppDelegate>.fromOpaque(ud).takeUnretainedValue()
     DispatchQueue.main.async { d.hotkeyPressed() }
     return noErr
@@ -1008,16 +1018,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             phraseRow(),
         ])
 
-        addSection("Sessions", to: root, rows: [
-            popupRow("Max saved sessions",
+        addSection("Workflows", to: root, rows: [
+            popupRow("Max saved workflows",
                      options: ["5", "10", "20", "50"],
                      selected: [5, 10, 20, 50].firstIndex(of: AppSettings.maxSessions) ?? 1)
                 { AppSettings.maxSessions = [5, 10, 20, 50][safe: $0] ?? 10 },
-            toggleRow("Auto-restore last session on launch",
-                      on: AppSettings.autoRestoreLastSession) { AppSettings.autoRestoreLastSession = $0 },
             toggleRow("Ignore system apps when saving",
                       on: AppSettings.ignoreSystemOnSave) { AppSettings.ignoreSystemOnSave = $0 },
-            toggleRow("Close other apps when restoring",
+            toggleRow("Close others when switching workflows",
                       on: AppSettings.closeOthersOnRestore) { AppSettings.closeOthersOnRestore = $0 },
             popupRow("Pause & reopen delay",
                      options: ["5 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours"],
@@ -1384,8 +1392,9 @@ private func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
 /// recording mode when clicked, capturing the next key+modifier combination.
 final class HotKeyRecorder: NSControl {
     private var isRecording = false
-    /// Called with (carbonKeyCode, carbonModifiers, displayChar) when the user sets a new shortcut.
     var onChange: ((UInt32, UInt32, String) -> Void)?
+    var capturedBinding: HotkeyBinding?
+    var errorMessage:    String?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1434,17 +1443,96 @@ final class HotKeyRecorder: NSControl {
         }
         path.fill(); path.lineWidth = 1; path.stroke()
 
-        let text = isRecording ? "Type shortcut…" : AppSettings.shortcutLabel()
+        let text: String
+        if isRecording          { text = "Type shortcut…" }
+        else if let e = errorMessage { text = e }
+        else if let b = capturedBinding { text = b.displayString }
+        else                    { text = AppSettings.shortcutLabel() }
         let para = NSMutableParagraphStyle(); para.alignment = .center
+        let textColor: NSColor = errorMessage != nil ? .systemRed
+            : isRecording ? .tertiaryLabelColor : .labelColor
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: isRecording ? .regular : .medium),
-            .foregroundColor: isRecording ? NSColor.tertiaryLabelColor : NSColor.labelColor,
+            .foregroundColor: textColor,
             .paragraphStyle: para,
         ]
         let str = NSAttributedString(string: text, attributes: attrs)
         let sz  = str.size()
         str.draw(at: NSPoint(x: (bounds.width - sz.width) / 2,
                              y: (bounds.height - sz.height) / 2 + 1))
+    }
+}
+
+// MARK: - ActionBox (NSButton target wrapper for closure actions)
+
+final class ActionBox: NSObject {
+    private let action: () -> Void
+    init(_ action: @escaping () -> Void) { self.action = action }
+    @objc func invoke() { action() }
+}
+
+// MARK: - WorkflowHotkeyManager
+
+private let workflowHotkeyCallback: EventHandlerUPP = { _, inEvent, ud -> OSStatus in
+    guard let inEvent, let ud else { return noErr }
+    var hkID = EventHotKeyID()
+    GetEventParameter(inEvent, EventParamName(kEventParamDirectObject),
+                      EventParamType(typeEventHotKeyID), nil,
+                      MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+    guard hkID.signature == fourCC("wkfl") else { return noErr }
+    let mgr = Unmanaged<WorkflowHotkeyManager>.fromOpaque(ud).takeUnretainedValue()
+    let eid = hkID.id
+    DispatchQueue.main.async { mgr.handlePress(eventID: eid) }
+    return noErr
+}
+
+final class WorkflowHotkeyManager {
+    static let shared = WorkflowHotkeyManager()
+    private var handlerRef: EventHandlerRef?
+    private var refs:  [UUID: EventHotKeyRef] = [:]
+    private var idMap: [UInt32: UUID]         = [:]
+
+    func install() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: OSType(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), workflowHotkeyCallback,
+                            1, &spec,
+                            Unmanaged.passUnretained(self).toOpaque(), &handlerRef)
+    }
+
+    func refresh() {
+        unregisterAll()
+        var counter: UInt32 = 100   // start above the main hotkey id=1
+        for session in SessionManager.shared.all {
+            guard let binding = session.hotkey else { continue }
+            counter += 1
+            let eid  = EventHotKeyID(signature: fourCC("wkfl"), id: counter)
+            var ref: EventHotKeyRef?
+            let err = RegisterEventHotKey(binding.keyCode, binding.modifiers,
+                                          eid, GetApplicationEventTarget(), 0, &ref)
+            if err == noErr, let ref {
+                refs[session.id]    = ref
+                idMap[counter]      = session.id
+            }
+        }
+    }
+
+    func unregisterAll() {
+        refs.values.forEach { UnregisterEventHotKey($0) }
+        refs.removeAll(); idMap.removeAll()
+    }
+
+    func handlePress(eventID: UInt32) {
+        guard let uid = idMap[eventID],
+              let session = SessionManager.shared.all.first(where: { $0.id == uid })
+        else { return }
+        var s = SessionManager.shared.all
+        if let i = s.firstIndex(where: { $0.id == uid }) { s[i].lastUsed = Date() }
+        SessionManager.shared.all = s
+        let item = SessionManager.shared.restore(session, mode: .replace)
+        let hud  = SwitchHUD(workflowName: session.name) { item.cancel() }
+        (NSApp.delegate as? AppDelegate)?.switchHUD = hud
+        hud.show()
     }
 }
 
@@ -1455,12 +1543,27 @@ struct SavedApp: Codable {
     let name:     String
 }
 
+struct HotkeyBinding: Codable, Equatable {
+    let keyCode:       UInt32
+    let modifiers:     UInt32
+    var displayString: String   // e.g. "⌥⌘1"
+}
+
+private struct PersistedSessions: Codable {
+    let version:  Int
+    let sessions: [AppSession]
+}
+
 struct AppSession: Codable {
-    let id:         UUID
-    var name:       String
-    let date:       Date
-    let apps:       [SavedApp]
-    var isFavorite: Bool = false   // true = "Workflow", sorts to top
+    let id:                UUID
+    var name:              String
+    let date:              Date
+    let apps:              [SavedApp]
+    var isFavorite:        Bool           = false
+    var hotkey:            HotkeyBinding? = nil
+    var primaryBundleID:   String?        = nil
+    var autoLaunchOnLogin: Bool           = false
+    var lastUsed:          Date?          = nil
 }
 
 final class SessionManager {
@@ -1470,14 +1573,19 @@ final class SessionManager {
 
     var all: [AppSession] {
         get {
-            guard let d = UserDefaults.standard.data(forKey: key),
-                  let s = try? JSONDecoder().decode([AppSession].self, from: d) else { return [] }
-            return s
+            guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+            // v2 envelope first, fall back to bare v1 array
+            if let p = try? JSONDecoder().decode(PersistedSessions.self, from: data) {
+                return p.sessions
+            }
+            return (try? JSONDecoder().decode([AppSession].self, from: data)) ?? []
         }
         set {
-            if let d = try? JSONEncoder().encode(newValue) {
-                UserDefaults.standard.set(d, forKey: key)
+            let p = PersistedSessions(version: 2, sessions: newValue)
+            if let data = try? JSONEncoder().encode(p) {
+                UserDefaults.standard.set(data, forKey: key)
             }
+            WorkflowHotkeyManager.shared.refresh()
         }
     }
 
@@ -1492,7 +1600,6 @@ final class SessionManager {
         var s = all
         guard let i = s.firstIndex(where: { $0.id == id }) else { return }
         s[i].isFavorite.toggle()
-        // Keep favorites grouped at front; stable sort within each group preserves insertion order
         all = s.filter { $0.isFavorite } + s.filter { !$0.isFavorite }
     }
 
@@ -1503,13 +1610,37 @@ final class SessionManager {
         all = s
     }
 
-    func restore(_ session: AppSession) {
-        let selfPID  = ProcessInfo.processInfo.processIdentifier
+    func setHotkey(id: UUID, binding: HotkeyBinding?) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].hotkey = binding
+        all = s
+    }
+
+    func setPrimary(id: UUID, bundleID: String?) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].primaryBundleID = bundleID
+        all = s
+    }
+
+    func setAutoLaunch(id: UUID, enabled: Bool) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].autoLaunchOnLogin = enabled
+        all = s
+    }
+
+    enum RestoreMode { case additive, replace }
+
+    @discardableResult
+    func restore(_ session: AppSession, mode: RestoreMode = .additive) -> DispatchWorkItem {
+        AppSettings.activeWorkflowID = session.id
+        let selfPID          = ProcessInfo.processInfo.processIdentifier
         let sessionBundleIDs = Set(session.apps.map { $0.bundleID })
 
-        // "Close other apps when restoring" — quit running regular apps that
-        // aren't part of the session so you land in a clean workspace.
-        if AppSettings.closeOthersOnRestore {
+        let shouldClose = mode == .replace || AppSettings.closeOthersOnRestore
+        if shouldClose {
             NSWorkspace.shared.runningApplications
                 .filter { $0.activationPolicy == .regular
                        && $0.processIdentifier != selfPID
@@ -1518,28 +1649,41 @@ final class SessionManager {
                 .forEach { $0.terminate() }
         }
 
-        let runningApps = NSWorkspace.shared.runningApplications
-        for app in session.apps {
-            // If already running, bring it to front
-            if let running = runningApps.first(where: { $0.bundleIdentifier == app.bundleID }) {
-                if #available(macOS 14.0, *) {
-                    running.activate()
-                } else {
-                    running.activate(options: [.activateIgnoringOtherApps])
+        let launchDelay: Double = shouldClose ? 0.6 : 0.0
+        let item = DispatchWorkItem { [apps = session.apps, primaryID = session.primaryBundleID] in
+            let runningApps = NSWorkspace.shared.runningApplications
+            for app in apps {
+                if let running = runningApps.first(where: { $0.bundleIdentifier == app.bundleID }) {
+                    if #available(macOS 14.0, *) { running.activate() }
+                    else { running.activate(options: [.activateIgnoringOtherApps]) }
+                    continue
                 }
-                continue
+                guard let url = NSWorkspace.shared.urlForApplication(
+                    withBundleIdentifier: app.bundleID) else { continue }
+                let cfg = NSWorkspace.OpenConfiguration(); cfg.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: cfg)
             }
-            guard let url = NSWorkspace.shared.urlForApplication(
-                withBundleIdentifier: app.bundleID) else { continue }
-            let cfg = NSWorkspace.OpenConfiguration()
-            cfg.activates = false
-            NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+            if let pid = primaryID {
+                var retries = 0
+                var tryActivate: (() -> Void)?
+                tryActivate = {
+                    if let app = NSWorkspace.shared.runningApplications
+                            .first(where: { $0.bundleIdentifier == pid }) {
+                        if #available(macOS 14.0, *) { app.activate() }
+                        else { app.activate(options: [.activateIgnoringOtherApps]) }
+                        tryActivate = nil
+                    } else if retries < 10 {
+                        retries += 1
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { tryActivate?() }
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { tryActivate?() }
+            }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + launchDelay, execute: item)
+        return item
     }
 
-    /// Heuristic: treat apps living under /System/ as system apps (Finder,
-    /// Calendar, Notes etc. ship there on modern macOS). User-installed apps
-    /// in /Applications and ~/Applications are kept.
     static func isSystemApp(_ app: NSRunningApplication) -> Bool {
         guard let path = app.bundleURL?.path else { return false }
         return path.hasPrefix("/System/")
@@ -1860,6 +2004,89 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
     }
 
     @objc private func cancelTapped() { onCancel?(); onCancel = nil; dismiss() }
+}
+
+// MARK: - SwitchHUD
+
+final class SwitchHUD: NSObject, NSWindowDelegate {
+    private var window:       NSWindow?
+    private var eventMonitor: Any?
+    private var dismissTimer: Timer?
+    private var onCancel:     (() -> Void)?
+    private let workflowName: String
+
+    init(workflowName: String, onCancel: @escaping () -> Void) {
+        self.workflowName = workflowName
+        self.onCancel     = onCancel
+        super.init()
+    }
+
+    func show(autoDismissAfter seconds: Double = 1.8) {
+        guard window == nil else { return }
+        let W: CGFloat = 320
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: 0),
+                         styleMask: [.titled, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = ""; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false; w.level = .floating; w.delegate = self
+        buildUI(in: w, width: W)
+        window = w
+        if let screen = NSScreen.main {
+            let sf = screen.visibleFrame
+            w.setFrameOrigin(NSPoint(x: sf.midX - W/2, y: sf.maxY - w.frame.height - 60))
+        } else { w.center() }
+        w.makeKeyAndOrderFront(nil)
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            if ev.keyCode == 47 && ev.modifierFlags.contains([.option, .command]) {
+                self?.doCancel(); return nil
+            }
+            return ev
+        }
+        dismissTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            self?.dismiss()
+        }
+    }
+
+    func dismiss() {
+        dismissTimer?.invalidate(); dismissTimer = nil
+        if let m = eventMonitor { NSEvent.removeMonitor(m); eventMonitor = nil }
+        onCancel = nil; window?.close()
+    }
+
+    func windowWillClose(_ n: Notification) { window = nil }
+
+    private func doCancel() { onCancel?(); onCancel = nil; dismiss() }
+
+    private func buildUI(in w: NSWindow, width W: CGFloat) {
+        let cv = w.contentView!
+        let root = NSStackView()
+        root.orientation = .vertical; root.spacing = 10; root.alignment = .centerX
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: cv.topAnchor),
+            root.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning; spinner.controlSize = .regular
+        spinner.isIndeterminate = true; spinner.startAnimation(nil)
+        root.addArrangedSubview(spinner)
+        let label = NSTextField(labelWithString: "Switching to \"\(workflowName)\"…")
+        label.font = .systemFont(ofSize: 14, weight: .semibold); label.alignment = .center
+        root.addArrangedSubview(label)
+        let hint = NSTextField(labelWithString: "Press ⌥⌘. to cancel")
+        hint.font = .systemFont(ofSize: 11); hint.textColor = .tertiaryLabelColor
+        hint.alignment = .center
+        root.addArrangedSubview(hint)
+        let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancelTapped))
+        cancelBtn.bezelStyle = .rounded
+        root.addArrangedSubview(cancelBtn)
+    }
+
+    @objc private func cancelTapped() { doCancel() }
 }
 
 // MARK: - AboutWindow
@@ -3046,10 +3273,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var currentKillPhrase: String = ""
     var phraseIndex:       Int    = 0
     var phraseTimer:       Timer?
+    var usageTimer:        Timer?
 
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
     var pendingSpaceRestoreSession: AppSession?
     var spaceRestoreHUD: SpaceRestoreHUD?
+    var switchHUD: SwitchHUD?
+    // Drift indicator state — populated by buildDriftStrip, consumed by catch-up / tidy actions
+    private var driftMissingApps: [SavedApp]             = []
+    private var driftExtraApps:   [NSRunningApplication] = []
     var updateWindow: UpdateWindow?
     var selfUpdater:  SelfUpdater?
     weak var demoRowView: NSView?     // sample row in Settings for previewing animations
@@ -3185,6 +3417,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
         registerHotKey()
+        WorkflowHotkeyManager.shared.install()
+        WorkflowHotkeyManager.shared.refresh()
         watchWorkspace()
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(activeSpaceChanged(_:)),
@@ -3196,17 +3430,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 self.onboardingWindow.show()
             }
         }
-        // Auto-restore last session if enabled
-        if AppSettings.autoRestoreLastSession,
-           let lastSession = SessionManager.shared.all.first {
+        // Migrate legacy autoRestoreLastSession → autoLaunchOnLogin on first upgrade
+        if AppSettings.autoRestoreLastSession {
+            var s = SessionManager.shared.all
+            if !s.isEmpty && !s.contains(where: { $0.autoLaunchOnLogin }) {
+                s[0].autoLaunchOnLogin = true
+                SessionManager.shared.all = s
+            }
+            AppSettings.autoRestoreLastSession = false
+        }
+        // Restore all per-workflow autoLaunchOnLogin sessions
+        let autoLaunch = SessionManager.shared.all.filter { $0.autoLaunchOnLogin }
+        if !autoLaunch.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                SessionManager.shared.restore(lastSession)
+                autoLaunch.forEach { SessionManager.shared.restore($0) }
             }
         }
 
         // Support nudge — show every 6 hours, skip first 24 h and if already licensed
         _ = AppSettings.firstLaunchDate   // ensures first-launch date is recorded
         startNudgeTimer()
+        startUsageTimer()
 
         // Silent background update check
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
@@ -3507,6 +3751,198 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         return false
     }
 
+    // MARK: Workflow drift + suggest
+
+    @objc func catchUpWorkflow() {
+        for app in driftMissingApps {
+            guard let url = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: app.bundleID) else { continue }
+            let cfg = NSWorkspace.OpenConfiguration(); cfg.activates = false
+            NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.refreshSessionsPanel() }
+    }
+
+    @objc func tidyWorkflow() {
+        driftExtraApps.forEach { $0.terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.refreshSessionsPanel() }
+    }
+
+    private func buildDriftStrip() -> NSView? {
+        guard let activeID = AppSettings.activeWorkflowID,
+              let active   = SessionManager.shared.all.first(where: { $0.id == activeID }),
+              let lastUsed = active.lastUsed,
+              Date().timeIntervalSince(lastUsed) < 4 * 3600
+        else { return nil }
+
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let running = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular
+                   && $0.processIdentifier != selfPID
+                   && !SessionManager.isSystemApp($0) }
+        let runningIDs  = Set(running.compactMap(\.bundleIdentifier))
+        let workflowIDs = Set(active.apps.map(\.bundleID))
+        driftMissingApps = active.apps.filter { !runningIDs.contains($0.bundleID) }
+        driftExtraApps   = running.filter { !workflowIDs.contains($0.bundleIdentifier ?? "") }
+
+        let strip = NSView(); strip.wantsLayer = true
+        strip.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor
+        strip.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLbl = NSTextField(labelWithString: "Active: \(active.name)")
+        titleLbl.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLbl.textColor = .controlAccentColor
+        titleLbl.translatesAutoresizingMaskIntoConstraints = false
+
+        func makeIconView(image: NSImage?, alpha: CGFloat, dot: Bool, tip: String) -> NSView {
+            let c = NSView(); c.translatesAutoresizingMaskIntoConstraints = false
+            c.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            c.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            let iv = NSImageView(frame: NSRect(x: 1, y: 1, width: 20, height: 20))
+            iv.image = image; iv.alphaValue = alpha; iv.toolTip = tip; c.addSubview(iv)
+            if dot {
+                let d = NSView(frame: NSRect(x: 14, y: 14, width: 7, height: 7))
+                d.wantsLayer = true; d.layer?.cornerRadius = 3.5
+                d.layer?.backgroundColor = NSColor.systemRed.cgColor; c.addSubview(d)
+            }
+            return c
+        }
+
+        let missingRow = NSStackView(); missingRow.orientation = .horizontal; missingRow.spacing = 2
+        missingRow.translatesAutoresizingMaskIntoConstraints = false
+        for app in driftMissingApps.prefix(7) {
+            let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleID)
+                .map { NSWorkspace.shared.icon(forFile: $0.path) }
+            missingRow.addArrangedSubview(makeIconView(image: icon, alpha: 0.35, dot: false,
+                                                       tip: "\(app.name) — not running"))
+        }
+
+        let driftRow = NSStackView(); driftRow.orientation = .horizontal; driftRow.spacing = 2
+        driftRow.translatesAutoresizingMaskIntoConstraints = false
+        for app in driftExtraApps.prefix(7) {
+            driftRow.addArrangedSubview(makeIconView(image: app.icon, alpha: 1.0, dot: true,
+                                                     tip: "\(app.localizedName ?? "App") — not in workflow"))
+        }
+
+        var statusParts: [String] = []
+        if !driftMissingApps.isEmpty { statusParts.append("\(driftMissingApps.count) missing") }
+        if !driftExtraApps.isEmpty   { statusParts.append("\(driftExtraApps.count) extra") }
+        let statusStr = statusParts.isEmpty ? "✓ In sync" : statusParts.joined(separator: "  ·  ")
+        let statusLbl = NSTextField(labelWithString: statusStr)
+        statusLbl.font = .systemFont(ofSize: 10); statusLbl.textColor = .tertiaryLabelColor
+        statusLbl.translatesAutoresizingMaskIntoConstraints = false
+
+        let catchUpBtn = NSButton(title: "Catch Up", target: self, action: #selector(catchUpWorkflow))
+        catchUpBtn.bezelStyle = .rounded; catchUpBtn.font = .systemFont(ofSize: 11)
+        catchUpBtn.translatesAutoresizingMaskIntoConstraints = false
+        let tidyBtn = NSButton(title: "Tidy", target: self, action: #selector(tidyWorkflow))
+        tidyBtn.bezelStyle = .rounded; tidyBtn.font = .systemFont(ofSize: 11)
+        tidyBtn.translatesAutoresizingMaskIntoConstraints = false
+        catchUpBtn.isHidden = driftMissingApps.isEmpty
+        tidyBtn.isHidden    = driftExtraApps.isEmpty
+
+        strip.addSubview(titleLbl); strip.addSubview(missingRow)
+        strip.addSubview(driftRow); strip.addSubview(statusLbl)
+        strip.addSubview(catchUpBtn); strip.addSubview(tidyBtn)
+        NSLayoutConstraint.activate([
+            titleLbl.topAnchor.constraint(equalTo: strip.topAnchor, constant: 8),
+            titleLbl.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 12),
+            missingRow.topAnchor.constraint(equalTo: titleLbl.bottomAnchor, constant: 5),
+            missingRow.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 12),
+            driftRow.centerYAnchor.constraint(equalTo: missingRow.centerYAnchor),
+            driftRow.leadingAnchor.constraint(equalTo: missingRow.trailingAnchor, constant: 6),
+            statusLbl.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 12),
+            statusLbl.topAnchor.constraint(equalTo: missingRow.bottomAnchor, constant: 5),
+            statusLbl.bottomAnchor.constraint(equalTo: strip.bottomAnchor, constant: -8),
+            catchUpBtn.trailingAnchor.constraint(equalTo: tidyBtn.leadingAnchor, constant: -4),
+            catchUpBtn.centerYAnchor.constraint(equalTo: strip.centerYAnchor),
+            tidyBtn.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -10),
+            tidyBtn.centerYAnchor.constraint(equalTo: strip.centerYAnchor),
+        ])
+        return strip
+    }
+
+    // MARK: Usage tracking
+
+    func startUsageTimer() {
+        snapshotUsage()
+        usageTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            self?.snapshotUsage()
+        }
+    }
+
+    private func snapshotUsage() {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let ids = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular
+                   && $0.processIdentifier != selfPID
+                   && !SessionManager.isSystemApp($0) }
+            .compactMap(\.bundleIdentifier).sorted()
+        guard !ids.isEmpty else { return }
+        var patterns = (UserDefaults.standard.array(forKey: "usagePatterns") as? [[String]]) ?? []
+        patterns.append(ids)
+        if patterns.count > 200 { patterns = Array(patterns.suffix(200)) }
+        UserDefaults.standard.set(patterns, forKey: "usagePatterns")
+    }
+
+    private func buildSuggestCard() -> NSView? {
+        let sessions = SessionManager.shared.all
+        guard sessions.count <= 3 else { return nil }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let running = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular
+                   && $0.processIdentifier != selfPID
+                   && !SessionManager.isSystemApp($0) }
+        guard running.count >= 3 else { return nil }
+        let runningIDs = Set(running.compactMap(\.bundleIdentifier))
+        let isClose = sessions.contains { s in
+            let wids = Set(s.apps.map(\.bundleID))
+            let inter = runningIDs.intersection(wids).count
+            let union = runningIDs.union(wids).count
+            return union > 0 && Double(inter) / Double(union) >= 0.6
+        }
+        guard !isClose else { return nil }
+
+        let card = NSView(); card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.07).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let lbl = NSTextField(labelWithString: "Save current \(running.count) apps as a workflow?")
+        lbl.font = .systemFont(ofSize: 11, weight: .medium)
+        lbl.translatesAutoresizingMaskIntoConstraints = false
+
+        let iconRow = NSStackView(); iconRow.orientation = .horizontal; iconRow.spacing = 2
+        iconRow.translatesAutoresizingMaskIntoConstraints = false
+        for app in running.prefix(8) {
+            let iv = NSImageView()
+            iv.image = app.icon; iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            iv.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            iconRow.addArrangedSubview(iv)
+        }
+
+        let saveBtn = NSButton(title: "+ Save", target: self, action: #selector(saveSuggestedWorkflow))
+        saveBtn.bezelStyle = .rounded; saveBtn.font = .systemFont(ofSize: 11)
+        saveBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(lbl); card.addSubview(iconRow); card.addSubview(saveBtn)
+        NSLayoutConstraint.activate([
+            lbl.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            lbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            iconRow.topAnchor.constraint(equalTo: lbl.bottomAnchor, constant: 6),
+            iconRow.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            saveBtn.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            saveBtn.topAnchor.constraint(equalTo: iconRow.bottomAnchor, constant: 8),
+            saveBtn.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+        ])
+        return card
+    }
+
+    @objc func saveSuggestedWorkflow() {
+        saveSession()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.refreshSessionsPanel() }
+    }
+
     // MARK: Sessions
 
     @objc func saveSessionMI() { saveSession() }
@@ -3543,19 +3979,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
               let id = UUID(uuidString: idStr),
               let session = SessionManager.shared.all.first(where: { $0.id == id })
         else { return }
-        let alert = NSAlert()
-        alert.messageText = "Rename Workflow"
-        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
-        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
-        tf.stringValue       = session.name
-        tf.placeholderString = "Workflow name"
-        alert.accessoryView  = tf
-        alert.window.initialFirstResponder = tf
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let newName = tf.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !newName.isEmpty else { return }
-        SessionManager.shared.rename(id: id, to: newName)
-        refreshSessionsPanel()
+        showWorkflowEditor(for: session) { self.refreshSessionsPanel() }
     }
 
     func saveSession() {
@@ -3714,7 +4138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         backBtn.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(backBtn)
 
-        let titleLbl = NSTextField(labelWithString: "Sessions")
+        let titleLbl = NSTextField(labelWithString: "Workflows")
         titleLbl.font = .systemFont(ofSize: 13, weight: .semibold)
         titleLbl.textColor = .labelColor; titleLbl.alignment = .center
         titleLbl.translatesAutoresizingMaskIntoConstraints = false
@@ -3790,6 +4214,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func refreshSessionsPanel() {
         guard let stack = sessionsListStack else { return }
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        func addDivider() {
+            let div = NSBox(); div.boxType = .separator
+            div.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(div)
+            div.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        if let strip = buildDriftStrip() {
+            stack.addArrangedSubview(strip)
+            strip.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            addDivider()
+        }
+
+        if let card = buildSuggestCard() {
+            stack.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            addDivider()
+        }
 
         let all      = SessionManager.shared.all
         let workflows = all.filter { $0.isFavorite }
@@ -3984,17 +4427,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func renameSessionInPanel(id: UUID) {
         guard let session = SessionManager.shared.all.first(where: { $0.id == id }) else { return }
+        showWorkflowEditor(for: session) { self.refreshSessionsPanel() }
+    }
+
+    func showWorkflowEditor(for session: AppSession, completion: @escaping () -> Void) {
         let alert = NSAlert()
-        alert.messageText = "Rename"
-        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
-        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
-        tf.stringValue = session.name; tf.placeholderString = "Workflow name"
-        alert.accessoryView = tf; alert.window.initialFirstResponder = tf
+        alert.messageText = "Edit Workflow"
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+
+        let av = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 132))
+        let nameField = NSTextField(frame: .zero)
+        nameField.stringValue = session.name; nameField.placeholderString = "Workflow name"
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+
+        let hkLbl = NSTextField(labelWithString: "Hotkey:")
+        hkLbl.font = .systemFont(ofSize: 12); hkLbl.translatesAutoresizingMaskIntoConstraints = false
+
+        let recorder = HotKeyRecorder(frame: .zero)
+        recorder.capturedBinding = session.hotkey
+        recorder.translatesAutoresizingMaskIntoConstraints = false
+
+        let clearBtn = NSButton(title: "Clear", target: nil, action: nil)
+        clearBtn.bezelStyle = .rounded; clearBtn.font = .systemFont(ofSize: 11)
+        clearBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        let primLbl = NSTextField(labelWithString: "Primary:")
+        primLbl.font = .systemFont(ofSize: 12); primLbl.translatesAutoresizingMaskIntoConstraints = false
+
+        let primPop = NSPopUpButton(frame: .zero, pullsDown: false)
+        primPop.translatesAutoresizingMaskIntoConstraints = false
+        primPop.addItem(withTitle: "None")
+        for app in session.apps { primPop.addItem(withTitle: app.name) }
+        if let pid = session.primaryBundleID,
+           let idx = session.apps.firstIndex(where: { $0.bundleID == pid }) {
+            primPop.selectItem(at: idx + 1)
+        }
+
+        let autoChk = NSButton(checkboxWithTitle: "Launch on login", target: nil, action: nil)
+        autoChk.state = session.autoLaunchOnLogin ? .on : .off
+        autoChk.translatesAutoresizingMaskIntoConstraints = false
+
+        av.addSubview(nameField); av.addSubview(hkLbl)
+        av.addSubview(recorder);  av.addSubview(clearBtn)
+        av.addSubview(primLbl);   av.addSubview(primPop)
+        av.addSubview(autoChk)
+        NSLayoutConstraint.activate([
+            nameField.topAnchor.constraint(equalTo: av.topAnchor),
+            nameField.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            nameField.trailingAnchor.constraint(equalTo: av.trailingAnchor),
+            hkLbl.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            hkLbl.centerYAnchor.constraint(equalTo: recorder.centerYAnchor),
+            recorder.leadingAnchor.constraint(equalTo: hkLbl.trailingAnchor, constant: 8),
+            recorder.widthAnchor.constraint(equalToConstant: 130),
+            recorder.topAnchor.constraint(equalTo: nameField.bottomAnchor, constant: 14),
+            clearBtn.leadingAnchor.constraint(equalTo: recorder.trailingAnchor, constant: 8),
+            clearBtn.centerYAnchor.constraint(equalTo: recorder.centerYAnchor),
+            primLbl.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            primLbl.centerYAnchor.constraint(equalTo: primPop.centerYAnchor),
+            primPop.leadingAnchor.constraint(equalTo: primLbl.trailingAnchor, constant: 8),
+            primPop.topAnchor.constraint(equalTo: recorder.bottomAnchor, constant: 12),
+            autoChk.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            autoChk.topAnchor.constraint(equalTo: primPop.bottomAnchor, constant: 10),
+            autoChk.bottomAnchor.constraint(equalTo: av.bottomAnchor),
+        ])
+        alert.accessoryView = av; alert.window.initialFirstResponder = nameField
+
+        recorder.onChange = { [weak recorder] code, mods, char in
+            if code == AppSettings.hotKeyCode && mods == AppSettings.hotKeyMods {
+                recorder?.errorMessage = "⚠ Conflict"; recorder?.needsDisplay = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak recorder] in
+                    recorder?.errorMessage = nil; recorder?.needsDisplay = true
+                }
+                return
+            }
+            recorder?.capturedBinding = HotkeyBinding(keyCode: code, modifiers: mods,
+                                                       displayString: char)
+        }
+        let clearAction = ActionBox { [weak recorder] in
+            recorder?.capturedBinding = nil; recorder?.needsDisplay = true
+        }
+        clearBtn.target = clearAction; clearBtn.action = #selector(ActionBox.invoke)
+
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let newName = tf.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !newName.isEmpty else { return }
-        SessionManager.shared.rename(id: id, to: newName)
-        refreshSessionsPanel()
+        let nm = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        if !nm.isEmpty { SessionManager.shared.rename(id: session.id, to: nm) }
+        SessionManager.shared.setHotkey(id: session.id, binding: recorder.capturedBinding)
+        let primIdx = primPop.indexOfSelectedItem
+        SessionManager.shared.setPrimary(id: session.id,
+                                         bundleID: primIdx == 0 ? nil : session.apps[primIdx - 1].bundleID)
+        SessionManager.shared.setAutoLaunch(id: session.id, enabled: autoChk.state == .on)
+        completion()
     }
 
     // Thin "CPU · RAM" label pinned to the right edge of the list area,
@@ -4319,6 +4841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         NSObject.cancelPreviousPerformRequests(withTarget: self,
                                                selector: #selector(liveRefresh), object: nil)
         perform(#selector(liveRefresh), with: nil, afterDelay: 0.25)
+        if isShowingSessions { refreshSessionsPanel() }
     }
 
     @objc func liveRefresh() {
@@ -4904,13 +5427,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let sesBtn = NSButton()
         sesBtn.isBordered = false
         if let sym = NSImage(systemSymbolName: "clock.arrow.circlepath",
-                             accessibilityDescription: "Sessions") {
+                             accessibilityDescription: "Workflows") {
             sesBtn.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
         sesBtn.contentTintColor = dimIconColor
         sesBtn.target = self; sesBtn.action = #selector(toggleSessionsPanel)
-        sesBtn.toolTip = "Sessions"
+        sesBtn.toolTip = "Workflows"
         sesBtn.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sesBtn)
         sessionBtn = sesBtn
@@ -5183,13 +5706,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let sesBtn2 = NSButton()
         sesBtn2.isBordered = false
         if let sym = NSImage(systemSymbolName: "clock.arrow.circlepath",
-                             accessibilityDescription: "Sessions") {
+                             accessibilityDescription: "Workflows") {
             sesBtn2.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
         sesBtn2.contentTintColor = .tertiaryLabelColor
         sesBtn2.target = self; sesBtn2.action = #selector(toggleSessionsPanel)
-        sesBtn2.toolTip = "Sessions"
+        sesBtn2.toolTip = "Workflows"
         sesBtn2.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sesBtn2)
         sessionBtn = sesBtn2
@@ -5540,13 +6063,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 if isShowingSessions {
                     hintLabel?.stringValue = "▶ restore  ·  ✕ delete  ·  esc back to apps"
                 } else {
-                    let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
-                                       && AppSettings.hotKeyMods == UInt32(cmdKey)
-                    let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
-                    hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close"
+                    // Show active workflow name + age when one is set
+                    if let aid = AppSettings.activeWorkflowID,
+                       let wf  = SessionManager.shared.all.first(where: { $0.id == aid }),
+                       let lu  = wf.lastUsed {
+                        hintLabel?.stringValue = "Active: \(wf.name) · \(ageString(lu))  ·  esc close"
+                    } else {
+                        let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
+                                           && AppSettings.hotKeyMods == UInt32(cmdKey)
+                        let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
+                        hintLabel?.stringValue = "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close"
+                    }
                 }
             }
         }
+    }
+
+    private func ageString(_ date: Date) -> String {
+        let s = Int(-date.timeIntervalSinceNow)
+        if s < 60  { return "\(s)s ago" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        return "\(s / 3600)h ago"
     }
 
     // MARK: Phrase cycling
