@@ -1,6 +1,6 @@
 cask "axe" do
-  version "2.7.1"
-  sha256 "54c738553470fff94b53b19970fb1ed307b3e25644a2b57ff07687a06489c446"
+  version "2.7.2"
+  sha256 "ef66f1259033e8c6cd0760ee925e94ec93936e0681be9fa355a3b2fd339497ab"
 
   url "https://github.com/emerytech/homebrew-axe/releases/download/v#{version}/Axe.zip"
   name "Axe"
