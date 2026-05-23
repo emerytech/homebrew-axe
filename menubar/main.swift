@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.6.1"
+let appVersion = "2.6.2"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -472,6 +472,11 @@ struct AppSettings {
         get { d.object(forKey: "lastAutoUpdateCheck") as? Date }
         set { d.set(newValue, forKey: "lastAutoUpdateCheck") }
     }
+    /// Extra height (pt) added to the notch panel by user drag-resize. 0 = default.
+    static var notchExtraHeight: CGFloat {
+        get { CGFloat(d.double(forKey: "notchExtraHeight")) }
+        set { d.set(Double(newValue), forKey: "notchExtraHeight") }
+    }
 }
 
 // MARK: - HotKey (Carbon — no Accessibility permission required)
@@ -498,11 +503,91 @@ private func residentMB(for pid: pid_t) -> Int? {
     return Int(info.pti_resident_size / 1_048_576)
 }
 
+// MARK: - CPU sampling (proc_pidinfo — permission-free for user-owned processes)
+//
+// Two consecutive readings of the cumulative user+sys CPU time (nanoseconds)
+// from proc_taskinfo, divided by elapsed wall time, give the same instantaneous
+// % that Activity Monitor shows. The first call per PID stores a baseline and
+// returns nil; subsequent calls return the delta percentage.
+
+private final class CPUSampler {
+    static let shared = CPUSampler()
+    private struct Baseline { var user: UInt64; var sys: UInt64; var time: CFAbsoluteTime }
+    private var baselines = [pid_t: Baseline]()
+    private let lock = NSLock()
+
+    func sample(_ pid: pid_t) -> Double? {
+        var info = proc_taskinfo()
+        let sz = Int32(MemoryLayout<proc_taskinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, sz) == sz else { return nil }
+        let now      = CFAbsoluteTimeGetCurrent()
+        let user     = info.pti_total_user
+        let sys      = info.pti_total_system
+        lock.lock(); defer { lock.unlock() }
+        if let b = baselines[pid] {
+            let wallNS = (now - b.time) * 1_000_000_000
+            guard wallNS > 0 else { return nil }
+            let cpuNS  = Double((user - b.user) + (sys - b.sys))
+            baselines[pid] = Baseline(user: user, sys: sys, time: now)
+            return min(cpuNS / wallNS * 100, 999)
+        }
+        baselines[pid] = Baseline(user: user, sys: sys, time: now)
+        return nil
+    }
+
+    func purge(keeping pids: Set<pid_t>) {
+        lock.lock(); defer { lock.unlock() }
+        baselines = baselines.filter { pids.contains($0.key) }
+    }
+}
+
+// MARK: - RAM statistics (host_statistics64 — permission-free)
+
+private struct RAMStats {
+    var free: UInt64; var inactive: UInt64
+    var active: UInt64; var wired: UInt64; var compressed: UInt64
+    var pressureLevel: Int   // 0 = normal, 1 = warning, 2 = critical
+    var freeFormatted: String { Self.fmt(free + inactive) }
+    private static func fmt(_ b: UInt64) -> String {
+        let gb = Double(b) / 1_073_741_824
+        return gb >= 1 ? String(format: "%.1f GB", gb)
+                       : String(format: "%.0f MB", Double(b) / 1_048_576)
+    }
+    var pressureLabel: String {
+        switch pressureLevel { case 1: return "Warning"; case 2: return "Critical"; default: return "Normal" }
+    }
+}
+
+private func readRAMStats() -> RAMStats? {
+    var stats = vm_statistics64()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<vm_statistics64>.stride / MemoryLayout<integer_t>.stride)
+    let kr = withUnsafeMutablePointer(to: &stats) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return nil }
+    let pg = UInt64(vm_kernel_page_size)
+    var pressure: Int32 = 0
+    var psz = MemoryLayout<Int32>.size
+    sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &psz, nil, 0)
+    return RAMStats(
+        free:         UInt64(stats.free_count)            * pg,
+        inactive:     UInt64(stats.inactive_count)        * pg,
+        active:       UInt64(stats.active_count)          * pg,
+        wired:        UInt64(stats.wire_count)            * pg,
+        compressed:   UInt64(stats.compressor_page_count) * pg,
+        pressureLevel: Int(pressure)
+    )
+}
+
 // MARK: - AppEntry
 
 struct AppEntry {
-    let app:   NSRunningApplication
-    let memMB: Int?
+    let app:        NSRunningApplication
+    let memMB:      Int?
+    let cpuPercent: Double?
     var name:  String    { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
     /// Cached via `IconCache` so the first row paint always has an icon
     /// instead of a blank placeholder. Falls back to `NSRunningApplication.icon`
@@ -511,7 +596,11 @@ struct AppEntry {
         IconCache.shared.icon(forBundleID: app.bundleIdentifier, url: app.bundleURL)
             ?? app.icon
     }
-    init(_ a: NSRunningApplication) { app = a; memMB = residentMB(for: a.processIdentifier) }
+    init(_ a: NSRunningApplication) {
+        app        = a
+        memMB      = residentMB(for: a.processIdentifier)
+        cpuPercent = CPUSampler.shared.sample(a.processIdentifier)
+    }
 }
 
 // MARK: - AutoFitTableView
@@ -758,7 +847,7 @@ final class AppRowCell: NSTableCellView {
 
             memLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             memLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            memLabel.widthAnchor.constraint(equalToConstant: 74),
+            memLabel.widthAnchor.constraint(equalToConstant: 90),
 
             appName.leadingAnchor.constraint(equalTo: checkBox.trailingAnchor, constant: 8),
             appName.trailingAnchor.constraint(lessThanOrEqualTo: memLabel.leadingAnchor, constant: -8),
@@ -861,9 +950,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     // ── UI construction ──────────────────────────────────────────
 
-    private func buildUI(in w: NSWindow) {
-        // Use a flipped stack so content fills from the top of the scroll view
-        // (a vanilla NSStackView would float content to the bottom of the clip).
+    // Returns a fully-populated settings scroll view that can be embedded
+    // either in the settings window or directly inside the overlay panel.
+    func buildSettingsScrollView() -> NSScrollView {
         let root = FlippedStackView()
         root.orientation     = .vertical
         root.spacing         = 0
@@ -871,22 +960,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.translatesAutoresizingMaskIntoConstraints = false
 
         let scroll = NSScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller   = true
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers    = true
         scroll.drawsBackground       = false
         scroll.documentView          = root
-
-        w.contentView?.addSubview(scroll)
-        NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
-            // Pin root width to the clip view so content can't scroll horizontally
-            root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-        ])
+        root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
 
         addSection("General", to: root, rows: [
             popupRow("Interface style",
@@ -961,7 +1040,6 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                       on: AppSettings.punnyMode) { AppSettings.punnyMode = $0 },
         ])
 
-        // Bottom divider + version
         let div = NSBox(); div.boxType = .separator
         div.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(div)
@@ -974,7 +1052,21 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         root.addArrangedSubview(verPad)
         verPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
+        return scroll
+    }
+
+    private func buildUI(in w: NSWindow) {
+        let scroll = buildSettingsScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+        ])
         w.contentView?.layoutSubtreeIfNeeded()
+        guard let root = scroll.documentView as? FlippedStackView else { return }
         let contentH  = root.fittingSize.height
         let screenH   = (w.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
         // Cap the window so it never spills below the screen on small laptops.
@@ -2604,18 +2696,32 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         // ── Interface style picker ──────────────────────────────────
         let pickerTitle = label("Choose how Axe opens", size: 13, weight: .semibold)
 
-        let seg = NSSegmentedControl(
-            labels: ["Menu Bar Popover", "Spotlight Overlay", "Drop from Notch"],
-            trackingMode: .selectOne, target: self,
-            action: #selector(stylePickerChanged(_:)))
-        seg.selectedSegment = [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0
-        seg.translatesAutoresizingMaskIntoConstraints = false
+        let styles: [(UIStyle, String, String)] = [
+            (.popover,   "Menu Bar\nPopover",  "Drops from the\nmenu bar icon"),
+            (.spotlight, "Spotlight\nOverlay", "Floats in the\ncenter of screen"),
+            (.notch,     "Drop from\nNotch",   "Slides from the\ntop of screen"),
+        ]
+        var cards: [StyleCard] = []
+        let cardStack = NSStackView()
+        cardStack.orientation = .horizontal; cardStack.spacing = 10; cardStack.alignment = .centerY
+        cardStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let pickerHint = label("Popover drops from the menu bar icon  ·  Spotlight floats center-screen  ·  Notch drops from the top",
-                               size: 11, weight: .regular, color: .tertiaryLabelColor)
+        for (style, name, hint) in styles {
+            let card = StyleCard(style: style, name: name, hint: hint)
+            card.translatesAutoresizingMaskIntoConstraints = false
+            card.widthAnchor.constraint(equalToConstant: 124).isActive = true
+            card.heightAnchor.constraint(equalToConstant: 110).isActive = true
+            card.isSelected = (AppSettings.uiStyle == style)
+            card.onSelect = { chosen in
+                AppSettings.uiStyle = chosen
+                cards.forEach { $0.isSelected = ($0.style == chosen) }
+            }
+            cards.append(card)
+            cardStack.addArrangedSubview(card)
+        }
 
-        let pickerStack = NSStackView(views: [pickerTitle, seg, pickerHint])
-        pickerStack.orientation = .vertical; pickerStack.spacing = 8; pickerStack.alignment = .centerX
+        let pickerStack = NSStackView(views: [pickerTitle, cardStack])
+        pickerStack.orientation = .vertical; pickerStack.spacing = 12; pickerStack.alignment = .centerX
         pickerStack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
         root.addArrangedSubview(pickerStack)
         pickerStack.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
@@ -2640,11 +2746,6 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     @objc private func dismiss() { window?.close() }
 
-    @objc private func stylePickerChanged(_ sender: NSSegmentedControl) {
-        // segment 0 = Menu bar popover, 1 = Spotlight overlay, 2 = Drop from notch
-        AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: sender.selectedSegment] ?? .popover
-    }
-
     private func label(_ s: String, size: CGFloat, weight: NSFont.Weight,
                        color: NSColor = .labelColor) -> NSTextField {
         let f = NSTextField(labelWithString: s)
@@ -2666,6 +2767,208 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         ])
         return wrap
     }
+
+    // ── Style selection card ────────────────────────────────────────
+    final class StyleCard: NSView {
+        let style: UIStyle
+        var onSelect: ((UIStyle) -> Void)?
+
+        var isSelected = false {
+            didSet {
+                let accent = NSColor.controlAccentColor
+                layer?.borderColor = isSelected
+                    ? accent.cgColor
+                    : NSColor.separatorColor.withAlphaComponent(0.5).cgColor
+                layer?.borderWidth = isSelected ? 2 : 1
+                titleLabel.textColor = isSelected ? accent : .secondaryLabelColor
+                needsDisplay = true
+            }
+        }
+
+        private let titleLabel: NSTextField
+
+        init(style: UIStyle, name: String, hint: String) {
+            self.style = style
+            self.titleLabel = NSTextField(labelWithString: name)
+            super.init(frame: .zero)
+            wantsLayer = true
+            layer?.cornerRadius = 10
+            layer?.borderWidth = 1
+            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
+            layer?.backgroundColor = NSColor.windowBackgroundColor
+                .withAlphaComponent(0.06).cgColor
+
+            titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+            titleLabel.textColor = .secondaryLabelColor
+            titleLabel.alignment = .center
+            titleLabel.maximumNumberOfLines = 2
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(titleLabel)
+
+            let hintLabel = NSTextField(labelWithString: hint)
+            hintLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
+            hintLabel.textColor = .tertiaryLabelColor
+            hintLabel.alignment = .center
+            hintLabel.maximumNumberOfLines = 2
+            hintLabel.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(hintLabel)
+
+            NSLayoutConstraint.activate([
+                titleLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+                titleLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
+                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+                titleLabel.bottomAnchor.constraint(equalTo: hintLabel.topAnchor, constant: -3),
+                hintLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+                hintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
+                hintLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+                hintLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            ])
+
+            let click = NSClickGestureRecognizer(target: self, action: #selector(tapped))
+            addGestureRecognizer(click)
+        }
+        required init?(coder: NSCoder) { fatalError() }
+
+        @objc private func tapped() {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.08
+                animator().alphaValue = 0.6
+            } completionHandler: {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.12
+                    self.animator().alphaValue = 1
+                }
+            }
+            onSelect?(style)
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            let accent = isSelected ? NSColor.controlAccentColor : NSColor.secondaryLabelColor
+            let ill = NSRect(x: 8, y: bounds.height - 68, width: bounds.width - 16, height: 58)
+
+            switch style {
+            case .popover:
+                // Menu bar strip at top, popover panel hanging below right
+                let barH: CGFloat = 10
+                let bar = NSBezierPath(roundedRect: NSRect(x: ill.minX, y: ill.maxY - barH,
+                                                           width: ill.width, height: barH),
+                                       xRadius: 3, yRadius: 3)
+                accent.withAlphaComponent(0.25).setFill(); bar.fill()
+                // Small icon dot at right of bar
+                let dot = NSBezierPath(ovalIn: NSRect(x: ill.maxX - 14,
+                                                      y: ill.maxY - barH + 2, width: 6, height: 6))
+                accent.withAlphaComponent(0.7).setFill(); dot.fill()
+                // Popover panel, right-aligned
+                let panW: CGFloat = ill.width * 0.7
+                let panH: CGFloat = ill.height - barH - 8
+                let panX = ill.maxX - panW
+                let panY = ill.minY + 4
+                let panel = NSBezierPath(roundedRect: NSRect(x: panX, y: panY, width: panW, height: panH),
+                                         xRadius: 5, yRadius: 5)
+                accent.withAlphaComponent(0.18).setFill(); panel.fill()
+                accent.withAlphaComponent(0.45).setStroke(); panel.lineWidth = 1; panel.stroke()
+                // Arrow upward from panel center-top toward icon
+                let arrowX = panX + panW - 14
+                let arrowY = panY + panH
+                let arrow = NSBezierPath()
+                arrow.move(to: NSPoint(x: arrowX - 5, y: arrowY))
+                arrow.line(to: NSPoint(x: arrowX + 5, y: arrowY))
+                arrow.line(to: NSPoint(x: arrowX, y: arrowY + 6))
+                arrow.close()
+                accent.withAlphaComponent(0.45).setFill(); arrow.fill()
+
+            case .spotlight:
+                // Floating centered panel with subtle shadow suggestion
+                let panW: CGFloat = ill.width * 0.78
+                let panH: CGFloat = ill.height * 0.7
+                let panX = ill.midX - panW / 2
+                let panY = ill.midY - panH / 2 + 4
+                // Shadow hint
+                let shadow = NSBezierPath(roundedRect: NSRect(x: panX + 2, y: panY - 4, width: panW, height: panH),
+                                          xRadius: 6, yRadius: 6)
+                NSColor.black.withAlphaComponent(0.12).setFill(); shadow.fill()
+                // Panel body
+                let panel = NSBezierPath(roundedRect: NSRect(x: panX, y: panY, width: panW, height: panH),
+                                          xRadius: 6, yRadius: 6)
+                accent.withAlphaComponent(0.18).setFill(); panel.fill()
+                accent.withAlphaComponent(0.45).setStroke(); panel.lineWidth = 1; panel.stroke()
+                // Search bar line inside panel
+                let lineY = panY + panH - 12
+                let lineX = panX + 8
+                let searchLine = NSBezierPath()
+                searchLine.move(to: NSPoint(x: lineX, y: lineY))
+                searchLine.line(to: NSPoint(x: panX + panW - 8, y: lineY))
+                accent.withAlphaComponent(0.3).setStroke()
+                searchLine.lineWidth = 1.5; searchLine.stroke()
+
+            case .notch:
+                // Notch shape at top center, panel drops below
+                let notchW: CGFloat = 42
+                let notchH: CGFloat = 10
+                let notchX = ill.midX - notchW / 2
+                let notchY = ill.maxY - notchH
+                let notch = NSBezierPath(roundedRect: NSRect(x: notchX, y: notchY, width: notchW, height: notchH),
+                                          xRadius: 5, yRadius: 5)
+                accent.withAlphaComponent(0.4).setFill(); notch.fill()
+                // Panel body
+                let panW = ill.width * 0.65
+                let panH = ill.height - notchH - 6
+                let panX = ill.midX - panW / 2
+                let panY = ill.minY + 2
+                let panel = NSBezierPath(roundedRect: NSRect(x: panX, y: panY, width: panW, height: panH),
+                                          xRadius: 5, yRadius: 5)
+                accent.withAlphaComponent(0.18).setFill(); panel.fill()
+                accent.withAlphaComponent(0.45).setStroke(); panel.lineWidth = 1; panel.stroke()
+            }
+        }
+    }
+}
+
+// MARK: - Notch Resize Handle
+
+final class NotchResizeHandle: NSView {
+    var onResize: (CGFloat) -> Void = { _ in }
+    private var trackingArea: NSTrackingArea?
+    private var dragStartScreenY: CGFloat = 0
+    private var dragStartExtra: CGFloat = 0
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea { removeTrackingArea(ta) }
+        let ta = NSTrackingArea(rect: bounds,
+                                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                owner: self, userInfo: nil)
+        addTrackingArea(ta); trackingArea = ta
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        return point.y <= 4 ? self : nil
+    }
+
+    override func mouseEntered(with event: NSEvent) { NSCursor.resizeUpDown.push() }
+    override func mouseExited(with event: NSEvent)  { NSCursor.pop() }
+
+    override func mouseDown(with event: NSEvent) {
+        dragStartScreenY = NSEvent.mouseLocation.y
+        dragStartExtra   = AppSettings.notchExtraHeight
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let dy = NSEvent.mouseLocation.y - dragStartScreenY
+        let newExtra = max(0, dragStartExtra - dy)
+        onResize(newExtra)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let dy = NSEvent.mouseLocation.y - dragStartScreenY
+        let newExtra = max(0, dragStartExtra - dy)
+        onResize(newExtra)
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 }
 
 // MARK: - App Delegate
@@ -2682,6 +2985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Overlay — popover mode
     var popover:        NSPopover?
     var popoverVC:      NSViewController?
+    var popoverBGView:  NSView?
     // Tracks which style was used to build the current overlay (detects setting changes)
     var lastBuiltStyle: UIStyle?
 
@@ -2698,10 +3002,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var sessionsListStack: NSStackView?    // inner stack rebuilt on each show
 
     // Data
-    var allApps:      [AppEntry]  = []
-    var filtered:     [AppEntry]  = []
+    var allApps:          [AppEntry]  = []
+    var filtered:         [AppEntry]  = []
     var checkedPIDs:      Set<pid_t>  = []
     var sortByMemory:     Bool        = false
+    var cpuRefreshTimer:  Timer?
+
+    // Inline settings panel (mirrors sessions panel pattern)
+    var isShowingSettings   = false
+    var settingsPanelView:  NSView?
+    var overlaySettingsBtn: NSButton?
+    var colHeaderView:      NSView?
+
+    // Expansion when settings panel opens — stored so we can restore on close
+    var listScrollHeightConstraint: NSLayoutConstraint?
+    var baseListScrollHeight: CGFloat = 0
+    var panelInnerHeightConstraint: NSLayoutConstraint?   // notch-only
+    var basePanelInnerHeight: CGFloat = 0                 // notch-only
+    // Anchored top-Y for the notch panel; set by showNotch() so resizeNotchPanel()
+    // always grows/shrinks from the same fixed top position.
+    var notchPanelTopY: CGFloat = 0
     var sortButton:       NSButton?
     var axeCheckedButton: NSButton?
     var halfAxeButton:    NSButton?
@@ -2937,6 +3257,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "Show Axe", key: "", tip: "⌘Z", action: #selector(toggleOverlay))
         menu.addItem(.separator())
 
+        let ramTitle: String
+        if let r = readRAMStats() {
+            ramTitle = "RAM  ·  \(r.freeFormatted) free  ·  Pressure: \(r.pressureLabel)"
+        } else {
+            ramTitle = "RAM  ·  unavailable"
+        }
+        let ramItem = NSMenuItem(title: ramTitle, action: nil, keyEquivalent: "")
+        ramItem.isEnabled = false
+        menu.addItem(ramItem)
+        menu.addItem(.separator())
+
         // Quick session actions — surface the most-used flows at the top level
         let saveQuick = NSMenuItem(title: "Save Workflow…",
                                    action: #selector(saveSessionMI), keyEquivalent: "L")
@@ -3045,7 +3376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
         addItem(menu, pun("Get Axe-quainted…", "Quick Start Guide…"),
                 key: "",  action: #selector(showOnboarding))
-        addItem(menu, "Check for Updates…",  key: "",  action: #selector(checkForUpdatesMI))
+        addItem(menu, pun("Sharpen my Axe…", "Check for Updates…"), key: "", action: #selector(checkForUpdatesMI))
         addItem(menu, "About Axe",           key: "",  action: #selector(showAbout))
         menu.addItem(.separator())
         addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
@@ -3666,9 +3997,186 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         refreshSessionsPanel()
     }
 
+    // Thin "CPU · RAM" label pinned to the right edge of the list area,
+    // matching the position of memLabel in each row.
+    private func makeColHeader() -> NSView {
+        let view = NSView()
+        let lbl  = NSTextField(labelWithString: "CPU · RAM")
+        lbl.font      = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        lbl.textColor = .tertiaryLabelColor
+        lbl.alignment = .right
+        lbl.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(lbl)
+        NSLayoutConstraint.activate([
+            lbl.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            lbl.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            lbl.widthAnchor.constraint(equalToConstant: 90),
+        ])
+        return view
+    }
+
+    @objc func toggleSettingsPanel() {
+        // Close sessions first if open — only one panel at a time.
+        if isShowingSessions { toggleSessionsPanel() }
+        isShowingSettings.toggle()
+        let showList = !isShowingSettings
+        appListContainer?.isHidden  = !showList
+        colHeaderView?.isHidden     = !showList
+        sessionsPanelView?.isHidden = true           // never shown alongside settings
+        settingsPanelView?.isHidden = !isShowingSettings
+        overlaySettingsBtn?.contentTintColor = isShowingSettings ? .controlAccentColor : dimIconColor
+        if isShowingSettings {
+            searchField?.window?.makeFirstResponder(nil)
+            expandOverlayForSettings()
+        } else {
+            collapseOverlayFromSettings()
+            searchField?.window?.makeFirstResponder(searchField)
+        }
+    }
+
+    private func expandOverlayForSettings() {
+        let style = AppSettings.uiStyle
+
+        if style == .popover {
+            popoverBGView?.layoutSubtreeIfNeeded()
+            if let sv = settingsPanelView as? NSScrollView {
+                sv.documentView?.scroll(.zero)
+                sv.reflectScrolledClipView(sv.contentView)
+            }
+            return
+        }
+
+        if style == .notch {
+            // Notch panel has a fixed size (user can drag-resize it). Don't
+            // expand it for settings — just flush layout and scroll to top.
+            panel?.contentView?.layoutSubtreeIfNeeded()
+            if let stp = settingsPanelView as? NSScrollView {
+                DispatchQueue.main.async {
+                    stp.documentView?.scroll(.zero)
+                    stp.reflectScrolledClipView(stp.contentView)
+                }
+            }
+            return
+        }
+
+        // Spotlight: grow the panel downward until 20pt above the screen floor.
+        guard let hc = listScrollHeightConstraint,
+              let screen = NSScreen.main,
+              let p = panel else { return }
+        let extra = max(0, p.frame.origin.y - screen.visibleFrame.minY - 20)
+        guard extra > 8 else {
+            if let sv = settingsPanelView as? NSScrollView {
+                sv.documentView?.scroll(.zero)
+                sv.reflectScrolledClipView(sv.contentView)
+            }
+            return
+        }
+
+        baseListScrollHeight = hc.constant
+        hc.constant += extra
+        p.contentView?.layoutSubtreeIfNeeded()
+        if let sv = settingsPanelView as? NSScrollView {
+            sv.documentView?.scroll(.zero)
+            sv.reflectScrolledClipView(sv.contentView)
+        }
+        var f = p.frame; f.origin.y -= extra; f.size.height += extra
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            p.animator().setFrame(f, display: true)
+        }
+    }
+
+    private func collapseOverlayFromSettings() {
+        let style = AppSettings.uiStyle
+
+        if style == .popover {
+            popoverBGView?.layoutSubtreeIfNeeded()
+            return
+        }
+
+        if style == .notch {
+            guard let hc  = listScrollHeightConstraint,
+                  let phc = panelInnerHeightConstraint,
+                  let p = panel,
+                  let cv = p.contentView,
+                  let mask = cv.layer?.mask as? CAShapeLayer else {
+                panel?.contentView?.layoutSubtreeIfNeeded()
+                return
+            }
+            let extra = hc.constant - baseListScrollHeight
+            guard extra > 0 else {
+                panel?.contentView?.layoutSubtreeIfNeeded()
+                return
+            }
+            hc.constant  = baseListScrollHeight
+            phc.constant = basePanelInnerHeight
+            cv.layoutSubtreeIfNeeded()
+            let g = makeNotchGeometry()
+            var f = p.frame; f.origin.y += extra; f.size.height = p.frame.height - extra
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            p.setFrame(f, display: false); cv.setFrameSize(f.size)
+            mask.frame = CGRect(origin: .zero, size: CGSize(width: g.W, height: g.H))
+            mask.path  = notchPanelPath(t: 1, geometry: g)
+            CATransaction.commit()
+            cv.layoutSubtreeIfNeeded()
+            return
+        }
+
+        // Spotlight: restore the panel to its original size.
+        guard let hc = listScrollHeightConstraint,
+              baseListScrollHeight > 0,
+              hc.constant > baseListScrollHeight,
+              let p = panel else { return }
+        let extra = hc.constant - baseListScrollHeight
+        hc.constant = baseListScrollHeight
+        p.contentView?.layoutSubtreeIfNeeded()
+        var f = p.frame; f.origin.y += extra; f.size.height -= extra
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            p.animator().setFrame(f, display: true)
+        }
+    }
+
+    func resizeNotchPanel(to newExtra: CGFloat) {
+        guard let p = panel,
+              let cv = p.contentView,
+              let mask = cv.layer?.mask as? CAShapeLayer,
+              let screen = NSScreen.main else { return }
+        var bezelH: CGFloat = 24
+        if #available(macOS 12.0, *) { bezelH = max(screen.safeAreaInsets.top, 24) }
+        let baseContentH: CGFloat = 412
+        let maxExtra = max(0, notchPanelTopY - baseContentH - bezelH - screen.frame.minY - 20)
+        let clamped  = max(0, min(newExtra, maxExtra))
+        AppSettings.notchExtraHeight = clamped
+        let rowH: CGFloat = 46; let maxRows: CGFloat = 7; let colH: CGFloat = 18
+        let g = makeNotchGeometry()
+        var f = p.frame
+        f.origin.y    = notchPanelTopY - g.H
+        f.size.height = g.H
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        p.setFrame(f, display: false); cv.setFrameSize(f.size)
+        CATransaction.commit()
+        panelInnerHeightConstraint?.constant = baseContentH + clamped
+        basePanelInnerHeight                 = baseContentH + clamped
+        listScrollHeightConstraint?.constant = rowH * maxRows - colH + clamped
+        baseListScrollHeight                 = rowH * maxRows - colH + clamped
+        cv.layoutSubtreeIfNeeded()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        mask.frame = CGRect(origin: .zero, size: CGSize(width: g.W, height: g.H))
+        mask.path  = notchPanelPath(t: 1, geometry: g)
+        CATransaction.commit()
+    }
+
+
     @objc func toggleSessionsPanel() {
+        // Close settings first if open.
+        if isShowingSettings { toggleSettingsPanel() }
         isShowingSessions.toggle()
-        appListContainer?.isHidden  = isShowingSessions
+        let showList = !isShowingSessions
+        appListContainer?.isHidden  = !showList
+        colHeaderView?.isHidden     = !showList
         sessionsPanelView?.isHidden = !isShowingSessions
         sessionBtn?.contentTintColor = isShowingSessions ? .controlAccentColor : dimIconColor
         if isShowingSessions {
@@ -3819,6 +4327,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         applyFilter(query)
     }
 
+    // Updates only the stat label of each visible row — no table reload, no flicker.
+    func refreshCPUInPlace() {
+        guard let tv = tableView else { return }
+        let visible = tv.rows(in: tv.visibleRect)
+        for row in visible.location ..< (visible.location + visible.length) {
+            guard row < filtered.count else { break }
+            let e   = filtered[row]
+            guard let cell = tv.view(atColumn: 0, row: row, makeIfNecessary: false) as? AppRowCell
+            else { continue }
+            let cpuStr = CPUSampler.shared.sample(e.app.processIdentifier)
+                .map { String(format: "%.1f%%", $0) } ?? "—"
+            let memStr = e.memMB.map { "\($0) MB" } ?? "—"
+            cell.memLabel.stringValue = "\(cpuStr) · \(memStr)"
+        }
+    }
+
     // MARK: Overlay lifecycle
 
     @objc func toggleOverlay() {
@@ -3838,12 +4362,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Tear down the built overlay so it's rebuilt fresh (called when style changes).
     func teardownOverlay() {
         panel?.orderOut(nil); panel = nil
-        popover?.close();     popover = nil; popoverVC = nil
+        popover?.close();     popover = nil; popoverVC = nil; popoverBGView = nil
         searchField = nil; tableView = nil; emptyView = nil
         hintLabel = nil; sortButton = nil; axeCheckedButton = nil; halfAxeButton = nil
         sessionBtn = nil; appListContainer = nil
         sessionsPanelView = nil; sessionsListStack = nil
-        isShowingSessions = false
+        settingsPanelView = nil; overlaySettingsBtn = nil; colHeaderView = nil
+        listScrollHeightConstraint = nil; baseListScrollHeight = 0
+        panelInnerHeightConstraint = nil; basePanelInnerHeight = 0
+        notchPanelTopY = 0
+        isShowingSessions = false; isShowingSettings = false
         lastBuiltStyle = nil
     }
 
@@ -3854,8 +4382,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         checkedPIDs.removeAll()
         stopPhraseCycling()
         currentKillPhrase = ""
-        isShowingSessions = false
+        isShowingSessions = false; isShowingSettings = false
+        // Sync view visibility to match the reset state — overlay may have been
+        // dismissed while sessions or settings was open, leaving views in the
+        // wrong hidden state.
+        settingsPanelView?.isHidden  = true
+        colHeaderView?.isHidden      = false
+        appListContainer?.isHidden   = false
+        sessionsPanelView?.isHidden  = true
+        // Reset any settings-expansion from previous session before showing.
+        listScrollHeightConstraint?.constant = baseListScrollHeight
+        panelInnerHeightConstraint?.constant = basePanelInnerHeight
+        // Restore the popover to its base size — it may have been left at an expanded
+        // height from a previous settings session that was dismissed without collapsing.
+        if let vc = popoverVC, let bg = popoverBGView, baseListScrollHeight > 0 {
+            let searchH: CGFloat = 50; let colH: CGFloat = 18; let hintH: CGFloat = 34
+            let baseH = searchH + 1 + (baseListScrollHeight + colH) + 1 + hintH
+            let sz = NSSize(width: bg.frame.width, height: baseH)
+            vc.preferredContentSize = sz
+            bg.setFrameSize(sz)
+        }
         refreshApps()
+        cpuRefreshTimer?.invalidate()
+        cpuRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.refreshCPUInPlace()
+        }
 
         switch AppSettings.uiStyle {
         case .spotlight: showSpotlight()
@@ -3956,6 +4507,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func showSpotlight() {
         if panel == nil { buildPanel(); lastBuiltStyle = .spotlight }
 
+        // If settings had expanded the panel and the overlay was dismissed without
+        // collapsing (e.g. click-outside while settings was open), the panel frame
+        // stays at the expanded height. Snap it back before showing so the layout
+        // starts from a known-good size.
+        if let p = panel, baseListScrollHeight > 0 {
+            let colH: CGFloat = 18; let searchH: CGFloat = 54; let hintH: CGFloat = 34
+            let baseH = baseListScrollHeight + colH + searchH + 1 + 1 + hintH
+            if p.frame.size.height > baseH + 1 {
+                var f = p.frame
+                f.origin.y += f.size.height - baseH
+                f.size.height = baseH
+                p.setFrame(f, display: false)
+                listScrollHeightConstraint?.constant = baseListScrollHeight
+                p.contentView?.layoutSubtreeIfNeeded()
+            }
+        }
+
         if let screen = NSScreen.main {
             let sf = screen.visibleFrame
             let pw = panel!.frame
@@ -4004,7 +4572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                               y: screen.frame.maxY + topOverlap - g.H,
                               width: g.W, height: g.H)
         p.setFrame(endFrame, display: false)
-
+        notchPanelTopY = endFrame.maxY   // anchor; used by resizeNotchPanel
         guard let cv = p.contentView,
               let layer = cv.layer,
               let mask = layer.mask as? CAShapeLayer else {
@@ -4018,6 +4586,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // the panel becomes visible. No implicit animations on this step.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        // Snap mask back to base geometry in case settings had expanded it.
+        mask.frame      = CGRect(origin: .zero, size: CGSize(width: g.W, height: g.H))
         mask.path       = notchPanelPath(t: 0, geometry: g)
         layer.opacity   = 0
         layer.transform = CATransform3DMakeScale(
@@ -4025,9 +4595,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             AnimationConstants.panelShowScaleFrom, 1)
         CATransaction.commit()
 
-        p.alphaValue = 1
+        // Keep window invisible until the pre-animation CA state is flushed
+        // to the render server — prevents the one-frame flash of the full panel.
+        p.alphaValue = 0
         p.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Guarantee t=0 mask / opacity 0 / scale 0.98 are committed before
+        // any frame composites, then reveal the window so the layer drives
+        // the visible fade (layer opacity is 0, so nothing renders yet).
+        CATransaction.flush()
+        p.alphaValue = 1
 
         // Mask grows from the small notch shape outward to the full panel
         // shape, in parallel with the spring scale+opacity entrance.
@@ -4050,6 +4628,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func hideOverlay() {
+        cpuRefreshTimer?.invalidate()
+        cpuRefreshTimer = nil
         switch lastBuiltStyle ?? AppSettings.uiStyle {
         case .spotlight:
             NotificationCenter.default.removeObserver(self,
@@ -4077,6 +4657,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             // Mirror of entrance: mask shrinks back to the notch shape while
             // the layer fades + scales down. ~0.18s ease-out.
             let g = makeNotchGeometry()
+            // If settings had expanded the panel, snap back to base geometry
+            // immediately so the collapse animation starts from the right shape.
+            if mask.frame.height > g.H + 1, let p = panel, let cv = p.contentView {
+                var f = p.frame; f.origin.y = f.maxY - g.H; f.size.height = g.H
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                p.setFrame(f, display: false)
+                cv.setFrameSize(f.size)
+                mask.frame = CGRect(origin: .zero, size: CGSize(width: g.W, height: g.H))
+                mask.path  = notchPanelPath(t: 1, geometry: g)
+                CATransaction.commit()
+                listScrollHeightConstraint?.constant = baseListScrollHeight
+                panelInnerHeightConstraint?.constant = basePanelInnerHeight
+                cv.layoutSubtreeIfNeeded()
+            }
             animateNotchMask(mask, to: 0,
                              duration: AnimationConstants.panelDismissDuration,
                              geometry: g)
@@ -4121,7 +4715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // top `bezelH` of the panel is empty black space covering the menu
         // bar; the lower `contentH` holds the search bar / list / buttons.
         let W_inner: CGFloat = 560
-        let contentH: CGFloat = 412  // search 54 + 1 + 46*7 + 1 + hint 34
+        let contentH: CGFloat = 412 + AppSettings.notchExtraHeight
         var bezelH: CGFloat = 24
         if #available(macOS 12.0, *) {
             bezelH = max((NSScreen.main?.safeAreaInsets.top) ?? 24, 24)
@@ -4188,6 +4782,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let maxRows: CGFloat = 7
         let hintH: CGFloat   = 34
         let contentH = searchH + 1 + rowH * maxRows + 1 + hintH  // 412
+        let notchExtra: CGFloat = isNotch ? AppSettings.notchExtraHeight : 0
 
         // Inner content width. Outer is wider in notch mode for the shoulders.
         // In notch mode we use the shared `makeNotchGeometry()` so show/hide
@@ -4202,7 +4797,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                         backing: .buffered, defer: false)
         p.titleVisibility             = .hidden
         p.titlebarAppearsTransparent  = true
-        p.isMovableByWindowBackground = true
+        p.isMovable               = !isNotch   // notch is anchored; spotlight is freely draggable
+        p.isMovableByWindowBackground = !isNotch
         // .popUpMenu in notch mode so we draw over the menu bar + status items;
         // .floating otherwise so the spotlight overlay sits above normal windows
         // but below the menu bar.
@@ -4234,12 +4830,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             inner.wantsLayer = true
             inner.translatesAutoresizingMaskIntoConstraints = false
             outer.addSubview(inner)
+            let innerHC = inner.heightAnchor.constraint(equalToConstant: contentH + notchExtra)
+            panelInnerHeightConstraint = innerHC
+            basePanelInnerHeight = contentH + notchExtra
             NSLayoutConstraint.activate([
                 inner.centerXAnchor.constraint(equalTo: outer.centerXAnchor),
                 inner.widthAnchor.constraint(equalToConstant: W_inner),
                 inner.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
-                inner.heightAnchor.constraint(equalToConstant: contentH),
+                innerHC,
             ])
+
+            let handle = NotchResizeHandle()
+            handle.translatesAutoresizingMaskIntoConstraints = false
+            outer.addSubview(handle)
+            NSLayoutConstraint.activate([
+                handle.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+                handle.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+                handle.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+                handle.heightAnchor.constraint(equalToConstant: 8),
+            ])
+            handle.onResize = { [weak self] newExtra in self?.resizeNotchPanel(to: newExtra) }
+
             bg = inner
         } else {
             let v = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: W, height: H))
@@ -4379,11 +4990,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(ev)
         emptyView = ev
 
+        // ── Column header ──────────────────────────────────────────
+        let colH: CGFloat = 18
+        let ch = makeColHeader()
+        ch.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(ch)
+        colHeaderView = ch
+
+        // ── Inline settings panel ──────────────────────────────────
+        let stp = settingsWindow.buildSettingsScrollView()
+        stp.isHidden = true
+        stp.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(stp)
+        settingsPanelView = stp
+
+        let svHC = sv.heightAnchor.constraint(equalToConstant: rowH * maxRows - colH + notchExtra)
+        listScrollHeightConstraint = svHC
+        baseListScrollHeight = rowH * maxRows - colH + notchExtra
         NSLayoutConstraint.activate([
-            sv.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            ch.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            ch.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            ch.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            ch.heightAnchor.constraint(equalToConstant: colH),
+            sv.topAnchor.constraint(equalTo: ch.bottomAnchor),
             sv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            sv.heightAnchor.constraint(equalToConstant: rowH * maxRows),
+            svHC,
             ev.topAnchor.constraint(equalTo: sv.topAnchor),
             ev.leadingAnchor.constraint(equalTo: sv.leadingAnchor),
             ev.trailingAnchor.constraint(equalTo: sv.trailingAnchor),
@@ -4392,6 +5024,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             sp.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
+            stp.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            stp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            stp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            stp.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
         ])
 
         // ── Bottom divider + hint bar ──────────────────────────────
@@ -4430,13 +5066,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Save + Settings + About icon buttons (trailing edge of hint bar)
         let saveBtn     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
         saveBtn.toolTip = "Save current workflow (⌘⇧L)"
-        let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
+        let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(toggleSettingsPanel))
         let aboutBtn    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
         // Override the default tertiary tint so the icons stay readable on
         // the pure-black notch background.
         saveBtn.contentTintColor     = dimIconColor
         settingsBtn.contentTintColor = dimIconColor
         aboutBtn.contentTintColor    = dimIconColor
+        overlaySettingsBtn = settingsBtn
         bg.addSubview(saveBtn)
         bg.addSubview(settingsBtn)
         bg.addSubview(aboutBtn)
@@ -4507,6 +5144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         vc.view = bg
         vc.preferredContentSize = NSSize(width: W, height: H)
         popoverVC = vc
+        popoverBGView = bg
 
         // ── Search bar ─────────────────────────────────────────────
         let searchIcon = NSImageView()
@@ -4622,11 +5260,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ev.translatesAutoresizingMaskIntoConstraints = false; ev.isHidden = true
         bg.addSubview(ev); emptyView = ev
 
+        // ── Column header ──────────────────────────────────────────
+        let colH: CGFloat = 18
+        let ch2 = makeColHeader()
+        ch2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(ch2)
+        colHeaderView = ch2
+
+        // ── Inline settings panel ──────────────────────────────────
+        let stp2 = settingsWindow.buildSettingsScrollView()
+        stp2.isHidden = true
+        stp2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(stp2)
+        settingsPanelView = stp2
+
+        // No fixed height on sv2 — it fills the space between the column header and
+        // the hint bar. Combined with hint.bottomAnchor = bg.bottomAnchor below, the
+        // layout is fully described from both ends and self-heals if NSPopover sizes
+        // bg to an unexpected height (a fixed height constraint would conflict and
+        // leave a blank gap between the list and the hint bar).
+        baseListScrollHeight = rowH * maxRows - colH   // used for preferredContentSize
         NSLayoutConstraint.activate([
-            sv2.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            ch2.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            ch2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            ch2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            ch2.heightAnchor.constraint(equalToConstant: colH),
+            sv2.topAnchor.constraint(equalTo: ch2.bottomAnchor),
             sv2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sv2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            sv2.heightAnchor.constraint(equalToConstant: rowH * maxRows),
             ev.topAnchor.constraint(equalTo: sv2.topAnchor),
             ev.leadingAnchor.constraint(equalTo: sv2.leadingAnchor),
             ev.trailingAnchor.constraint(equalTo: sv2.trailingAnchor),
@@ -4635,6 +5296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             sp2.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
+            stp2.topAnchor.constraint(equalTo: topDiv.bottomAnchor),
+            stp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            stp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            stp2.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
         ])
 
         // ── Hint bar ───────────────────────────────────────────────
@@ -4661,8 +5326,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Save + Settings + About icon buttons (trailing edge of hint bar)
         let saveBtn2     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
         saveBtn2.toolTip = "Save current workflow (⌘⇧L)"
-        let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
+        let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(toggleSettingsPanel))
         let aboutBtn2    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        overlaySettingsBtn = settingsBtn2
         bg.addSubview(saveBtn2)
         bg.addSubview(settingsBtn2)
         bg.addSubview(aboutBtn2)
@@ -4673,6 +5339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             botDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             botDiv.heightAnchor.constraint(equalToConstant: 1),
             hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
+            hint.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
             hint.trailingAnchor.constraint(equalTo: saveBtn2.leadingAnchor, constant: -4),
             hint.heightAnchor.constraint(equalToConstant: hintH),
@@ -4760,8 +5427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         filtered = query.isEmpty
             ? allApps
             : allApps.filter { $0.name.localizedCaseInsensitiveContains(query) }
-        // Drop checked PIDs for apps that are no longer running
+        // Drop checked PIDs and stale CPU baselines for apps no longer running
         let alivePIDs = Set(allApps.map { $0.app.processIdentifier })
+        CPUSampler.shared.purge(keeping: alivePIDs)
         checkedPIDs   = checkedPIDs.intersection(alivePIDs)
         tableView?.reloadData()
         if !filtered.isEmpty && checkedPIDs.isEmpty {
@@ -5461,7 +6129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let pid = e.app.processIdentifier
         cell.appName.stringValue  = e.name
         cell.appIcon.image        = e.icon
-        cell.memLabel.stringValue = e.memMB.map { "\($0) MB" } ?? "—"
+        let cpuStr = e.cpuPercent.map { String(format: "%.1f%%", $0) } ?? "—"
+        let memStr = e.memMB.map { "\($0) MB" } ?? "—"
+        cell.memLabel.stringValue = "\(cpuStr) · \(memStr)"
         cell.checkBox.state       = checkedPIDs.contains(pid) ? .on : .off
         cell.onCheckToggle = { [weak self] checked in
             guard let self else { return }
@@ -5498,7 +6168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                  doCommandBy sel: Selector) -> Bool {
         switch sel {
         case #selector(NSResponder.cancelOperation(_:)):
-            if isShowingSessions { toggleSessionsPanel() } else { hideOverlay() }
+            if isShowingSettings { toggleSettingsPanel() }
+            else if isShowingSessions { toggleSessionsPanel() }
+            else { hideOverlay() }
             return true
 
         case #selector(NSResponder.insertNewline(_:)):
