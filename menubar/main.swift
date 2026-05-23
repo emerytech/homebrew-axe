@@ -4,11 +4,12 @@
 // as a competing product or service.
 
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.6.0"
+let appVersion = "2.6.1"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -47,10 +48,251 @@ private enum CGSSpace {
     }
 }
 
+// MARK: - Chop sound effect
+// Synthesizes an axe "chop" entirely in code (a rising swing → sharp thwack →
+// low decaying thunk) so there's no audio file to bundle. Built once, replayed
+// on demand through a persistent AVAudioEngine.
+// MARK: - IconCache
+//
+// Keyed by bundle ID. The first hit per app blocks briefly (NSWorkspace.icon
+// is fast but does I/O); subsequent lookups are pure dictionary reads. The
+// list panel's `refreshApps` calls `warmAsync` so off-screen rows have their
+// icons ready by the time you scroll to them, and the first paint of any
+// visible row gets a real icon instead of a blank slot.
+final class IconCache {
+    static let shared = IconCache()
+    private let queue  = DispatchQueue(label: "com.emerytech.axe.iconcache",
+                                       qos: .userInitiated)
+    private var cache  = [String: NSImage]()
+    private let lock   = NSLock()
+
+    func icon(forBundleID id: String?, url: URL?) -> NSImage? {
+        guard let id = id else { return nil }
+        lock.lock()
+        if let hit = cache[id] { lock.unlock(); return hit }
+        lock.unlock()
+        guard let url = url else { return nil }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        lock.lock(); cache[id] = image; lock.unlock()
+        return image
+    }
+
+    func warmAsync(_ entries: [(String, URL)]) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            for (bid, url) in entries {
+                self.lock.lock(); let hit = self.cache[bid] != nil; self.lock.unlock()
+                if hit { continue }
+                let image = NSWorkspace.shared.icon(forFile: url.path)
+                self.lock.lock(); self.cache[bid] = image; self.lock.unlock()
+            }
+        }
+    }
+}
+
+final class ChopSound {
+    static let shared = ChopSound()
+
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private var buffer: AVAudioPCMBuffer?
+    private var prepared = false
+
+    private func prepare() {
+        guard !prepared else { return }
+        let sr = 44_100.0
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1) else { return }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        buffer = ChopSound.makeBuffer(format: format, sampleRate: sr)
+        do { try engine.start(); prepared = true } catch { prepared = false }
+    }
+
+    func play() {
+        prepare()
+        guard prepared, let buffer = buffer else { return }
+        if !engine.isRunning { try? engine.start() }
+        // .interrupts so rapid kills retrigger cleanly instead of stacking
+        player.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
+        if !player.isPlaying { player.play() }
+    }
+
+    private static func makeBuffer(format: AVAudioFormat, sampleRate sr: Double) -> AVAudioPCMBuffer? {
+        let duration   = 0.32
+        let frameCount = AVAudioFrameCount(sr * duration)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+              let ch  = buf.floatChannelData?[0] else { return nil }
+        buf.frameLength = frameCount
+
+        let impact = 0.10                  // seconds — when the blade lands
+        var seed: UInt32 = 0x1234_5678
+        func noise() -> Float {            // deterministic xorshift white noise
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5
+            return (Float(seed) / Float(UInt32.max)) * 2 - 1
+        }
+
+        for i in 0..<Int(frameCount) {
+            let t = Double(i) / sr
+            var s: Float = 0
+
+            // 1) Rising swing "whoosh" into the impact
+            if t < impact {
+                let prog = Float(t / impact)
+                s += noise() * (prog * prog) * 0.18
+            }
+
+            // 2) + 3) Sharp thwack transient and low decaying thunk on impact
+            let dt = t - impact
+            if dt >= 0 {
+                let clickEnv = Float(exp(-dt * 900))               // ~1ms crack
+                s += noise() * clickEnv * 0.6
+                let bodyEnv  = Float(exp(-dt * 22))                // weighty decay
+                let tone     = Float(sin(2 * .pi * 120 * dt))
+                let subTone  = Float(sin(2 * .pi *  70 * dt))
+                s += (tone * 0.5 + subTone * 0.35) * bodyEnv
+            }
+
+            ch[i] = max(-1, min(1, s)) * 0.9
+        }
+        return buf
+    }
+}
+
 // MARK: - Settings
 
 enum KillMode: Int  { case graceful = 0, force = 1 }
-enum UIStyle:  Int  { case spotlight = 0, popover = 1 }
+enum UIStyle:  Int  { case spotlight = 0, popover = 1, notch = 2 }
+
+// Destruction animation played as a row is axed.
+enum KillAnimation: Int, CaseIterable {
+    case shatter  = 0  // breaks into a grid of tiles that fall under gravity
+    case slice    = 1  // cleaved into two halves that fly apart
+    case explode  = 2  // tiles burst outward from the row's center
+    case poof     = 3  // vanishes in a puff of smoke
+    case burn     = 4  // a flame front sweeps up, consuming the row bottom-to-top
+    case thanos   = 5  // disintegrates into fine dust that drifts up and away
+    case dissolve = 6  // gently disintegrates into fine tiles that float up and fade
+    case random   = 7  // a different one is chosen at random each time
+
+    var label: String {
+        switch self {
+        case .shatter:  return "Shatter"
+        case .slice:    return "Cut in Half"
+        case .explode:  return "Explode"
+        case .poof:     return "Poof"
+        case .burn:     return "Burn"
+        case .thanos:   return "Thanos Snap"
+        case .dissolve: return "Dissolve"
+        case .random:   return "Surprise me"
+        }
+    }
+    /// Concrete styles only (everything except `.random`).
+    static var concreteCases: [KillAnimation] {
+        [.shatter, .slice, .explode, .poof, .burn, .thanos, .dissolve]
+    }
+}
+
+/// Returns the punny variant when "Punny mode" is on, otherwise the neutral text.
+/// Use this for personality copy where a tame fallback is desired; everyday
+/// brand puns ("Axe Behaviour", "Half-Axe It", etc.) stay on regardless.
+@inline(__always) func pun(_ punny: String, _ neutral: String) -> String {
+    AppSettings.punnyMode ? punny : neutral
+}
+
+// MARK: - AnimationConstants
+//
+// Single source of truth for the durations / damping / offsets used by the
+// overlay polish pass. Tune values here; everything else reads through these
+// names so callsites stay declarative.
+enum AnimationConstants {
+    // Panel entrance — spring-driven for the natural "drop into place" feel.
+    // Slower than the typical UI entrance so the notch-grow expansion reads
+    // as a deliberate unfolding rather than a snap.
+    static let panelShowDuration: CFTimeInterval = 0.48
+    static let panelShowDamping:  CGFloat        = 0.82   // damping ratio (0–1)
+    static let panelShowResponse: CGFloat        = 0.55   // approx period in seconds
+    static let panelShowScaleFrom: CGFloat       = 0.98
+    // Panel dismiss — measured ease-out mirror.
+    static let panelDismissDuration: CFTimeInterval = 0.34
+    // Reduce Motion fallback: opacity-only crossfade.
+    static let reducedDuration:   CFTimeInterval = 0.08
+
+    // List row transitions when the filter / sort changes.
+    static let rowFadeDuration:   CFTimeInterval = 0.16
+    static let rowFadeOffset:     CGFloat        = 4
+    static let rowStaggerDelay:   CFTimeInterval = 0.015   // 15ms per row
+
+    // Selection highlight slides between rows on arrow-up/down.
+    static let selectionDuration: CFTimeInterval = 0.12
+
+    // Hover state on the small chrome icons in the hint bar.
+    static let iconHoverDuration: CFTimeInterval = 0.12
+    static let iconHoverBgAlpha:  CGFloat        = 0.08
+    static let iconHoverCorner:   CGFloat        = 6
+
+    // Spring stiffness / damping for CASpringAnimation: derived from
+    // (response, dampingRatio) using the classic Apple spring formulas
+    //   stiffness = (2π / response)²       (assuming unit mass)
+    //   damping   = 4π · ratio / response
+    static var springStiffness: CGFloat {
+        let r = panelShowResponse
+        return pow(2 * .pi / r, 2)
+    }
+    static var springDamping: CGFloat {
+        4 * .pi * panelShowDamping / panelShowResponse
+    }
+
+    /// True when the user has enabled Reduce Motion in Accessibility settings.
+    static var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Builds a CAAnimation for opacity changes that respects Reduce Motion.
+    /// Use for any "fade" we'd otherwise drive with a spring / longer ease.
+    static func opacityAnimation(from: Float, to: Float,
+                                 duration: CFTimeInterval) -> CABasicAnimation {
+        let a = CABasicAnimation(keyPath: "opacity")
+        a.fromValue = from
+        a.toValue   = to
+        a.duration  = reduceMotion ? reducedDuration : duration
+        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        a.fillMode = .forwards
+        a.isRemovedOnCompletion = false
+        return a
+    }
+}
+
+/// Rotating punny phrases for the "Pause & Reopen Later" action — picked
+/// randomly each time the menu is built or the alert is shown.
+let pauseReopenPunPhrases: [String] = [
+    "Take a Br-Axe",
+    "Keep the Car Running, Clive",   // Boondock Saints
+    "Be Right B-Axe",
+]
+
+/// Rotating quit-confirmation copy. Plays up the irony of the killer being
+/// killed — picked at random each time the user tries to quit Axe.
+typealias QuitPrompt = (title: String, body: String, cancel: String, quit: String)
+let quitConfirmPrompts: [QuitPrompt] = [
+    ("You'd really axe the Axe?",
+     "How the tables have turned. You'll need me again — you just wait and see.",
+     "Spare me",                "Et tu, Brute?"),
+    ("Et tu, Brute?",
+     "After all the apps I've laid to rest for you, you'd really axe me too?",
+     "I'll spare you… for now", "Lay me to rest"),
+    ("Pulling the plug on the plug-puller?",
+     "Oh, the irony. Don't come crying when something needs killing in 5 minutes.",
+     "On second thought…",      "Yeet"),
+    ("The executioner becomes the executed.",
+     "Fine. I'll be waiting in the menu bar when you inevitably change your mind.",
+     "Stay sharp",              "Adieu"),
+    ("Goodbye, cruel user?",
+     "I've axed thousands of apps for you. This is how you repay me?",
+     "Not today",               "Bury the Axe"),
+    ("Hasta la vista, Axe-y?",
+     "I'll be back. (You will too, when Chrome starts hogging memory again.)",
+     "Sharpen the blade",       "I'll be back"),
+]
 
 struct AppSettings {
     private static let d = UserDefaults.standard
@@ -58,6 +300,11 @@ struct AppSettings {
     static var killMode: KillMode {
         get { KillMode(rawValue: d.integer(forKey: "killMode")) ?? .graceful }
         set { d.set(newValue.rawValue, forKey: "killMode") }
+    }
+    // Which destruction animation plays when an app is axed
+    static var killAnimation: KillAnimation {
+        get { KillAnimation(rawValue: d.integer(forKey: "killAnimation")) ?? .shatter }
+        set { d.set(newValue.rawValue, forKey: "killAnimation") }
     }
     // Seconds to wait before following up with SIGKILL (graceful mode only)
     static var gracePeriod: Double {
@@ -75,13 +322,31 @@ struct AppSettings {
         set { d.set(newValue, forKey: "autoClose") }
     }
     static var uiStyle: UIStyle {
-        get { UIStyle(rawValue: d.integer(forKey: "uiStyle")) ?? .popover }
+        // First-launch default: drop-from-notch. Existing installs keep whatever
+        // value they had stored (notch raw value is 2; first launch returns nil
+        // which falls through to .notch).
+        get {
+            if d.object(forKey: "uiStyle") == nil { return .notch }
+            return UIStyle(rawValue: d.integer(forKey: "uiStyle")) ?? .notch
+        }
         set { d.set(newValue.rawValue, forKey: "uiStyle") }
     }
     // Require a confirmation alert before killing any app
     static var confirmKill: Bool {
         get { d.bool(forKey: "confirmKill") }
         set { d.set(newValue, forKey: "confirmKill") }
+    }
+    // Play a chopping sound effect when apps are axed (default on)
+    static var soundEnabled: Bool {
+        get { d.object(forKey: "soundEnabled") == nil ? true : d.bool(forKey: "soundEnabled") }
+        set { d.set(newValue, forKey: "soundEnabled") }
+    }
+    // "Punny mode" — when on, the UI swaps in extra-cheesy axe puns wherever
+    // a neutral label exists. The everyday/baseline puns ("Axe Behaviour" etc.)
+    // stay on regardless; this turns the dial from witty up to chaotic.
+    static var punnyMode: Bool {
+        get { d.bool(forKey: "punnyMode") }
+        set { d.set(newValue, forKey: "punnyMode") }
     }
     static var launchAtLogin: Bool {
         if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
@@ -145,6 +410,23 @@ struct AppSettings {
     static var autoRestoreLastSession: Bool {
         get { d.bool(forKey: "autoRestoreLastSession") }
         set { d.set(newValue, forKey: "autoRestoreLastSession") }
+    }
+    /// On restore: first quit running (non-system) apps not in the session so
+    /// you land in a clean workspace.
+    static var closeOthersOnRestore: Bool {
+        get { d.bool(forKey: "closeOthersOnRestore") }
+        set { d.set(newValue, forKey: "closeOthersOnRestore") }
+    }
+    /// Exclude system apps (anything bundled under /System/) when saving a session.
+    static var ignoreSystemOnSave: Bool {
+        get { d.object(forKey: "ignoreSystemOnSave") == nil ? true : d.bool(forKey: "ignoreSystemOnSave") }
+        set { d.set(newValue, forKey: "ignoreSystemOnSave") }
+    }
+    /// Default delay (minutes) for "Pause & Reopen Later" — captures now, quits
+    /// the apps, restores them after this delay.
+    static var scheduledReopenMinutes: Int {
+        get { d.object(forKey: "scheduledReopenMinutes") == nil ? 15 : d.integer(forKey: "scheduledReopenMinutes") }
+        set { d.set(newValue, forKey: "scheduledReopenMinutes") }
     }
     /// Phrases the user has explicitly turned off. Stored as a JSON array of strings.
     /// Unrecognised / new phrases are implicitly enabled (not in this set).
@@ -222,7 +504,13 @@ struct AppEntry {
     let app:   NSRunningApplication
     let memMB: Int?
     var name:  String    { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
-    var icon:  NSImage?  { app.icon }
+    /// Cached via `IconCache` so the first row paint always has an icon
+    /// instead of a blank placeholder. Falls back to `NSRunningApplication.icon`
+    /// for apps that don't have a bundle URL on disk (rare).
+    var icon:  NSImage?  {
+        IconCache.shared.icon(forBundleID: app.bundleIdentifier, url: app.bundleURL)
+            ?? app.icon
+    }
     init(_ a: NSRunningApplication) { app = a; memMB = residentMB(for: a.processIdentifier) }
 }
 
@@ -232,13 +520,35 @@ struct AppEntry {
 /// scroll-view content area on every layout pass. This prevents horizontal
 /// overflow regardless of system scroll-bar style (overlay vs. always-on).
 private final class AutoFitTableView: NSTableView {
+    /// Right-click context menu for the row under the cursor — Axe / Force Axe
+    /// / Half-Axe the specific app the user right-clicked, without having to
+    /// check it or select it first. Delegates the menu construction back to
+    /// AppDelegate so the action plumbing lives next to the rest of the kill
+    /// logic.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let pt  = convert(event.locationInWindow, from: nil)
+        let row = row(at: pt)
+        guard row >= 0, row < numberOfRows else { return nil }
+        if let dg = delegate as? AppDelegate {
+            return dg.rowContextMenu(forRow: row)
+        }
+        return nil
+    }
+
     override func layout() {
         super.layout()
         guard let col = tableColumns.first,
               let sv  = enclosingScrollView else { return }
-        // Use documentVisibleRect width so the vertical scroller's width is
-        // already subtracted — this prevents the horizontal-overflow feedback loop.
-        let available = sv.documentVisibleRect.width
+        // When the list overflows vertically, an *overlay* scroller floats over the
+        // right edge of the content (it doesn't take layout space). Reserve a gutter
+        // so right-aligned content (the memory label) isn't covered by it.
+        // Legacy/"always shown" scrollers already reduce contentView width, so no
+        // extra gutter is needed in that case.
+        let contentHeight = CGFloat(numberOfRows) * rowHeight
+        let needsScroller = contentHeight > sv.contentView.bounds.height + 0.5
+        let isOverlay     = sv.scrollerStyle == .overlay
+        let gutter: CGFloat = (needsScroller && isOverlay) ? 16 : 0
+        let available = sv.contentView.bounds.width - gutter
         if available > 1 && abs(col.width - available) > 0.5 {
             col.width = available
             // Reset horizontal offset so content is never clipped on the left
@@ -254,6 +564,76 @@ private final class FlippedStackView: NSStackView {
     override var isFlipped: Bool { return true }
 }
 
+/// Transparent, layer-backed overlay that never intercepts mouse events.
+/// Hosts the shatter-animation fragment layers above the rest of the UI.
+private final class ShatterOverlayView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// NSButton with a subtle layered hover state (6pt rounded background that
+/// fades in/out at 0.12s) — used for the chrome icons in the hint bar.
+final class HoverIconButton: NSButton {
+    private var hoverArea: NSTrackingArea?
+    private let hoverBg = CALayer()
+    private var didSetupHover = false
+
+    private func setupHoverIfNeeded() {
+        guard !didSetupHover else { return }
+        wantsLayer = true
+        guard let host = layer else { return }
+        hoverBg.backgroundColor = NSColor.white
+            .withAlphaComponent(AnimationConstants.iconHoverBgAlpha).cgColor
+        hoverBg.cornerRadius = AnimationConstants.iconHoverCorner
+        hoverBg.opacity = 0
+        host.insertSublayer(hoverBg, at: 0)
+        didSetupHover = true
+    }
+
+    override func layout() {
+        super.layout()
+        setupHoverIfNeeded()
+        hoverBg.frame = bounds
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = hoverArea { removeTrackingArea(a) }
+        let a = NSTrackingArea(rect: bounds,
+                               options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(a); hoverArea = a
+    }
+
+    override func mouseEntered(with event: NSEvent) { animateHover(to: 1) }
+    override func mouseExited(with event: NSEvent)  { animateHover(to: 0) }
+
+    private func animateHover(to target: Float) {
+        setupHoverIfNeeded()
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = hoverBg.presentation()?.opacity ?? hoverBg.opacity
+        anim.toValue   = target
+        anim.duration  = AnimationConstants.reduceMotion
+            ? AnimationConstants.reducedDuration
+            : AnimationConstants.iconHoverDuration
+        anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        anim.fillMode  = .forwards
+        anim.isRemovedOnCompletion = false
+        hoverBg.add(anim, forKey: "hover")
+        hoverBg.opacity = target
+    }
+}
+
+/// NSPanel that doesn't get auto-constrained below the menu bar — required for
+/// notch mode where we want the overlay to draw flush against the top of the
+/// physical screen (covering the menu bar / blending with the notch).
+final class OverlayPanel: NSPanel {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        // Return the requested frame untouched — AppKit's default would clamp
+        // the top edge to visibleFrame.maxY (below the menu bar).
+        return frameRect
+    }
+}
+
 // MARK: - RoundedIconView
 
 final class RoundedIconView: NSImageView {
@@ -262,6 +642,72 @@ final class RoundedIconView: NSImageView {
                      xRadius: bounds.width * 0.22,
                      yRadius: bounds.height * 0.22).addClip()
         super.draw(dirty)
+    }
+}
+
+// MARK: - AnimatedRowView
+//
+// Replaces NSTableView's default selection highlight with a custom layer-based
+// background that fades on/off (0.12s ease-out) when the user arrows up/down,
+// instead of jumping. Also bumps the highlight contrast to ~12% white plus a
+// 1pt inner-top highlight so the selection reads clearly against the dark
+// panel material.
+final class AnimatedRowView: NSTableRowView {
+    private let bgLayer  = CALayer()
+    private let topHair  = CALayer()
+    private var didSetup = false
+
+    private func setupLayersIfNeeded() {
+        guard !didSetup else { return }
+        wantsLayer = true
+        guard let host = layer else { return }
+        bgLayer.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        bgLayer.cornerRadius    = 8
+        bgLayer.opacity         = 0
+        topHair.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        topHair.opacity         = 0
+        host.addSublayer(bgLayer)
+        host.addSublayer(topHair)
+        didSetup = true
+    }
+
+    override func layout() {
+        super.layout()
+        setupLayersIfNeeded()
+        let inset: CGFloat = 6
+        let frame = NSRect(x: inset, y: 1,
+                           width: bounds.width - 2 * inset,
+                           height: bounds.height - 2)
+        bgLayer.frame = frame
+        // 1pt inner top highlight, just below the top edge of the bg rect.
+        topHair.frame = NSRect(x: frame.minX + 8, y: frame.maxY - 1,
+                               width: frame.width - 16, height: 1)
+    }
+
+    // Suppress the system's default blue selection — we draw our own.
+    override func drawSelection(in dirtyRect: NSRect) {}
+    override func drawBackground(in dirtyRect: NSRect) {}
+
+    override var isSelected: Bool {
+        didSet {
+            guard oldValue != isSelected else { return }
+            setupLayersIfNeeded()
+            let target: Float = isSelected ? 1.0 : 0.0
+            let dur = AnimationConstants.reduceMotion
+                ? AnimationConstants.reducedDuration
+                : AnimationConstants.selectionDuration
+            for layer in [bgLayer, topHair] {
+                let anim = CABasicAnimation(keyPath: "opacity")
+                anim.fromValue = layer.presentation()?.opacity ?? layer.opacity
+                anim.toValue   = target
+                anim.duration  = dur
+                anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                anim.fillMode  = .forwards
+                anim.isRemovedOnCompletion = false
+                layer.add(anim, forKey: "selection")
+                layer.opacity = target
+            }
+        }
     }
 }
 
@@ -399,8 +845,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     func show() {
         if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 0),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Axe Settings"
+        w.minSize = NSSize(width: 460, height: 360)
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.center()
@@ -415,24 +862,38 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     // ── UI construction ──────────────────────────────────────────
 
     private func buildUI(in w: NSWindow) {
-        let root = NSStackView()
+        // Use a flipped stack so content fills from the top of the scroll view
+        // (a vanilla NSStackView would float content to the bottom of the clip).
+        let root = FlippedStackView()
         root.orientation     = .vertical
         root.spacing         = 0
         root.alignment       = .leading
         root.translatesAutoresizingMaskIntoConstraints = false
-        w.contentView?.addSubview(root)
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller   = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers    = true
+        scroll.drawsBackground       = false
+        scroll.documentView          = root
+
+        w.contentView?.addSubview(scroll)
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
-            root.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
-            root.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+            // Pin root width to the clip view so content can't scroll horizontally
+            root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
 
         addSection("General", to: root, rows: [
             popupRow("Interface style",
-                     options: ["Menu bar popover", "Spotlight overlay"],
-                     selected: AppSettings.uiStyle == .popover ? 0 : 1) {
-                         AppSettings.uiStyle = $0 == 0 ? .popover : .spotlight },
+                     options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
+                     selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
+                         AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
+                     },
             toggleRow("Launch at Login",
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits",
@@ -441,7 +902,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                       on: AppSettings.autoUpdate)    { AppSettings.autoUpdate = $0 },
         ])
 
-        addSection("Kill Behaviour", to: root, rows: [
+        addSection("Axe Behaviour", to: root, rows: [
             popupRow("Default mode",
                      options: ["Graceful  (SIGTERM → SIGKILL)", "Force  (immediate SIGKILL)"],
                      selected: AppSettings.killMode.rawValue) { AppSettings.killMode = KillMode(rawValue: $0) ?? .graceful },
@@ -449,11 +910,22 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                      options: ["Instant", "2 seconds", "5 seconds"],
                      selected: [0.0, 2.0, 5.0].firstIndex(of: AppSettings.gracePeriod) ?? 1)
                 { AppSettings.gracePeriod = [0.0, 2.0, 5.0][safe: $0] ?? 2 },
-            toggleRow("Confirm before killing",
+            toggleRow("Confirm before axing",
                       on: AppSettings.confirmKill) { AppSettings.confirmKill = $0 },
+            toggleRow("Play chop sound when axing",
+                      on: AppSettings.soundEnabled) {
+                          AppSettings.soundEnabled = $0
+                          if $0 { ChopSound.shared.play() }   // preview on enable
+                      },
+            animationDemoRow(),
+            popupRow("Destruction animation",
+                     options: KillAnimation.allCases.map(\.label),
+                     selected: AppSettings.killAnimation.rawValue) {
+                         AppSettings.killAnimation = KillAnimation(rawValue: $0) ?? .shatter
+                     },
         ])
 
-        addSection("Phrases", to: root, rows: [
+        addSection(pun("Battle Phrases", "Phrases"), to: root, rows: [
             phraseRow(),
         ])
 
@@ -464,6 +936,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 { AppSettings.maxSessions = [5, 10, 20, 50][safe: $0] ?? 10 },
             toggleRow("Auto-restore last session on launch",
                       on: AppSettings.autoRestoreLastSession) { AppSettings.autoRestoreLastSession = $0 },
+            toggleRow("Ignore system apps when saving",
+                      on: AppSettings.ignoreSystemOnSave) { AppSettings.ignoreSystemOnSave = $0 },
+            toggleRow("Close other apps when restoring",
+                      on: AppSettings.closeOthersOnRestore) { AppSettings.closeOthersOnRestore = $0 },
+            popupRow("Pause & reopen delay",
+                     options: ["5 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours"],
+                     selected: [5, 15, 30, 60, 120].firstIndex(of: AppSettings.scheduledReopenMinutes) ?? 1) {
+                         AppSettings.scheduledReopenMinutes = [5, 15, 30, 60, 120][safe: $0] ?? 15
+                     },
         ])
 
         addSection("App List", to: root, rows: [
@@ -473,6 +954,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("Keyboard Shortcut", to: root, rows: [
             shortcutRow(),
+        ])
+
+        addSection("Personality", to: root, rows: [
+            toggleRow("Punny mode  ·  go crazy on the puns",
+                      on: AppSettings.punnyMode) { AppSettings.punnyMode = $0 },
         ])
 
         // Bottom divider + version
@@ -489,8 +975,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         verPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
         w.contentView?.layoutSubtreeIfNeeded()
-        let h = root.fittingSize.height
-        var f = w.frame; f.size.height = h + 28; f.origin.y -= (h - w.frame.height) / 2
+        let contentH  = root.fittingSize.height
+        let screenH   = (w.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        // Cap the window so it never spills below the screen on small laptops.
+        // The scroll view handles overflow when content > available height.
+        let target    = min(contentH + 28, screenH * 0.85)
+        var f = w.frame
+        f.size.height = target
+        f.origin.y   -= (target - w.frame.height) / 2
         w.setFrame(f, display: false)
         w.center()
     }
@@ -561,6 +1053,70 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let box = PopupBox(pop, handler: handler)
         row.addArrangedSubview(lbl); row.addArrangedSubview(box)
         return row
+    }
+
+    /// A sample app row plus a "Test Animation" button that previews the
+    /// currently selected destruction animation on it. Wraps both in a single
+    /// bordered container so the button visually belongs to the row.
+    private func animationDemoRow() -> NSView {
+        // Sample row, styled like a real app entry.
+        let sample = AppRowCell(frame: NSRect(x: 0, y: 0, width: 220, height: 44))
+        sample.wantsLayer = true
+        sample.layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.12).cgColor
+        sample.layer?.cornerRadius = 6
+        sample.appName.stringValue  = "Sample App"
+        sample.memLabel.stringValue = "128 MB"
+        sample.appIcon.image = NSWorkspace.shared.icon(forFile: "/System/Library/CoreServices/Finder.app")
+        sample.checkBox.state = .off
+        sample.translatesAutoresizingMaskIntoConstraints = false
+        sample.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        NSLayoutConstraint.activate([
+            sample.heightAnchor.constraint(equalToConstant: 44),
+        ])
+        (NSApp.delegate as? AppDelegate)?.demoRowView = sample
+
+        let btn = NSButton(title: "Test Animation", target: self, action: #selector(testAnimation))
+        btn.bezelStyle  = .rounded
+        btn.controlSize = .regular
+        btn.setContentHuggingPriority(.required, for: .horizontal)
+
+        // Inner stack: sample row + button as a unit.
+        let inner = NSStackView(views: [sample, btn])
+        inner.orientation = .horizontal
+        inner.spacing     = 10
+        inner.alignment   = .centerY
+        inner.edgeInsets  = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        inner.translatesAutoresizingMaskIntoConstraints = false
+
+        // Bordered container groups them visually — the Test button reads as
+        // belonging to that row instead of floating beside it.
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.borderColor = NSColor.separatorColor.cgColor
+        container.layer?.borderWidth = 0.5
+        container.layer?.cornerRadius = 10
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: container.topAnchor),
+            inner.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            inner.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        // Section row wraps the container with the standard 16pt side inset
+        // used by every other Settings row.
+        let row = NSStackView(views: [container])
+        row.orientation = .horizontal
+        row.edgeInsets  = NSEdgeInsets(top: 4, left: 16, bottom: 4, right: 16)
+        return row
+    }
+
+    @objc private func testAnimation() {
+        guard let delegate = NSApp.delegate as? AppDelegate,
+              let rv = delegate.demoRowView, rv.window != nil else { return }
+        if AppSettings.soundEnabled { ChopSound.shared.play() }
+        delegate.runKillAnimation(on: rv) { [weak rv] in rv?.isHidden = false }  // restore for re-testing
     }
 
     private func labelRow(_ label: String, value: String) -> NSView {
@@ -856,6 +1412,20 @@ final class SessionManager {
     }
 
     func restore(_ session: AppSession) {
+        let selfPID  = ProcessInfo.processInfo.processIdentifier
+        let sessionBundleIDs = Set(session.apps.map { $0.bundleID })
+
+        // "Close other apps when restoring" — quit running regular apps that
+        // aren't part of the session so you land in a clean workspace.
+        if AppSettings.closeOthersOnRestore {
+            NSWorkspace.shared.runningApplications
+                .filter { $0.activationPolicy == .regular
+                       && $0.processIdentifier != selfPID
+                       && !SessionManager.isSystemApp($0)
+                       && !sessionBundleIDs.contains($0.bundleIdentifier ?? "") }
+                .forEach { $0.terminate() }
+        }
+
         let runningApps = NSWorkspace.shared.runningApplications
         for app in session.apps {
             // If already running, bring it to front
@@ -873,6 +1443,14 @@ final class SessionManager {
             cfg.activates = false
             NSWorkspace.shared.openApplication(at: url, configuration: cfg)
         }
+    }
+
+    /// Heuristic: treat apps living under /System/ as system apps (Finder,
+    /// Calendar, Notes etc. ship there on modern macOS). User-installed apps
+    /// in /Applications and ~/Applications are kept.
+    static func isSystemApp(_ app: NSRunningApplication) -> Bool {
+        guard let path = app.bundleURL?.path else { return false }
+        return path.hasPrefix("/System/")
     }
 }
 
@@ -1232,7 +1810,7 @@ final class AboutWindow: NSObject, NSWindowDelegate {
         version.textColor = .secondaryLabelColor
 
         // Tagline
-        let tagline = NSTextField(labelWithString: "Kill running apps — fast.")
+        let tagline = NSTextField(labelWithString: "Axe running apps — fast.")
         tagline.font      = .systemFont(ofSize: 12)
         tagline.textColor = .secondaryLabelColor
 
@@ -1682,8 +2260,9 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
         let headline = NSTextField(labelWithString: "Enjoying Axe?")
         headline.font = .systemFont(ofSize: 16, weight: .semibold); headline.alignment = .center
 
-        let body = NSTextField(labelWithString:
-            "Axe is free to keep. If it's been saving you time,\na small tip keeps the blade sharp. ⚔️")
+        let body = NSTextField(labelWithString: pun(
+            "Axe is free to keep. If it's been saving you time,\na small tip keeps the Axe sharp. ⚔️",
+            "Axe is free to keep. If it's been saving you time,\na small tip keeps the blade sharp. ⚔️"))
         body.font = .systemFont(ofSize: 12, weight: .regular)
         body.textColor = .secondaryLabelColor; body.alignment = .center
         body.lineBreakMode = .byWordWrapping
@@ -1695,9 +2274,10 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
         topPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
         // ── Buy + dismiss buttons ─────────────────────────────────
-        let buyBtn = NSButton(title: "Buy Axe →", target: self, action: #selector(buyTapped))
+        let buyBtn = NSButton(title: "Get the Axe →", target: self, action: #selector(buyTapped))
         buyBtn.bezelStyle = .rounded; buyBtn.keyEquivalent = "\r"
-        let laterBtn = NSButton(title: "Maybe Later", target: self, action: #selector(laterTapped))
+        let laterBtn = NSButton(title: pun("Maybe L-Axe-ter", "Maybe Later"),
+                                target: self, action: #selector(laterTapped))
         laterBtn.bezelStyle = .inline
 
         let btnRow = NSStackView(views: [buyBtn, laterBtn])
@@ -1732,7 +2312,7 @@ final class NudgeWindow: NSObject, NSWindowDelegate {
         statusLbl.textColor = .systemRed; statusLbl.lineBreakMode = .byWordWrapping
         statusLabel = statusLbl
 
-        let extraBtn = NSButton(title: "Buy an extra seat — $4.99 →",
+        let extraBtn = NSButton(title: "Buy an Axe-tra seat — $4.99 →",
                                target: self, action: #selector(extraSeatTapped))
         extraBtn.bezelStyle = .rounded
         extraBtn.isHidden = true
@@ -2025,13 +2605,13 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         let pickerTitle = label("Choose how Axe opens", size: 13, weight: .semibold)
 
         let seg = NSSegmentedControl(
-            labels: ["Menu Bar Popover", "Spotlight Overlay"],
+            labels: ["Menu Bar Popover", "Spotlight Overlay", "Drop from Notch"],
             trackingMode: .selectOne, target: self,
             action: #selector(stylePickerChanged(_:)))
-        seg.selectedSegment = AppSettings.uiStyle == .popover ? 0 : 1
+        seg.selectedSegment = [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0
         seg.translatesAutoresizingMaskIntoConstraints = false
 
-        let pickerHint = label("Popover drops from the menu bar icon  ·  Spotlight floats center-screen",
+        let pickerHint = label("Popover drops from the menu bar icon  ·  Spotlight floats center-screen  ·  Notch drops from the top",
                                size: 11, weight: .regular, color: .tertiaryLabelColor)
 
         let pickerStack = NSStackView(views: [pickerTitle, seg, pickerHint])
@@ -2061,8 +2641,8 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     @objc private func dismiss() { window?.close() }
 
     @objc private func stylePickerChanged(_ sender: NSSegmentedControl) {
-        // segment 0 = Menu bar popover, segment 1 = Spotlight overlay
-        AppSettings.uiStyle = sender.selectedSegment == 0 ? .popover : .spotlight
+        // segment 0 = Menu bar popover, 1 = Spotlight overlay, 2 = Drop from notch
+        AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: sender.selectedSegment] ?? .popover
     }
 
     private func label(_ s: String, size: CGFloat, weight: NSFont.Weight,
@@ -2124,6 +2704,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var sortByMemory:     Bool        = false
     var sortButton:       NSButton?
     var axeCheckedButton: NSButton?
+    var halfAxeButton:    NSButton?
+
+    /// Notch mode paints on pure black, so the standard `.tertiaryLabelColor` /
+    /// `.quaternaryLabelColor` system colors (designed for translucent
+    /// materials) become hard to read. Slightly brighten them there — but
+    /// kept subdued so the chrome stays subordinate to the app list itself.
+    private var dimIconColor: NSColor {
+        AppSettings.uiStyle == .notch
+            ? NSColor.white.withAlphaComponent(0.55)
+            : .tertiaryLabelColor
+    }
+    private var dimHintColor: NSColor {
+        AppSettings.uiStyle == .notch
+            ? NSColor.white.withAlphaComponent(0.40)
+            : .quaternaryLabelColor
+    }
 
     // Rotating kill-button phrases — picked randomly on first checkbox tick,
     // then cycled automatically every 10 s while apps remain selected.
@@ -2136,6 +2732,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var spaceRestoreHUD: SpaceRestoreHUD?
     var updateWindow: UpdateWindow?
     var selfUpdater:  SelfUpdater?
+    weak var demoRowView: NSView?     // sample row in Settings for previewing animations
+    var pauseReopenTimer:   Timer?
+    var pauseReopenSession: AppSession?
     var enabledKillPhrases: [String] {
         let dis = AppSettings.disabledKillPhrases
         let enabled = killPhrases.filter { !dis.contains($0) }
@@ -2247,6 +2846,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // MARK: Launch
 
+    /// Confirm before quitting Axe. Both the "Quit Axe" menu item and ⌘Q go
+    /// through here. Returns `.terminateCancel` if the user backs out, so the
+    /// app stays alive.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        NSApp.activate(ignoringOtherApps: true)
+        let prompt = quitConfirmPrompts.randomElement() ?? quitConfirmPrompts[0]
+        let alert = NSAlert()
+        alert.alertStyle      = .warning
+        alert.messageText     = prompt.title
+        alert.informativeText = prompt.body
+        alert.addButton(withTitle: prompt.cancel)           // .alertFirstButtonReturn  (default — Return)
+        let quitBtn = alert.addButton(withTitle: prompt.quit) // .alertSecondButtonReturn
+        if #available(macOS 11.0, *) { quitBtn.hasDestructiveAction = true }
+        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+    }
+
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
         registerHotKey()
@@ -2322,6 +2937,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "Show Axe", key: "", tip: "⌘Z", action: #selector(toggleOverlay))
         menu.addItem(.separator())
 
+        // Quick session actions — surface the most-used flows at the top level
+        let saveQuick = NSMenuItem(title: "Save Workflow…",
+                                   action: #selector(saveSessionMI), keyEquivalent: "L")
+        saveQuick.keyEquivalentModifierMask = [.command, .shift]
+        saveQuick.target = self
+        menu.addItem(saveQuick)
+
+        if !saved.isEmpty {
+            let restoreLast = NSMenuItem(
+                title: "Restore Last  ·  \(saved[0].name)",
+                action: #selector(restoreLastSessionMI), keyEquivalent: "")
+            restoreLast.target = self
+            menu.addItem(restoreLast)
+        }
+
+        if pauseReopenTimer != nil, let s = pauseReopenSession {
+            let mi = NSMenuItem(title: "Cancel Reopen  ·  \(s.name)",
+                                action: #selector(cancelPauseReopenMI), keyEquivalent: "")
+            mi.target = self
+            menu.addItem(mi)
+        } else {
+            let mins = AppSettings.scheduledReopenMinutes
+            let phrase = pauseReopenPunPhrases.randomElement() ?? "Take a Br-Axe"
+            let title = pun("\(phrase) (\(mins) min)…",
+                            "Pause & Reopen in \(mins) min…")
+            let mi = NSMenuItem(title: title,
+                                action: #selector(pauseAndReopenMI), keyEquivalent: "")
+            mi.target = self
+            menu.addItem(mi)
+        }
+        menu.addItem(.separator())
+
         // Sessions submenu (all sessions)
         let sessionsItem = NSMenuItem(title: "All Sessions", action: nil, keyEquivalent: "")
         let sessionsSub  = NSMenu()
@@ -2389,14 +3036,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         menu.addItem(.separator())
         if AppSettings.isLicensed {
-            let li = NSMenuItem(title: "Licensed — Thanks! ✦", action: nil, keyEquivalent: "")
+            let li = NSMenuItem(title: "Licensed — Axe-cellent! ✦", action: nil, keyEquivalent: "")
             li.isEnabled = false; menu.addItem(li)
         } else {
-            addItem(menu, "Support Axe ♥", key: "", action: #selector(showNudgeWindow))
+            addItem(menu, "Support my Axe ♥", key: "", action: #selector(showNudgeWindow))
         }
         menu.addItem(.separator())
         addItem(menu, "Settings…",           key: ",", action: #selector(openSettings))
-        addItem(menu, "Quick Start Guide…",  key: "",  action: #selector(showOnboarding))
+        addItem(menu, pun("Get Axe-quainted…", "Quick Start Guide…"),
+                key: "",  action: #selector(showOnboarding))
         addItem(menu, "Check for Updates…",  key: "",  action: #selector(checkForUpdatesMI))
         addItem(menu, "About Axe",           key: "",  action: #selector(showAbout))
         menu.addItem(.separator())
@@ -2532,6 +3180,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     @objc func saveSessionMI() { saveSession() }
 
+    @objc func restoreLastSessionMI() {
+        guard let last = SessionManager.shared.all.first else { return }
+        SessionManager.shared.restore(last)
+    }
+
     @objc func restoreSessionMI(_ sender: NSMenuItem) {
         guard let idStr = sender.representedObject as? String,
               let id = UUID(uuidString: idStr),
@@ -2577,7 +3230,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func saveSession() {
         let selfPID  = ProcessInfo.processInfo.processIdentifier
         let running  = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID
+                   && !(AppSettings.ignoreSystemOnSave && SessionManager.isSystemApp($0)) }
             .compactMap { app -> SavedApp? in
                 guard let bid = app.bundleIdentifier,
                       let name = app.localizedName else { return nil }
@@ -2597,7 +3251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let alert = NSAlert()
         alert.messageText     = "Save Workflow"
         alert.informativeText = "\(running.count) apps will be saved. Name it after what you're working on so you can switch back to it anytime."
-        alert.addButton(withTitle: "Save & Quit All")
+        alert.addButton(withTitle: "Save & Axe All")
         alert.addButton(withTitle: "Save Only")
         alert.addButton(withTitle: "Cancel")
         let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
@@ -2624,6 +3278,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                     .terminate()
             }
         }
+    }
+
+    // MARK: Pause & Reopen Later
+
+    @objc func pauseAndReopenMI() { pauseAndReopen() }
+    @objc func cancelPauseReopenMI() { cancelPauseReopen() }
+
+    /// Saves the current workflow, quits its apps, and schedules a restore
+    /// after `scheduledReopenMinutes`. Lets you take a break / focus block
+    /// and have everything come back automatically.
+    func pauseAndReopen() {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let running = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID
+                   && !(AppSettings.ignoreSystemOnSave && SessionManager.isSystemApp($0)) }
+        let saved = running.compactMap { app -> SavedApp? in
+            guard let bid = app.bundleIdentifier, let name = app.localizedName else { return nil }
+            return SavedApp(bundleID: bid, name: name)
+        }
+        guard !saved.isEmpty else {
+            let a = NSAlert(); a.messageText = "Nothing to pause"
+            a.informativeText = "No regular apps are running right now."
+            a.runModal(); return
+        }
+        let minutes = AppSettings.scheduledReopenMinutes
+        let alert = NSAlert()
+        alert.messageText = pun("Time for a Br-Axe?", "Pause workflow?")
+        alert.informativeText = "\(saved.count) app\(saved.count == 1 ? "" : "s") will be saved and quit now, then reopened in \(minutes) minute\(minutes == 1 ? "" : "s")."
+        let btnPhrase = pauseReopenPunPhrases.randomElement() ?? "Take a Br-Axe"
+        alert.addButton(withTitle: pun(btnPhrase, "Pause & Reopen Later"))
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let df = DateFormatter(); df.dateFormat = "MMM d h:mma"
+        let session = AppSession(id: UUID(),
+                                 name: "Pause • \(df.string(from: Date()))",
+                                 date: Date(), apps: saved)
+        SessionManager.shared.save(session)
+        running.forEach { $0.terminate() }
+
+        cancelPauseReopen()
+        pauseReopenSession = session
+        let t = Timer.scheduledTimer(withTimeInterval: TimeInterval(minutes * 60), repeats: false) { [weak self] _ in
+            self?.executePauseReopen()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        pauseReopenTimer = t
+    }
+
+    func cancelPauseReopen() {
+        pauseReopenTimer?.invalidate()
+        pauseReopenTimer   = nil
+        pauseReopenSession = nil
+    }
+
+    private func executePauseReopen() {
+        guard let s = pauseReopenSession else { return }
+        pauseReopenTimer   = nil
+        pauseReopenSession = nil
+        SessionManager.shared.restore(s)
     }
 
     // MARK: Hot key (⌥⌘K)
@@ -2956,7 +3670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         isShowingSessions.toggle()
         appListContainer?.isHidden  = isShowingSessions
         sessionsPanelView?.isHidden = !isShowingSessions
-        sessionBtn?.contentTintColor = isShowingSessions ? .controlAccentColor : .tertiaryLabelColor
+        sessionBtn?.contentTintColor = isShowingSessions ? .controlAccentColor : dimIconColor
         if isShowingSessions {
             refreshSessionsPanel()
             searchField?.window?.makeFirstResponder(nil)
@@ -3117,6 +3831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         switch AppSettings.uiStyle {
         case .spotlight: return panel?.isVisible ?? false
         case .popover:   return popover?.isShown  ?? false
+        case .notch:     return panel?.isVisible ?? false   // shares the spotlight panel
         }
     }
 
@@ -3125,7 +3840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         panel?.orderOut(nil); panel = nil
         popover?.close();     popover = nil; popoverVC = nil
         searchField = nil; tableView = nil; emptyView = nil
-        hintLabel = nil; sortButton = nil; axeCheckedButton = nil
+        hintLabel = nil; sortButton = nil; axeCheckedButton = nil; halfAxeButton = nil
         sessionBtn = nil; appListContainer = nil
         sessionsPanelView = nil; sessionsListStack = nil
         isShowingSessions = false
@@ -3145,6 +3860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         switch AppSettings.uiStyle {
         case .spotlight: showSpotlight()
         case .popover:   showPopover()
+        case .notch:     showNotch()
         }
 
         searchField?.stringValue = ""
@@ -3157,6 +3873,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // MARK: Spotlight mode
 
+    // MARK: Entrance / dismiss helpers (shared by spotlight + notch)
+
+    /// Spring-driven entrance: scale `panelShowScaleFrom`→1.0 and opacity 0→1.
+    /// Falls back to a 0.08s opacity-only crossfade when Reduce Motion is on.
+    private func applyEntrance(to layer: CALayer) {
+        if AnimationConstants.reduceMotion {
+            let op = AnimationConstants.opacityAnimation(
+                from: 0, to: 1, duration: AnimationConstants.reducedDuration)
+            layer.add(op, forKey: "opacity")
+            layer.opacity = 1
+            layer.transform = CATransform3DIdentity
+            return
+        }
+        let dur   = AnimationConstants.panelShowDuration
+        let stiff = AnimationConstants.springStiffness
+        let damp  = AnimationConstants.springDamping
+
+        let op = CASpringAnimation(keyPath: "opacity")
+        op.fromValue = 0; op.toValue = 1
+        op.damping = damp; op.stiffness = stiff; op.mass = 1
+        op.duration = dur
+        op.fillMode = .forwards; op.isRemovedOnCompletion = false
+        layer.add(op, forKey: "opacity")
+        layer.opacity = 1
+
+        let s = CASpringAnimation(keyPath: "transform.scale")
+        s.fromValue = AnimationConstants.panelShowScaleFrom; s.toValue = 1.0
+        s.damping = damp; s.stiffness = stiff; s.mass = 1
+        s.duration = dur
+        s.fillMode = .forwards; s.isRemovedOnCompletion = false
+        layer.add(s, forKey: "scale")
+        layer.transform = CATransform3DIdentity
+    }
+
+    /// Mirror of `applyEntrance` — quick ease-out fade + slight scale down.
+    private func applyDismiss(to layer: CALayer, completion: @escaping () -> Void) {
+        let dur = AnimationConstants.reduceMotion
+            ? AnimationConstants.reducedDuration
+            : AnimationConstants.panelDismissDuration
+
+        let op = AnimationConstants.opacityAnimation(from: 1, to: 0, duration: dur)
+        layer.add(op, forKey: "opacity")
+        layer.opacity = 0
+
+        if !AnimationConstants.reduceMotion {
+            let s = CABasicAnimation(keyPath: "transform.scale")
+            s.fromValue = 1.0
+            s.toValue   = AnimationConstants.panelShowScaleFrom
+            s.duration  = dur
+            s.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            s.fillMode = .forwards; s.isRemovedOnCompletion = false
+            layer.add(s, forKey: "scale")
+            layer.transform = CATransform3DMakeScale(
+                AnimationConstants.panelShowScaleFrom,
+                AnimationConstants.panelShowScaleFrom, 1)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur + 0.02) { completion() }
+    }
+
+    /// Animates the notch overlay mask path between t=0 (notch shape) and
+    /// t=1 (full tapered panel) — same timing curve as the spring entrance.
+    private func animateNotchMask(_ mask: CAShapeLayer, to targetT: CGFloat,
+                                  duration: CFTimeInterval,
+                                  geometry g: NotchGeometry) {
+        let endPath = notchPanelPath(t: targetT, geometry: g)
+        if AnimationConstants.reduceMotion {
+            mask.path = endPath
+            return
+        }
+        let anim = CABasicAnimation(keyPath: "path")
+        anim.fromValue = mask.path
+        anim.toValue   = endPath
+        anim.duration  = duration
+        // Bezier approximating the (response 0.32, damping 0.82) spring shape.
+        anim.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.94, 0.6, 1.0)
+        anim.fillMode = .forwards; anim.isRemovedOnCompletion = false
+        mask.add(anim, forKey: targetT > 0.5 ? "grow" : "shrink")
+        mask.path = endPath
+    }
+
     private func showSpotlight() {
         if panel == nil { buildPanel(); lastBuiltStyle = .spotlight }
 
@@ -3168,22 +3964,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 y: sf.midY - pw.height / 2 + sf.height * 0.08))
         }
 
-        let cv = panel!.contentView!
+        guard let p = panel, let cv = p.contentView else { return }
         cv.wantsLayer = true
-        cv.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.95, y: 0.95))
-        panel?.alphaValue = 0
-        panel?.makeKeyAndOrderFront(nil)
+
+        // Reset content-layer state synchronously — no implicit animation flicker.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cv.layer?.opacity   = 0
+        cv.layer?.transform = CATransform3DMakeScale(
+            AnimationConstants.panelShowScaleFrom,
+            AnimationConstants.panelShowScaleFrom, 1)
+        CATransaction.commit()
+
+        p.alphaValue = 1                          // window visible; layer drives opacity
+        p.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18; ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel?.animator().alphaValue = 1
-        }
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22; ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            cv.animator().layer?.setAffineTransform(.identity)
-        }
+
+        if let layer = cv.layer { applyEntrance(to: layer) }
+
         NotificationCenter.default.addObserver(self, selector: #selector(panelResignedKey),
                                                name: NSWindow.didResignKeyNotification, object: panel)
+    }
+
+    // MARK: Notch mode  (drops from the notch / top of screen, slides back up)
+
+    private func showNotch() {
+        if panel == nil { buildPanel(); lastBuiltStyle = .notch }
+        guard let screen = NSScreen.main, let p = panel else { return }
+        let g = makeNotchGeometry()
+
+        // Push the panel a few pixels ABOVE screen.maxY so its rendered top
+        // edge sits offscreen behind the bezel — the visible top of the
+        // panel becomes the screen edge itself, with no 1pt boundary line
+        // showing where panel meets bezel. The OverlayPanel subclass
+        // overrides constrainFrameRect so AppKit doesn't clamp it back.
+        let xc = screen.frame.midX - g.W / 2
+        let topOverlap: CGFloat = 6
+        let endFrame = NSRect(x: xc,
+                              y: screen.frame.maxY + topOverlap - g.H,
+                              width: g.W, height: g.H)
+        p.setFrame(endFrame, display: false)
+
+        guard let cv = p.contentView,
+              let layer = cv.layer,
+              let mask = layer.mask as? CAShapeLayer else {
+            p.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        // Reset state synchronously — collapse the mask back to the small
+        // notch shape (t=0) and the layer to scale 0.98 / opacity 0 before
+        // the panel becomes visible. No implicit animations on this step.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mask.path       = notchPanelPath(t: 0, geometry: g)
+        layer.opacity   = 0
+        layer.transform = CATransform3DMakeScale(
+            AnimationConstants.panelShowScaleFrom,
+            AnimationConstants.panelShowScaleFrom, 1)
+        CATransaction.commit()
+
+        p.alphaValue = 1
+        p.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Mask grows from the small notch shape outward to the full panel
+        // shape, in parallel with the spring scale+opacity entrance.
+        animateNotchMask(mask, to: 1,
+                         duration: AnimationConstants.panelShowDuration,
+                         geometry: g)
+        applyEntrance(to: layer)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(panelResignedKey),
+                                               name: NSWindow.didResignKeyNotification, object: p)
     }
 
     // MARK: Popover mode
@@ -3200,15 +4054,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         case .spotlight:
             NotificationCenter.default.removeObserver(self,
                 name: NSWindow.didResignKeyNotification, object: panel)
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.12
-                panel?.animator().alphaValue = 0
-            }, completionHandler: {
-                self.panel?.orderOut(nil)
-                self.panel?.alphaValue = 1
-            })
+            guard let cv = panel?.contentView, let layer = cv.layer else {
+                panel?.orderOut(nil); return
+            }
+            applyDismiss(to: layer) { [weak self] in
+                self?.panel?.orderOut(nil)
+                layer.opacity = 1
+                layer.transform = CATransform3DIdentity
+            }
+
         case .popover:
             popover?.close()
+
+        case .notch:
+            NotificationCenter.default.removeObserver(self,
+                name: NSWindow.didResignKeyNotification, object: panel)
+            guard let cv = panel?.contentView,
+                  let layer = cv.layer,
+                  let mask = layer.mask as? CAShapeLayer else {
+                panel?.orderOut(nil); return
+            }
+            // Mirror of entrance: mask shrinks back to the notch shape while
+            // the layer fades + scales down. ~0.18s ease-out.
+            let g = makeNotchGeometry()
+            animateNotchMask(mask, to: 0,
+                             duration: AnimationConstants.panelDismissDuration,
+                             geometry: g)
+            applyDismiss(to: layer) { [weak self] in
+                self?.panel?.orderOut(nil)
+                layer.opacity = 1
+                layer.transform = CATransform3DIdentity
+            }
         }
     }
 
@@ -3225,32 +4101,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // MARK: Build overlay panel
 
+    /// Resolved geometry for the notch overlay. Cached values shared by build,
+    /// show, and hide animations so the start/end paths line up exactly.
+    struct NotchGeometry {
+        let W: CGFloat            // outer layer width
+        let H: CGFloat            // outer layer height
+        let W_inner: CGFloat      // inner content width
+        let sideInset: CGFloat    // shoulder width on each side
+        let taperH: CGFloat       // shoulder height
+        let bezelH: CGFloat       // bezel/menu-bar coverage at top
+        let bottomR: CGFloat      // body bottom corner radius
+        let notchW: CGFloat       // hardware notch approximate width
+        let notchCornerR: CGFloat // hardware notch bottom-corner radius
+    }
+
+    func makeNotchGeometry() -> NotchGeometry {
+        // Panel covers the menu bar in its central width (W_inner) so the
+        // bezel + notch + panel read as one continuous black surface. The
+        // top `bezelH` of the panel is empty black space covering the menu
+        // bar; the lower `contentH` holds the search bar / list / buttons.
+        let W_inner: CGFloat = 560
+        let contentH: CGFloat = 412  // search 54 + 1 + 46*7 + 1 + hint 34
+        var bezelH: CGFloat = 24
+        if #available(macOS 12.0, *) {
+            bezelH = max((NSScreen.main?.safeAreaInsets.top) ?? 24, 24)
+        }
+        return NotchGeometry(
+            W: W_inner,
+            H: contentH + bezelH,    // taller, so the top region covers the menu bar
+            W_inner: W_inner,
+            sideInset: 0,
+            taperH: 0,
+            bezelH: bezelH,
+            bottomR: 22,
+            notchW: 200,
+            notchCornerR: 22
+        )
+    }
+
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * t
+    }
+
+    /// Parametric notch path. At t=0 the shape is a small rect matching the
+    /// hardware notch (centered at the top); at t=1 it's the full panel —
+    /// flat top corners (sit behind the bezel) and rounded bottom corners.
+    /// Topology stays constant (1 move + 3 lines + 1 arc + 2 lines + 1 arc +
+    /// close) so CABasicAnimation can interpolate smoothly between any two t.
+    private func notchPanelPath(t: CGFloat, geometry g: NotchGeometry) -> CGPath {
+        let tt = max(0, min(1, t))
+        let outerW  = lerp(g.notchW, g.W, tt)
+        let outerH  = lerp(g.bezelH, g.H, tt)
+        let bottomR = lerp(0, g.bottomR, tt)
+
+        let xc = g.W / 2
+        let left    = xc - outerW / 2
+        let right   = xc + outerW / 2
+        let bottomY = g.H - outerH    // bottom of shape
+        let topY    = g.H             // top of layer (behind bezel)
+
+        let path = CGMutablePath()
+        // 1. Bottom-left, after rounded corner
+        path.move(to: CGPoint(x: left + bottomR, y: bottomY))
+        // 2. Bottom edge
+        path.addLine(to: CGPoint(x: right - bottomR, y: bottomY))
+        // 3. Bottom-right rounded corner (CCW, 6 → 3 o'clock)
+        path.addArc(center: CGPoint(x: right - bottomR, y: bottomY + bottomR),
+                    radius: bottomR, startAngle: -.pi / 2, endAngle: 0, clockwise: false)
+        // 4. Right side straight up (top corner is flat, sits behind bezel)
+        path.addLine(to: CGPoint(x: right, y: topY))
+        // 5. Top edge (hidden by actual bezel)
+        path.addLine(to: CGPoint(x: left, y: topY))
+        // 6. Left side straight down to bottom corner
+        path.addLine(to: CGPoint(x: left, y: bottomY + bottomR))
+        // 7. Bottom-left rounded corner (CCW, 9 → 6 o'clock)
+        path.addArc(center: CGPoint(x: left + bottomR, y: bottomY + bottomR),
+                    radius: bottomR, startAngle: .pi, endAngle: 3 * .pi / 2, clockwise: false)
+        path.closeSubpath()
+        return path
+    }
+
     func buildPanel() {
-        let W: CGFloat  = 620
+        let isNotch = AppSettings.uiStyle == .notch
         let searchH: CGFloat = 54
         let rowH: CGFloat    = 46
         let maxRows: CGFloat = 7
         let hintH: CGFloat   = 34
-        let H = searchH + 1 + rowH * maxRows + 1 + hintH  // 412
+        let contentH = searchH + 1 + rowH * maxRows + 1 + hintH  // 412
 
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+        // Inner content width. Outer is wider in notch mode for the shoulders.
+        // In notch mode we use the shared `makeNotchGeometry()` so show/hide
+        // animations resolve to the exact same dimensions.
+        let geo = isNotch ? makeNotchGeometry() : nil
+        let W_inner: CGFloat   = geo?.W_inner   ?? 620
+        let W: CGFloat         = geo?.W         ?? W_inner
+        let H: CGFloat         = geo?.H         ?? contentH
+
+        let p = OverlayPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                         styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         p.titleVisibility             = .hidden
         p.titlebarAppearsTransparent  = true
         p.isMovableByWindowBackground = true
-        p.level              = .floating
+        // .popUpMenu in notch mode so we draw over the menu bar + status items;
+        // .floating otherwise so the spotlight overlay sits above normal windows
+        // but below the menu bar.
+        // Notch mode draws OVER the menu bar in its central width so the
+        // bezel + menu bar + panel read as one continuous black surface.
+        // Other styles stay at .floating (below menu bar).
+        p.level              = isNotch ? .popUpMenu : .floating
         p.isReleasedWhenClosed = false
         p.backgroundColor    = .clear
 
-        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: W, height: H))
-        bg.blendingMode = .behindWindow
-        bg.material     = .popover
-        bg.state        = .active
-        bg.wantsLayer   = true
-        bg.layer?.cornerRadius  = 12
-        bg.layer?.masksToBounds = true
-        p.contentView = bg
+        let bg: NSView
+        if isNotch {
+            // Outer black view positioned at screen.maxY (covers the menu bar
+            // in the central W_inner band). Shape is driven by a CAShapeLayer
+            // mask — flat top corners (sit behind bezel) and rounded bottom
+            // corners at t=1; at t=0 the mask collapses to the small hardware
+            // notch shape so `showNotch` can animate it expanding outward.
+            let outer = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+            outer.wantsLayer = true
+            outer.layer?.backgroundColor = NSColor.black.cgColor
+            outer.appearance = NSAppearance(named: .darkAqua)
+            let mask = CAShapeLayer()
+            mask.frame = outer.bounds
+            mask.path  = notchPanelPath(t: 0, geometry: geo!)
+            outer.layer?.mask = mask
+            p.contentView = outer
+
+            let inner = NSView()
+            inner.wantsLayer = true
+            inner.translatesAutoresizingMaskIntoConstraints = false
+            outer.addSubview(inner)
+            NSLayoutConstraint.activate([
+                inner.centerXAnchor.constraint(equalTo: outer.centerXAnchor),
+                inner.widthAnchor.constraint(equalToConstant: W_inner),
+                inner.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+                inner.heightAnchor.constraint(equalToConstant: contentH),
+            ])
+            bg = inner
+        } else {
+            let v = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+            v.blendingMode = .behindWindow
+            v.material     = .popover
+            v.state        = .active
+            v.wantsLayer   = true
+            v.layer?.cornerRadius  = 12
+            v.layer?.masksToBounds = true
+            p.contentView = v
+            bg = v
+        }
 
         // ── Search bar ─────────────────────────────────────────────
         let searchIcon = NSImageView()
@@ -3259,7 +4260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             searchIcon.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 15, weight: .regular))
         }
-        searchIcon.contentTintColor = .tertiaryLabelColor
+        searchIcon.contentTintColor = dimIconColor
         searchIcon.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(searchIcon)
 
@@ -3270,7 +4271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sortBtn.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
-        sortBtn.contentTintColor = .tertiaryLabelColor
+        sortBtn.contentTintColor = sortByMemory ? .controlAccentColor : dimIconColor
         sortBtn.target           = self
         sortBtn.action           = #selector(toggleSort)
         sortBtn.toolTip          = "Sort by name / memory"
@@ -3296,7 +4297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sesBtn.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
-        sesBtn.contentTintColor = .tertiaryLabelColor
+        sesBtn.contentTintColor = dimIconColor
         sesBtn.target = self; sesBtn.action = #selector(toggleSessionsPanel)
         sesBtn.toolTip = "Sessions"
         sesBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -3318,8 +4319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sortBtn.heightAnchor.constraint(equalToConstant: 26),
             sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 8),
             sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -6),
+            // Center on the icon at the field's natural line height — an editable
+            // NSTextField top-aligns its text inside a tall frame, which made the
+            // text sit high near the rounded corner. Letting it use intrinsic
+            // height + centerY keeps the text vertically centered in the bar.
             sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
-            sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
 
         // ── Top divider ────────────────────────────────────────────
@@ -3395,27 +4399,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         bg.addSubview(botDiv)
 
         let hint = NSTextField(labelWithString: "")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .quaternaryLabelColor
+        // Lighter weight + lower opacity so the hint reads as ancillary chrome
+        // — the eye is drawn to the action buttons, not the keybind legend.
+        hint.font = .systemFont(ofSize: 11, weight: .light)
+        hint.textColor = dimHintColor
         hint.alignment = .center
+        hint.alphaValue = 0.55
         hint.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(hint)
         hintLabel = hint
 
-        // "Axe X Apps" button — shown in place of the hint text when boxes are checked
+        // Action buttons — shown in place of the hint text when boxes are checked.
+        // Purple "Half-Axe It" (hide) on the left, red kill button on the right,
+        // centered as a pair straddling the bar's centerline.
+        let halfAxeBtn = makeHalfAxeButton()
+        bg.addSubview(halfAxeBtn)
+        halfAxeButton = halfAxeBtn
+
         let axeBtn = RedButton()
         axeBtn.isBordered = false
         axeBtn.wantsLayer = true
         axeBtn.target  = self
         axeBtn.action  = #selector(axeCheckedApps)
         axeBtn.isHidden = true
+        (axeBtn.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
         axeBtn.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(axeBtn)
         axeCheckedButton = axeBtn
 
-        // Settings + About icon buttons (trailing edge of hint bar)
+        // Save + Settings + About icon buttons (trailing edge of hint bar)
+        let saveBtn     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
+        saveBtn.toolTip = "Save current workflow (⌘⇧L)"
         let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
         let aboutBtn    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        // Override the default tertiary tint so the icons stay readable on
+        // the pure-black notch background.
+        saveBtn.contentTintColor     = dimIconColor
+        settingsBtn.contentTintColor = dimIconColor
+        aboutBtn.contentTintColor    = dimIconColor
+        bg.addSubview(saveBtn)
         bg.addSubview(settingsBtn)
         bg.addSubview(aboutBtn)
 
@@ -3426,12 +4448,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             botDiv.heightAnchor.constraint(equalToConstant: 1),
             hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            hint.trailingAnchor.constraint(equalTo: settingsBtn.leadingAnchor, constant: -4),
+            hint.trailingAnchor.constraint(equalTo: saveBtn.leadingAnchor, constant: -4),
             hint.heightAnchor.constraint(equalToConstant: hintH),
-            axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            halfAxeBtn.trailingAnchor.constraint(equalTo: bg.centerXAnchor, constant: -5),
+            halfAxeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            halfAxeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
+            axeBtn.leadingAnchor.constraint(equalTo: bg.centerXAnchor, constant: 5),
             axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
-            axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
-            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: settingsBtn.leadingAnchor, constant: -4),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: saveBtn.leadingAnchor, constant: -6),
+            // Save-session button
+            saveBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            saveBtn.trailingAnchor.constraint(equalTo: settingsBtn.leadingAnchor, constant: -2),
+            saveBtn.widthAnchor.constraint(equalToConstant: 22),
+            saveBtn.heightAnchor.constraint(equalToConstant: 22),
             // Settings button
             settingsBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
             settingsBtn.trailingAnchor.constraint(equalTo: aboutBtn.leadingAnchor, constant: -2),
@@ -3446,6 +4475,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         panel = p
         updateHint()
+    }
+
+    /// Purple "Half-Axe It" button used in both overlay styles.
+    private func makeHalfAxeButton() -> RedButton {
+        let b = RedButton()
+        b.fillColor   = .systemPurple
+        b.isBordered  = false
+        b.wantsLayer  = true
+        b.target      = self
+        b.action      = #selector(halfAxeCheckedApps)
+        b.isHidden    = true
+        b.toolTip     = "Hide the selected apps instead of quitting them"
+        (b.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
+        b.translatesAutoresizingMaskIntoConstraints = false
+        return b
     }
 
     // MARK: Build popover
@@ -3527,8 +4571,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sortBtn.heightAnchor.constraint(equalToConstant: 26),
             sf.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 6),
             sf.trailingAnchor.constraint(equalTo: sortBtn.leadingAnchor, constant: -4),
+            // Center on the icon at the field's natural line height (see spotlight
+            // build): a tall fixed height top-aligns the text and pushes it up
+            // against the rounded top corner.
             sf.centerYAnchor.constraint(equalTo: searchIcon.centerYAnchor),
-            sf.heightAnchor.constraint(equalToConstant: searchH),
         ])
 
         // ── Divider ────────────────────────────────────────────────
@@ -3594,21 +4640,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // ── Hint bar ───────────────────────────────────────────────
         let botDiv = divider(); bg.addSubview(botDiv)
         let hint = NSTextField(labelWithString: "")
-        hint.font = .systemFont(ofSize: 11); hint.textColor = .quaternaryLabelColor
+        hint.font = .systemFont(ofSize: 11, weight: .light); hint.textColor = .quaternaryLabelColor
+        hint.alphaValue = 0.55
         hint.alignment = .center
         hint.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(hint); hintLabel = hint
+
+        let halfAxeBtn2 = makeHalfAxeButton()
+        bg.addSubview(halfAxeBtn2)
+        halfAxeButton = halfAxeBtn2
 
         let axeBtn = RedButton()
         axeBtn.isBordered = false; axeBtn.wantsLayer = true
         axeBtn.target = self; axeBtn.action = #selector(axeCheckedApps)
         axeBtn.isHidden = true
+        (axeBtn.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
         axeBtn.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(axeBtn); axeCheckedButton = axeBtn
 
-        // Settings + About icon buttons (trailing edge of hint bar)
+        // Save + Settings + About icon buttons (trailing edge of hint bar)
+        let saveBtn2     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
+        saveBtn2.toolTip = "Save current workflow (⌘⇧L)"
         let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(openSettings))
         let aboutBtn2    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        bg.addSubview(saveBtn2)
         bg.addSubview(settingsBtn2)
         bg.addSubview(aboutBtn2)
 
@@ -3619,12 +4674,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             botDiv.heightAnchor.constraint(equalToConstant: 1),
             hint.topAnchor.constraint(equalTo: botDiv.bottomAnchor),
             hint.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            hint.trailingAnchor.constraint(equalTo: settingsBtn2.leadingAnchor, constant: -4),
+            hint.trailingAnchor.constraint(equalTo: saveBtn2.leadingAnchor, constant: -4),
             hint.heightAnchor.constraint(equalToConstant: hintH),
-            axeBtn.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            halfAxeBtn2.trailingAnchor.constraint(equalTo: bg.centerXAnchor, constant: -5),
+            halfAxeBtn2.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            halfAxeBtn2.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
+            axeBtn.leadingAnchor.constraint(equalTo: bg.centerXAnchor, constant: 5),
             axeBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
-            axeBtn.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
-            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: settingsBtn2.leadingAnchor, constant: -4),
+            axeBtn.trailingAnchor.constraint(lessThanOrEqualTo: saveBtn2.leadingAnchor, constant: -6),
+            // Save-session button
+            saveBtn2.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            saveBtn2.trailingAnchor.constraint(equalTo: settingsBtn2.leadingAnchor, constant: -2),
+            saveBtn2.widthAnchor.constraint(equalToConstant: 22),
+            saveBtn2.heightAnchor.constraint(equalToConstant: 22),
             // Settings button
             settingsBtn2.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
             settingsBtn2.trailingAnchor.constraint(equalTo: aboutBtn2.leadingAnchor, constant: -2),
@@ -3651,9 +4713,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         return v
     }
 
-    /// Small SF Symbol icon button for the hint bar (subtle, tertiary color, no border)
+    /// Small SF Symbol icon button for the hint bar (subtle, tertiary color,
+    /// no border). Uses `HoverIconButton` so it gains a soft layered hover
+    /// background that fades in/out on cursor enter/exit.
     private func makeHintIconButton(symbolName: String, action: Selector) -> NSButton {
-        let btn = NSButton()
+        let btn = HoverIconButton()
         btn.isBordered = false
         btn.bezelStyle = .inline
         btn.target = self
@@ -3682,6 +4746,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         allApps = sortByMemory
             ? entries.sorted { ($0.memMB ?? -1) > ($1.memMB ?? -1) }
             : entries.sorted { $0.name < $1.name }
+        // Warm the icon cache off the main thread so the first paint of the
+        // table has icons populated even for apps we haven't seen before.
+        let warm: [(String, URL)] = allApps.compactMap { e in
+            guard let bid = e.app.bundleIdentifier, let url = e.app.bundleURL else { return nil }
+            return (bid, url)
+        }
+        IconCache.shared.warmAsync(warm)
         updatePlaceholder()
     }
 
@@ -3698,6 +4769,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         updateEmptyState(query: query)
         updateHint()
+
+        // Staggered fade-in for visible rows once the table relays out.
+        if !AnimationConstants.reduceMotion {
+            DispatchQueue.main.async { [weak self] in self?.animateRowsIn() }
+        }
+    }
+
+    /// Fade-in + 4pt vertical slide for each visible row, staggered 15ms
+    /// per row. Called after the table reloads on filter / sort changes.
+    private func animateRowsIn() {
+        guard let tv = tableView else { return }
+        let range = tv.rows(in: tv.visibleRect)
+        let begin = CACurrentMediaTime()
+        for row in range.location ..< (range.location + range.length) {
+            guard let rv = tv.rowView(atRow: row, makeIfNecessary: false) else { continue }
+            rv.wantsLayer = true
+            guard let layer = rv.layer else { continue }
+            let delay = Double(row - range.location) * AnimationConstants.rowStaggerDelay
+
+            let op = CABasicAnimation(keyPath: "opacity")
+            op.fromValue = 0.0; op.toValue = 1.0
+            op.duration = AnimationConstants.rowFadeDuration
+            op.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            op.beginTime = begin + delay
+            op.fillMode  = .backwards
+            layer.add(op, forKey: "rowFade")
+
+            let off = CABasicAnimation(keyPath: "transform.translation.y")
+            off.fromValue = AnimationConstants.rowFadeOffset
+            off.toValue   = 0
+            off.duration  = AnimationConstants.rowFadeDuration
+            off.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            off.beginTime = begin + delay
+            off.fillMode  = .backwards
+            layer.add(off, forKey: "rowOffset")
+        }
     }
 
     func refreshAndFilter() {
@@ -3719,13 +4826,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sortButton?.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
-        sortButton?.contentTintColor = sortByMemory ? .controlAccentColor : .tertiaryLabelColor
+        sortButton?.contentTintColor = sortByMemory ? .controlAccentColor : dimIconColor
         refreshAndFilter()
     }
 
     private func updateEmptyState(query: String) {
         if filtered.isEmpty {
-            emptyView?.show(query.isEmpty ? "No apps running" : "No matches for \"\(query)\"")
+            let none = pun("Nothing to axe.", "No apps running")
+            emptyView?.show(query.isEmpty ? none : "No matches for \"\(query)\"")
         } else {
             emptyView?.hide()
         }
@@ -3741,17 +4849,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 currentKillPhrase = phrases[safe: phraseIndex] ?? "Yeet"
                 startPhraseCycling()
             }
-            let btnTitle = "\(currentKillPhrase) (\(checked))"
+            let attrs: [NSAttributedString.Key: Any] =
+                [.foregroundColor: NSColor.white,
+                 .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
             axeCheckedButton?.attributedTitle = NSAttributedString(
-                string: btnTitle,
-                attributes: [.foregroundColor: NSColor.white,
-                             .font: NSFont.systemFont(ofSize: 12, weight: .semibold)])
+                string: "\(currentKillPhrase) (\(checked))", attributes: attrs)
             axeCheckedButton?.isHidden = false
+            halfAxeButton?.attributedTitle = NSAttributedString(
+                string: "Half-Axe It", attributes: attrs)
+            halfAxeButton?.isHidden = false
             hintLabel?.isHidden = true
         } else {
             stopPhraseCycling()
             currentKillPhrase = ""   // reset so next session gets a fresh phrase
             axeCheckedButton?.isHidden = true
+            halfAxeButton?.isHidden = true
             hintLabel?.isHidden = false
             let sel = tableView?.selectedRowIndexes.count ?? 0
             if sel > 1 {
@@ -3774,9 +4886,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func startPhraseCycling() {
         phraseTimer?.invalidate()
         guard enabledKillPhrases.count > 1 else { return }   // nothing to cycle to
-        phraseTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        // Register on .common run-loop modes so the tick still fires while the user
+        // is hovering/scrolling the overlay (event-tracking mode) — a plain
+        // scheduledTimer (.default mode) would pause during interaction.
+        let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             self?.cycleKillPhrase()
         }
+        RunLoop.main.add(t, forMode: .common)
+        phraseTimer = t
     }
 
     private func stopPhraseCycling() {
@@ -3806,6 +4923,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             let targets = rows.compactMap { filtered[safe: $0] }
             confirmAndExecuteKill(targets: targets, force: force)
         }
+    }
+
+    // MARK: Half-Axe (hide instead of quit)
+
+    @objc func halfAxeCheckedApps() { hideSelected() }
+
+    /// "Half-Axe It" — hides the selected/checked apps instead of quitting them.
+    /// Non-destructive, so no confirmation; closes the overlay when done.
+    func hideSelected() {
+        let targets: [AppEntry]
+        if !checkedPIDs.isEmpty {
+            targets = filtered.filter { checkedPIDs.contains($0.app.processIdentifier) }
+        } else {
+            let rows = tableView?.selectedRowIndexes ?? IndexSet()
+            targets = rows.compactMap { filtered[safe: $0] }
+        }
+        guard !targets.isEmpty else { return }
+        targets.forEach { $0.app.hide() }
+        checkedPIDs.removeAll()
+        hideOverlay()
+    }
+
+    // MARK: Row context menu (right-click)
+
+    /// Builds a context menu for a specific row — Axe / Force Axe / Half-Axe
+    /// that one app without disturbing the table's selection or checkboxes.
+    /// The Axe items render red, the Half-Axe item purple, matching the
+    /// overlay's action buttons.
+    func rowContextMenu(forRow row: Int) -> NSMenu? {
+        guard row >= 0, row < filtered.count else { return nil }
+        let entry = filtered[row]
+        let pidNum = NSNumber(value: entry.app.processIdentifier)
+
+        func makeItem(_ title: String, color: NSColor, selector: Selector) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            item.representedObject = pidNum
+            item.attributedTitle = NSAttributedString(string: title, attributes: [
+                .foregroundColor: color,
+                .font: NSFont.menuFont(ofSize: 0),
+            ])
+            return item
+        }
+
+        let menu = NSMenu()
+        menu.addItem(makeItem("Axe \(entry.name)",
+                              color: .systemRed,
+                              selector: #selector(contextAxe(_:))))
+        menu.addItem(makeItem("Force Axe \(entry.name)",
+                              color: .systemRed,
+                              selector: #selector(contextForceAxe(_:))))
+        menu.addItem(.separator())
+        menu.addItem(makeItem("Half-Axe \(entry.name)  ·  hide",
+                              color: .systemPurple,
+                              selector: #selector(contextHalfAxe(_:))))
+        return menu
+    }
+
+    private func contextEntry(_ sender: NSMenuItem) -> AppEntry? {
+        guard let n = sender.representedObject as? NSNumber else { return nil }
+        let pid = n.int32Value
+        return filtered.first(where: { $0.app.processIdentifier == pid })
+    }
+
+    @objc func contextAxe(_ sender: NSMenuItem) {
+        guard let e = contextEntry(sender) else { return }
+        confirmAndExecuteKill(targets: [e], force: false)
+    }
+
+    @objc func contextForceAxe(_ sender: NSMenuItem) {
+        guard let e = contextEntry(sender) else { return }
+        confirmAndExecuteKill(targets: [e], force: true)
+    }
+
+    @objc func contextHalfAxe(_ sender: NSMenuItem) {
+        guard let e = contextEntry(sender) else { return }
+        e.app.hide()
+        hideOverlay()
     }
 
     // Shows a confirmation sheet when "Confirm before killing" is on, then kills.
@@ -3845,6 +5040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func executeKill(targets: [AppEntry], force: Bool) {
+        if AppSettings.soundEnabled { ChopSound.shared.play() }
         targets.forEach { killEntry($0, force: force) }
         if AppSettings.autoClose && targets.count >= filtered.count {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -3871,18 +5067,371 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let pid = entry.app.processIdentifier
         if let row = filtered.firstIndex(where: { $0.app.processIdentifier == pid }),
            let rv = tableView?.rowView(atRow: row, makeIfNecessary: false) {
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.18
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                rv.animator().alphaValue = 0
-            }, completionHandler: { [weak self] in
-                self?.refreshAndFilter()
-            })
+            animateKill(rv)   // plays the chosen destruction animation, then refreshes
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 self?.refreshAndFilter()
             }
         }
+    }
+
+    // MARK: Destruction animations
+
+    /// Hosts a kill animation in its own transparent, click-through floating
+    /// window. Because the effect lives outside the popover/panel, it always
+    /// plays to completion even if the overlay that triggered it dismisses.
+    private final class KillCanvas {
+        let window:  NSWindow
+        let host:    CALayer
+        let full:    CGImage
+        let scale:   CGFloat
+        let bounds:  CGRect      // row bounds, local coords
+        let flipped: Bool        // whether the row view is flipped
+        let rect:    CGRect      // row rect in overlay-content coords (screen-aligned, y up)
+        private let screenOrigin: CGPoint
+        private weak var row: NSView?
+
+        init(window: NSWindow, host: CALayer, full: CGImage, scale: CGFloat,
+             bounds: CGRect, flipped: Bool, rect: CGRect,
+             screenOrigin: CGPoint, row: NSView) {
+            self.window = window; self.host = host; self.full = full
+            self.scale = scale; self.bounds = bounds; self.flipped = flipped
+            self.rect = rect; self.screenOrigin = screenOrigin; self.row = row
+        }
+
+        /// Maps a point in the row's local coords to overlay-content coords.
+        func point(_ local: NSPoint) -> CGPoint {
+            guard let row = row, let win = row.window else { return CGPoint(x: local.x, y: local.y) }
+            let onScreen = win.convertPoint(toScreen: row.convert(local, to: nil))
+            return CGPoint(x: onScreen.x - screenOrigin.x, y: onScreen.y - screenOrigin.y)
+        }
+    }
+
+    private func kv(_ p: CGPoint) -> NSValue { NSValue(point: NSPoint(x: p.x, y: p.y)) }
+    private func ease(_ n: CAMediaTimingFunctionName) -> CAMediaTimingFunction {
+        CAMediaTimingFunction(name: n)
+    }
+
+    /// Real kill: animate the row out, then refresh the list.
+    private func animateKill(_ rv: NSView) {
+        runKillAnimation(on: rv) { [weak self] in self?.refreshAndFilter() }
+    }
+
+    /// Picks the configured (or a random) style and runs it on `rv`, calling
+    /// `completion` once the effect (and its overlay window) is finished.
+    func runKillAnimation(on rv: NSView, completion: @escaping () -> Void) {
+        var style = AppSettings.killAnimation
+        if style == .random { style = KillAnimation.concreteCases.randomElement() ?? .shatter }
+        guard let c = makeKillCanvas(for: rv) else {
+            rv.isHidden = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { completion() }
+            return
+        }
+        switch style {
+        case .shatter:  runTileAnim(c, cols: 6,  rows: 2, duration: 0.6,  mode: .shatter, completion: completion)
+        case .explode:  runTileAnim(c, cols: 6,  rows: 2, duration: 0.55, mode: .explode, completion: completion)
+        case .dissolve: runTileAnim(c, cols: 12, rows: 3, duration: 0.6,  mode: .dissolve, completion: completion)
+        case .burn:     runTileAnim(c, cols: 10, rows: 4, duration: 0.85, mode: .burn, completion: completion)
+        case .thanos:   runTileAnim(c, cols: 16, rows: 4, duration: 1.0,  mode: .thanos, completion: completion)
+        case .slice:    runSliceAnim(c, completion: completion)
+        case .poof:     runPoofAnim(c, completion: completion)
+        case .random:   runTileAnim(c, cols: 6, rows: 2, duration: 0.6, mode: .shatter, completion: completion)
+        }
+    }
+
+    /// Snapshots the row, hides it, and builds a floating overlay window.
+    private func makeKillCanvas(for rv: NSView) -> KillCanvas? {
+        guard let win = rv.window else { return nil }
+        let bounds = rv.bounds
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = rv.bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        rv.cacheDisplay(in: bounds, to: rep)
+        guard let full = rep.cgImage,
+              let scr  = win.screen ?? NSScreen.main ?? NSScreen.screens.first else { return nil }
+        let frame = scr.frame
+
+        let owin = NSWindow(contentRect: frame, styleMask: .borderless,
+                            backing: .buffered, defer: false)
+        owin.isOpaque             = false
+        owin.backgroundColor      = .clear
+        owin.hasShadow            = false
+        owin.ignoresMouseEvents   = true
+        owin.level                = .popUpMenu
+        owin.isReleasedWhenClosed = false
+        owin.collectionBehavior   = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        let content = ShatterOverlayView(frame: NSRect(origin: .zero, size: frame.size))
+        content.wantsLayer = true
+        owin.contentView = content
+        owin.orderFront(nil)
+        guard let host = content.layer else { return nil }
+
+        // Row rect in overlay-content coords (screen-aligned).
+        let rScreen = win.convertToScreen(rv.convert(rv.bounds, to: nil))
+        let rect = CGRect(x: rScreen.minX - frame.minX, y: rScreen.minY - frame.minY,
+                          width: rScreen.width, height: rScreen.height)
+
+        rv.isHidden = true   // only the animated pieces should be visible
+        return KillCanvas(window: owin, host: host, full: full,
+                          scale: win.backingScaleFactor, bounds: bounds,
+                          flipped: rv.isFlipped, rect: rect,
+                          screenOrigin: frame.origin, row: rv)
+    }
+
+    /// Crops one grid tile out of the snapshot (CGImage is top-left origin).
+    private func cropTile(_ c: KillCanvas, vx: CGFloat, vy: CGFloat,
+                          pw: CGFloat, ph: CGFloat) -> CGImage? {
+        let topY = c.flipped ? vy : (c.bounds.height - vy - ph)
+        let crop = CGRect(x: (vx * c.scale).rounded(), y: (topY * c.scale).rounded(),
+                          width: (pw * c.scale).rounded(), height: (ph * c.scale).rounded())
+        return c.full.cropping(to: crop)
+    }
+
+    private func makeTileLayer(_ c: KillCanvas, tile: CGImage,
+                               w: CGFloat, h: CGFloat, center: CGPoint) -> CALayer {
+        let layer = CALayer()
+        layer.contents      = tile
+        layer.contentsScale = c.scale
+        layer.bounds        = CGRect(x: 0, y: 0, width: w, height: h)
+        layer.anchorPoint   = CGPoint(x: 0.5, y: 0.5)
+        layer.position      = center
+        c.host.addSublayer(layer)
+        return layer
+    }
+
+    private func finishKill(_ c: KillCanvas, after duration: CFTimeInterval,
+                            completion: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.08) {
+            c.window.orderOut(nil)
+            completion()
+        }
+    }
+
+    private enum TileMode { case shatter, explode, dissolve, burn, thanos }
+
+    /// Tile-grid styles: shatter (gravity fall), explode (radial burst),
+    /// dissolve (gentle fade), burn (flame front sweeps up), thanos (dust away).
+    private func runTileAnim(_ c: KillCanvas, cols: Int, rows: Int,
+                             duration: CFTimeInterval, mode: TileMode,
+                             completion: @escaping () -> Void) {
+        let pw = c.bounds.width  / CGFloat(cols)
+        let ph = c.bounds.height / CGFloat(rows)
+        let center = CGPoint(x: c.rect.midX, y: c.rect.midY)
+
+        if mode == .burn { addFlameBar(c, duration: duration) }
+
+        for cy in 0..<rows {
+            for cx in 0..<cols {
+                let vx = CGFloat(cx) * pw
+                let vy = CGFloat(cy) * ph
+                guard let tile = cropTile(c, vx: vx, vy: vy, pw: pw, ph: ph) else { continue }
+                let start = c.point(NSPoint(x: vx + pw / 2, y: vy + ph / 2))
+                let layer = makeTileLayer(c, tile: tile, w: pw, h: ph, center: start)
+
+                let pos    = CAKeyframeAnimation(keyPath: "position")
+                let rot    = CABasicAnimation(keyPath: "transform.rotation.z"); rot.fromValue = 0
+                let scaleA = CAKeyframeAnimation(keyPath: "transform.scale")
+                let fade   = CAKeyframeAnimation(keyPath: "opacity")
+
+                switch mode {
+                case .shatter:
+                    let drift = CGFloat.random(in: -55...55)
+                    let fall  = CGFloat.random(in: 80...170)
+                    let pop   = CGFloat.random(in: 2...20)
+                    pos.values = [kv(start),
+                                  kv(CGPoint(x: start.x + drift * 0.35, y: start.y + pop)),
+                                  kv(CGPoint(x: start.x + drift,        y: start.y - fall))]
+                    pos.keyTimes = [0, 0.22, 1]
+                    pos.timingFunctions = [ease(.easeOut), ease(.easeIn)]
+                    rot.toValue   = CGFloat.random(in: -1.8...1.8)
+                    scaleA.values = [1.0, CGFloat.random(in: 0.5...0.85)]; scaleA.keyTimes = [0, 1]
+                    fade.values   = [1, 1, 0]; fade.keyTimes = [0, 0.45, 1]
+
+                case .explode:
+                    var dx = start.x - center.x, dy = start.y - center.y
+                    if abs(dx) < 0.5 && abs(dy) < 0.5 { dx = .random(in: -1...1); dy = .random(in: -1...1) }
+                    let len = max(1, hypot(dx, dy)); let mag = CGFloat.random(in: 80...170)
+                    let end = CGPoint(x: start.x + dx / len * mag,
+                                      y: start.y + dy / len * mag + CGFloat.random(in: -12...12))
+                    pos.values = [kv(start), kv(end)]; pos.keyTimes = [0, 1]
+                    pos.timingFunctions = [ease(.easeOut)]
+                    rot.toValue   = CGFloat.random(in: -2.6...2.6)
+                    scaleA.values = [1.0, CGFloat.random(in: 0.4...0.8)]; scaleA.keyTimes = [0, 1]
+                    fade.values   = [1, 1, 0]; fade.keyTimes = [0, 0.35, 1]
+
+                case .dissolve:
+                    let rise = CGFloat.random(in: 6...22), sway = CGFloat.random(in: -8...8)
+                    pos.values = [kv(start), kv(CGPoint(x: start.x + sway, y: start.y + rise))]
+                    pos.keyTimes = [0, 1]; pos.timingFunctions = [ease(.easeOut)]
+                    rot.toValue   = CGFloat.random(in: -0.4...0.4)
+                    scaleA.values = [1.0, CGFloat.random(in: 0.6...0.9)]; scaleA.keyTimes = [0, 1]
+                    let cp = (cols <= 1) ? 0 : Double(cx) / Double(cols - 1)
+                    let t0 = 0.1 + 0.45 * cp
+                    fade.values = [1, 1, 0]; fade.keyTimes = [0, NSNumber(value: t0), 1]
+
+                case .burn:
+                    // Bottom (lower screen y) ignites first as the flame rises.
+                    let vfrac = Double((start.y - c.rect.minY) / max(1, c.rect.height))
+                    let t0 = min(0.85, 0.1 + 0.6 * vfrac)
+                    let te = min(1.0, t0 + 0.3)
+                    pos.values = [kv(start), kv(start),
+                                  kv(CGPoint(x: start.x + CGFloat.random(in: -8...8),
+                                             y: start.y + CGFloat.random(in: 18...46)))]
+                    pos.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+                    pos.timingFunctions = [ease(.linear), ease(.easeIn)]
+                    rot.toValue   = CGFloat.random(in: -0.5...0.5)
+                    scaleA.values = [1.0, 1.0, CGFloat.random(in: 0.3...0.6)]
+                    scaleA.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+                    fade.values   = [1, 1, 0]
+                    fade.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+
+                case .thanos:
+                    // Left dusts slightly before right; pieces drift up and away.
+                    let hfrac = Double((start.x - c.rect.minX) / max(1, c.rect.width))
+                    let t0 = min(0.55, 0.35 * hfrac + Double.random(in: 0...0.15))
+                    let te = min(1.0, t0 + 0.5)
+                    let end = CGPoint(x: start.x + CGFloat.random(in: 24...72),
+                                      y: start.y + CGFloat.random(in: 30...84))
+                    pos.values = [kv(start), kv(start), kv(end)]
+                    pos.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+                    pos.timingFunctions = [ease(.linear), ease(.easeOut)]
+                    rot.toValue   = CGFloat.random(in: -1.0...1.0)
+                    scaleA.values = [1.0, 1.0, CGFloat.random(in: 0.04...0.18)]
+                    scaleA.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+                    fade.values   = [1, 1, 0]
+                    fade.keyTimes = [0, NSNumber(value: t0), NSNumber(value: te)]
+                }
+
+                let grp = CAAnimationGroup()
+                grp.animations            = [pos, rot, scaleA, fade]
+                grp.duration              = duration
+                grp.fillMode              = .forwards
+                grp.isRemovedOnCompletion = false
+                layer.add(grp, forKey: "kill")
+                layer.opacity = 0
+            }
+        }
+        finishKill(c, after: duration, completion: completion)
+    }
+
+    /// A bright flame front that sweeps up the row for the burn animation.
+    private func addFlameBar(_ c: KillCanvas, duration: CFTimeInterval) {
+        let barH: CGFloat = 16
+        let grad = CAGradientLayer()
+        grad.bounds      = CGRect(x: 0, y: 0, width: c.rect.width, height: barH)
+        grad.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        grad.position    = CGPoint(x: c.rect.midX, y: c.rect.minY)
+        grad.colors      = [NSColor.systemYellow.withAlphaComponent(0.0).cgColor,
+                            NSColor.systemOrange.withAlphaComponent(0.95).cgColor,
+                            NSColor.systemRed.withAlphaComponent(0.0).cgColor]
+        grad.locations   = [0, 0.5, 1]
+        grad.startPoint  = CGPoint(x: 0.5, y: 0)
+        grad.endPoint    = CGPoint(x: 0.5, y: 1)
+        c.host.addSublayer(grad)
+
+        let move = CABasicAnimation(keyPath: "position.y")
+        move.fromValue = c.rect.minY
+        move.toValue   = c.rect.maxY + barH
+
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values   = [0.0, 1.0, 1.0, 0.0]
+        fade.keyTimes = [0, 0.15, 0.7, 1]
+
+        let grp = CAAnimationGroup()
+        grp.animations            = [move, fade]
+        grp.duration              = duration * 0.8
+        grp.timingFunction        = ease(.easeIn)
+        grp.fillMode              = .forwards
+        grp.isRemovedOnCompletion = false
+        grad.add(grp, forKey: "flame")
+        grad.opacity = 0
+    }
+
+    /// Poof: the whole row puffs up and vanishes in a little cloud of smoke.
+    private func runPoofAnim(_ c: KillCanvas, completion: @escaping () -> Void) {
+        let duration: CFTimeInterval = 0.45
+        let mid = CGPoint(x: c.rect.midX, y: c.rect.midY)
+
+        let layer = makeTileLayer(c, tile: c.full, w: c.rect.width, h: c.rect.height, center: mid)
+        let scaleA = CABasicAnimation(keyPath: "transform.scale")
+        scaleA.fromValue = 1.0; scaleA.toValue = 1.18
+        let rise = CABasicAnimation(keyPath: "position.y")
+        rise.fromValue = mid.y; rise.toValue = mid.y + 10
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [1, 0.9, 0]; fade.keyTimes = [0, 0.25, 1]
+        let grp = CAAnimationGroup()
+        grp.animations = [scaleA, rise, fade]
+        grp.duration = duration
+        grp.fillMode = .forwards; grp.isRemovedOnCompletion = false
+        layer.add(grp, forKey: "poof")
+        layer.opacity = 0
+
+        // Smoke puffs radiating outward.
+        let puffs = 7
+        for i in 0..<puffs {
+            let sz = CGFloat.random(in: 16...30)
+            let puff = CALayer()
+            puff.bounds = CGRect(x: 0, y: 0, width: sz, height: sz)
+            puff.cornerRadius = sz / 2
+            puff.backgroundColor = NSColor.white.withAlphaComponent(0.22).cgColor
+            puff.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            let angle = CGFloat(i) / CGFloat(puffs) * .pi * 2
+            let from = CGPoint(x: mid.x + cos(angle) * 12, y: mid.y + sin(angle) * 7)
+            puff.position = from
+            c.host.addSublayer(puff)
+
+            let dist = CGFloat.random(in: 16...46)
+            let pMove = CABasicAnimation(keyPath: "position")
+            pMove.fromValue = kv(from)
+            pMove.toValue   = kv(CGPoint(x: from.x + cos(angle) * dist,
+                                         y: from.y + sin(angle) * dist + 8))
+            let pScale = CABasicAnimation(keyPath: "transform.scale")
+            pScale.fromValue = 0.3; pScale.toValue = CGFloat.random(in: 1.2...1.9)
+            let pFade = CAKeyframeAnimation(keyPath: "opacity")
+            pFade.values = [0.0, 0.8, 0.0]; pFade.keyTimes = [0, 0.3, 1]
+            let pg = CAAnimationGroup()
+            pg.animations = [pMove, pScale, pFade]
+            pg.duration = duration
+            pg.fillMode = .forwards; pg.isRemovedOnCompletion = false
+            puff.add(pg, forKey: "puff")
+            puff.opacity = 0
+        }
+        finishKill(c, after: duration, completion: completion)
+    }
+
+    /// Slice: cleave the row into a top and bottom half that fly apart.
+    private func runSliceAnim(_ c: KillCanvas, completion: @escaping () -> Void) {
+        let duration: CFTimeInterval = 0.5
+        let halfH = c.bounds.height / 2
+
+        for half in 0..<2 {                                   // 0 = lower local half, 1 = upper
+            let vy = CGFloat(half) * halfH
+            guard let tile = cropTile(c, vx: 0, vy: vy, pw: c.bounds.width, ph: halfH) else { continue }
+            let start = c.point(NSPoint(x: c.bounds.midX, y: vy + halfH / 2))
+            let layer = makeTileLayer(c, tile: tile, w: c.bounds.width, h: halfH, center: start)
+
+            // Split based on actual screen position so it reads correctly
+            // regardless of the row view's flippedness.
+            let goesUp = start.y >= c.rect.midY
+            let dy: CGFloat = goesUp ? 60 : -60
+            let dx: CGFloat = goesUp ? -34 : 34
+
+            let pos = CAKeyframeAnimation(keyPath: "position")
+            pos.values   = [kv(start), kv(CGPoint(x: start.x + dx, y: start.y + dy))]
+            pos.keyTimes = [0, 1]; pos.timingFunctions = [ease(.easeIn)]
+            let rot = CABasicAnimation(keyPath: "transform.rotation.z")
+            rot.fromValue = 0; rot.toValue = goesUp ? 0.18 : -0.18
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [1, 1, 0]; fade.keyTimes = [0, 0.35, 1]
+
+            let grp = CAAnimationGroup()
+            grp.animations            = [pos, rot, fade]
+            grp.duration              = duration
+            grp.fillMode              = .forwards
+            grp.isRemovedOnCompletion = false
+            layer.add(grp, forKey: "slice")
+            layer.opacity = 0
+        }
+        finishKill(c, after: duration, completion: completion)
     }
 
     // MARK: Table interactions
@@ -3921,6 +5470,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             self.updateHint()
         }
         return cell
+    }
+
+    /// Provide our custom row view so selection fades smoothly with extra
+    /// contrast — see `AnimatedRowView` for the layer setup.
+    func tableView(_ tv: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let id = NSUserInterfaceItemIdentifier("AnimatedRow")
+        if let reused = tv.makeView(withIdentifier: id, owner: nil) as? AnimatedRowView {
+            return reused
+        }
+        let rv = AnimatedRowView()
+        rv.identifier = id
+        return rv
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
