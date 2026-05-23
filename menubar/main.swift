@@ -9,40 +9,50 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.7.0"
+let appVersion = "2.7.1"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
-// These have been stable since macOS 10.8; used by Moom, Swish, etc.
 // No Accessibility permission required.
+//
+// Symbol map across macOS versions:
+//   Connection:  CGSMainConnection (≤11)  →  _CGSDefaultConnection (12+)
+//   Add space:   CGSAddSpace (≤11)        →  CGSSpaceCreate(cid, NULL, NULL) (12+)
+//                CGSSpaceCreate signature inferred from community reverse-engineering
+//                (Moom, Silenz et al); 3-arg form with NULL,NULL = normal user Space.
+//   Switch:      CGSShowSpaces — present on all versions probed.
 private enum CGSSpace {
-    typealias ConnFn = @convention(c) () -> UInt32
-    typealias AddFn  = @convention(c) (UInt32, Int32) -> UInt64
-    typealias ShowFn = @convention(c) (UInt32, CFArray) -> Int32
+    typealias ConnFn   = @convention(c) () -> UInt32
+    typealias CreateFn = @convention(c) (UInt32, UnsafeMutableRawPointer?, CFDictionary?) -> UInt64
+    typealias AddFn    = @convention(c) (UInt32, Int32) -> UInt64
+    typealias ShowFn   = @convention(c) (UInt32, CFArray) -> Int32
 
     /// Creates a new desktop Space and switches to it. Returns false if the
     /// private APIs are unavailable (caller should fall back to the manual HUD).
     static func createAndSwitch() -> Bool {
-        // CoreGraphics is always loaded alongside AppKit
-        guard let lib = dlopen(
-                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
-                Int32(RTLD_NOLOAD | RTLD_LAZY))
-        else { return false }
-        defer { dlclose(lib) }
+        let lib = UnsafeMutableRawPointer(bitPattern: -2)! // RTLD_DEFAULT
 
-        guard let pConn = dlsym(lib, "CGSMainConnection"),
-              let pAdd  = dlsym(lib, "CGSAddSpace"),
+        guard let pConn = dlsym(lib, "_CGSDefaultConnection") ?? dlsym(lib, "CGSMainConnection"),
               let pShow = dlsym(lib, "CGSShowSpaces")
         else { return false }
 
         let conn = unsafeBitCast(pConn, to: ConnFn.self)
-        let add  = unsafeBitCast(pAdd,  to: AddFn.self)
         let show = unsafeBitCast(pShow, to: ShowFn.self)
-
-        let cid = conn()
+        let cid  = conn()
         guard cid != 0 else { return false }
-        let sid = add(cid, 0)   // 0 = normal desktop Space
+
+        let sid: UInt64
+        if let pCreate = dlsym(lib, "CGSSpaceCreate") {
+            let create = unsafeBitCast(pCreate, to: CreateFn.self)
+            sid = create(cid, nil, nil)
+        } else if let pAdd = dlsym(lib, "CGSAddSpace") {
+            let add = unsafeBitCast(pAdd, to: AddFn.self)
+            sid = add(cid, 0)
+        } else {
+            return false
+        }
         guard sid != 0 else { return false }
+
         _ = show(cid, [NSNumber(value: sid)] as CFArray)
         return true
     }
@@ -940,6 +950,10 @@ private func makeMenuBarIcon() -> NSImage {
 
 final class SettingsWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    private weak var axPermStatusLabel: NSTextField?
+    private weak var axPermSubtitleLabel: NSTextField?
+    private weak var axPermBtn: NSButton?
+    private var permissionObserver: NSObjectProtocol?
 
     func show() {
         if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
@@ -956,7 +970,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         w.makeKeyAndOrderFront(nil)
     }
 
-    func windowWillClose(_ notification: Notification) { window = nil }
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+        if let obs = permissionObserver {
+            NotificationCenter.default.removeObserver(obs)
+            permissionObserver = nil
+        }
+    }
 
     // ── UI construction ──────────────────────────────────────────
 
@@ -1048,6 +1068,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                       on: AppSettings.punnyMode) { AppSettings.punnyMode = $0 },
         ])
 
+        addSection("Permissions", to: root, rows: [
+            permissionRow(in: root.window ?? NSApp.keyWindow ?? NSWindow()),
+        ])
+
+        permissionObserver = NotificationCenter.default.addObserver(
+            forName: .permissionStateChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshPermissionRow()
+        }
+
         let div = NSBox(); div.boxType = .separator
         div.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(div)
@@ -1137,6 +1166,99 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let box = ToggleBox(sw, handler: handler)
         row.addArrangedSubview(lbl); row.addArrangedSubview(box)
         return row
+    }
+
+    private func permissionRow(in w: NSWindow) -> NSView {
+        let row = NSStackView(); row.orientation = .vertical; row.spacing = 4
+        row.alignment = .leading
+        row.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+
+        let titleRow = NSStackView(); titleRow.orientation = .horizontal; titleRow.spacing = 8
+        titleRow.alignment = .centerY
+        let titleLbl = NSTextField(labelWithString: "Accessibility")
+        titleLbl.font = .systemFont(ofSize: 13, weight: .regular)
+        titleLbl.textColor = .labelColor
+        titleLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let statusLbl = NSTextField(labelWithString: "")
+        statusLbl.font = .systemFont(ofSize: 11, weight: .medium)
+        statusLbl.setContentHuggingPriority(.required, for: .horizontal)
+        axPermStatusLabel = statusLbl
+
+        titleRow.addArrangedSubview(titleLbl)
+        titleRow.addArrangedSubview(statusLbl)
+
+        let subtitleLbl = NSTextField(wrappingLabelWithString: "")
+        subtitleLbl.font = .systemFont(ofSize: 11)
+        subtitleLbl.textColor = .secondaryLabelColor
+        subtitleLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        axPermSubtitleLabel = subtitleLbl
+
+        let btn = NSButton(title: "", target: self, action: #selector(axPermBtnTapped(_:)))
+        btn.bezelStyle  = .rounded
+        btn.controlSize = .small
+        axPermBtn = btn
+
+        row.addArrangedSubview(titleRow)
+        row.addArrangedSubview(subtitleLbl)
+        row.addArrangedSubview(btn)
+        titleRow.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -32).isActive = true
+        subtitleLbl.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -32).isActive = true
+
+        PermissionManager.shared.refreshAccessibilityState()
+        refreshPermissionRow()
+        return row
+    }
+
+    private func refreshPermissionRow() {
+        switch PermissionManager.shared.accessibility {
+        case .granted:
+            axPermStatusLabel?.stringValue  = "Granted"
+            axPermStatusLabel?.textColor    = .systemGreen
+            axPermSubtitleLabel?.stringValue = "Window position capture is available for workflows."
+            axPermBtn?.title    = "Open Accessibility Settings…"
+            axPermBtn?.isHidden = false
+        case .denied:
+            axPermStatusLabel?.stringValue  = "Not granted"
+            axPermStatusLabel?.textColor    = .secondaryLabelColor
+            axPermSubtitleLabel?.stringValue = "Grant access in System Settings to enable window position capture in workflows."
+            axPermBtn?.title    = "Open Settings…"
+            axPermBtn?.isHidden = false
+        case .notDetermined:
+            axPermStatusLabel?.stringValue  = "Not granted"
+            axPermStatusLabel?.textColor    = .secondaryLabelColor
+            axPermSubtitleLabel?.stringValue = "Optional. Lets Axe capture and restore window positions in workflows."
+            axPermBtn?.title    = "Grant Access…"
+            axPermBtn?.isHidden = false
+        }
+    }
+
+    @objc private func axPermBtnTapped(_ sender: NSButton) {
+        let state = PermissionManager.shared.accessibility
+        if state == .granted {
+            PermissionManager.shared.openAccessibilitySettings()
+            return
+        }
+        guard let w = window else { return }
+        let alert = NSAlert()
+        alert.messageText     = "Axe would like to control this computer"
+        alert.informativeText = """
+            Axe uses Accessibility only to capture and restore window positions in workflows. \
+            No other data is read or sent anywhere.
+
+            After granting access, open Axe Settings again to check the status. \
+            You can revoke access any time in System Settings › Privacy & Security › Accessibility.
+            """
+        alert.addButton(withTitle: "Grant Access")
+        alert.addButton(withTitle: "Not Now")
+        alert.alertStyle = .informational
+        alert.beginSheetModal(for: w) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            PermissionManager.shared.requestAccessibility()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                PermissionManager.shared.refreshAccessibilityState()
+            }
+        }
     }
 
     private func popupRow(_ label: String, options: [String], selected: Int,
@@ -1536,6 +1658,44 @@ final class WorkflowHotkeyManager {
     }
 }
 
+// MARK: - Permission management
+
+enum PermissionState: Equatable {
+    case notDetermined, granted, denied
+}
+
+extension Notification.Name {
+    static let permissionStateChanged = Notification.Name("com.emerytech.axe.permissionStateChanged")
+}
+
+final class PermissionManager {
+    static let shared = PermissionManager()
+    private(set) var accessibility: PermissionState = .notDetermined
+
+    @discardableResult
+    func refreshAccessibilityState() -> PermissionState {
+        let trusted = AXIsProcessTrusted()
+        let prev    = accessibility
+        accessibility = trusted ? .granted :
+            (UserDefaults.standard.bool(forKey: "axHasBeenAsked") ? .denied : .notDetermined)
+        if prev != accessibility {
+            NotificationCenter.default.post(name: .permissionStateChanged, object: nil)
+        }
+        return accessibility
+    }
+
+    func requestAccessibility() {
+        UserDefaults.standard.set(true, forKey: "axHasBeenAsked")
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+    }
+
+    func openAccessibilitySettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+}
+
 // MARK: - Session persistence
 
 struct SavedApp: Codable {
@@ -1549,21 +1709,35 @@ struct HotkeyBinding: Codable, Equatable {
     var displayString: String   // e.g. "⌥⌘1"
 }
 
+struct WindowState: Codable {
+    let frame:       CGRect
+    let isMinimized: Bool
+    let title:       String?
+}
+
+struct AppWindowSnapshot: Codable {
+    let bundleID: String
+    let windows:  [WindowState]
+}
+
 private struct PersistedSessions: Codable {
     let version:  Int
     let sessions: [AppSession]
 }
 
+// v3 = adds captureWindowState / windowSnapshots (optional, defaults to nil — backward-compatible).
 struct AppSession: Codable {
-    let id:                UUID
-    var name:              String
-    let date:              Date
-    let apps:              [SavedApp]
-    var isFavorite:        Bool           = false
-    var hotkey:            HotkeyBinding? = nil
-    var primaryBundleID:   String?        = nil
-    var autoLaunchOnLogin: Bool           = false
-    var lastUsed:          Date?          = nil
+    let id:                  UUID
+    var name:                String
+    let date:                Date
+    let apps:                [SavedApp]
+    var isFavorite:          Bool                = false
+    var hotkey:              HotkeyBinding?      = nil
+    var primaryBundleID:     String?             = nil
+    var autoLaunchOnLogin:   Bool                = false
+    var lastUsed:            Date?               = nil
+    var captureWindowState:  Bool                = false
+    var windowSnapshots:     [AppWindowSnapshot]? = nil
 }
 
 final class SessionManager {
@@ -1581,7 +1755,7 @@ final class SessionManager {
             return (try? JSONDecoder().decode([AppSession].self, from: data)) ?? []
         }
         set {
-            let p = PersistedSessions(version: 2, sessions: newValue)
+            let p = PersistedSessions(version: 3, sessions: newValue)
             if let data = try? JSONEncoder().encode(p) {
                 UserDefaults.standard.set(data, forKey: key)
             }
@@ -1631,6 +1805,96 @@ final class SessionManager {
         all = s
     }
 
+    func setCaptureWindowState(id: UUID, enabled: Bool) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].captureWindowState = enabled
+        all = s
+    }
+
+    func setWindowSnapshots(id: UUID, snapshots: [AppWindowSnapshot]?) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].windowSnapshots = snapshots
+        all = s
+    }
+
+    func captureWindowSnapshots(for bundleIDs: [String]) -> [AppWindowSnapshot]? {
+        guard AXIsProcessTrusted() else { return nil }
+        var result: [AppWindowSnapshot] = []
+        for bid in bundleIDs {
+            guard let app = NSWorkspace.shared.runningApplications
+                    .first(where: { $0.bundleIdentifier == bid }) else { continue }
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var windowsRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                  let windows = windowsRef as? [AXUIElement] else { continue }
+            var states: [WindowState] = []
+            for win in windows.prefix(20) {
+                var posRef: CFTypeRef?, sizeRef: CFTypeRef?, minRef: CFTypeRef?, titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef)
+                AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString,     &sizeRef)
+                AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minRef)
+                AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString,    &titleRef)
+                var pos  = CGPoint.zero; var size = CGSize.zero
+                if let p = posRef  { AXValueGetValue(p  as! AXValue, .cgPoint, &pos)  }
+                if let s = sizeRef { AXValueGetValue(s  as! AXValue, .cgSize,  &size) }
+                let minimized = (minRef as? Bool) ?? false
+                let title     = titleRef as? String
+                states.append(WindowState(frame: CGRect(origin: pos, size: size),
+                                          isMinimized: minimized, title: title))
+            }
+            if !states.isEmpty { result.append(AppWindowSnapshot(bundleID: bid, windows: states)) }
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    static func applyWindowSnapshots(_ snapshots: [AppWindowSnapshot]) {
+        guard AXIsProcessTrusted() else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            for snap in snapshots {
+                var attempts = 0
+                while attempts < 15 {
+                    guard let app = NSWorkspace.shared.runningApplications
+                            .first(where: { $0.bundleIdentifier == snap.bundleID }) else {
+                        attempts += 1; Thread.sleep(forTimeInterval: 0.2); continue
+                    }
+                    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+                    var windowsRef: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                          let windows = windowsRef as? [AXUIElement], !windows.isEmpty else {
+                        attempts += 1; Thread.sleep(forTimeInterval: 0.2); continue
+                    }
+                    for (idx, state) in snap.windows.enumerated() {
+                        let candidates: [AXUIElement]
+                        if let title = state.title {
+                            let prefix = String(title.prefix(30))
+                            candidates = windows.filter {
+                                var t: CFTypeRef?
+                                AXUIElementCopyAttributeValue($0, kAXTitleAttribute as CFString, &t)
+                                return (t as? String)?.hasPrefix(prefix) ?? false
+                            }
+                        } else { candidates = [] }
+                        let win = candidates.first ?? (idx < windows.count ? windows[idx] : nil)
+                        guard let win else { continue }
+                        var pos  = state.frame.origin
+                        var size = state.frame.size
+                        if let pv = AXValueCreate(.cgPoint, &pos) {
+                            AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, pv)
+                        }
+                        if let sv = AXValueCreate(.cgSize,  &size) {
+                            AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, sv)
+                        }
+                        let minimized = state.isMinimized
+                        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString,
+                                                     minimized as CFTypeRef)
+                    }
+                    break
+                }
+            }
+        }
+    }
+
     enum RestoreMode { case additive, replace }
 
     @discardableResult
@@ -1650,7 +1914,8 @@ final class SessionManager {
         }
 
         let launchDelay: Double = shouldClose ? 0.6 : 0.0
-        let item = DispatchWorkItem { [apps = session.apps, primaryID = session.primaryBundleID] in
+        let item = DispatchWorkItem { [apps = session.apps, primaryID = session.primaryBundleID,
+                                       snapshots = session.windowSnapshots] in
             let runningApps = NSWorkspace.shared.runningApplications
             for app in apps {
                 if let running = runningApps.first(where: { $0.bundleIdentifier == app.bundleID }) {
@@ -1678,6 +1943,11 @@ final class SessionManager {
                     }
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { tryActivate?() }
+            }
+            if let snaps = snapshots, PermissionManager.shared.accessibility == .granted {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    SessionManager.applyWindowSnapshots(snaps)
+                }
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + launchDelay, execute: item)
@@ -1918,13 +2188,15 @@ final class PhrasesWindow: NSObject, NSWindowDelegate {
 /// Floating top-center banner shown while waiting for the user to switch to a new Space.
 /// When NSWorkspace fires activeSpaceDidChangeNotification the apps are launched there.
 final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
-    private var window:    NSWindow?
-    private var onCancel:  (() -> Void)?
-    let sessionName: String
+    private var window:      NSWindow?
+    private var onCancel:    (() -> Void)?
+    let sessionName:  String
+    let manualReason: Bool
 
-    init(sessionName: String, onCancel: @escaping () -> Void) {
-        self.sessionName = sessionName
-        self.onCancel    = onCancel
+    init(sessionName: String, manualReason: Bool = false, onCancel: @escaping () -> Void) {
+        self.sessionName  = sessionName
+        self.manualReason = manualReason
+        self.onCancel     = onCancel
         super.init()
     }
 
@@ -1984,7 +2256,9 @@ final class SpaceRestoreHUD: NSObject, NSWindowDelegate {
 
         // Instructions
         let body = NSTextField(labelWithString:
-            "Switch to any Space and the workflow will open there.\n\nPress ⌃↑ to open Mission Control, then click + to create a new Space.")
+            manualReason
+                ? "Automatic Space creation isn't available on this system.\n\nPress ⌃↑ to open Mission Control, click + to create a new Space, then switch to it."
+                : "Switch to any Space and the workflow will open there.\n\nPress ⌃↑ to open Mission Control, then click + to create a new Space.")
         body.font = .systemFont(ofSize: 12); body.textColor = .secondaryLabelColor
         body.alignment = .center; body.lineBreakMode = .byWordWrapping
         body.preferredMaxLayoutWidth = W - 48
@@ -2228,6 +2502,7 @@ final class SelfUpdater: NSObject, NSWindowDelegate {
                             self.statusLabel?.stringValue = "Restarting Axe…"
                             self.progressBar?.isHidden = true
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                (NSApp.delegate as? AppDelegate)?.isUpdating = true
                                 NSApp.terminate(nil)   // installer script relaunches
                             }
                         } else { self.fail() }
@@ -3202,10 +3477,12 @@ final class NotchResizeHandle: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate,
                           NSTableViewDataSource, NSTableViewDelegate,
-                          NSTextFieldDelegate {
+                          NSTextFieldDelegate, NSMenuDelegate {
 
     // Status bar
     var statusItem: NSStatusItem!
+    private weak var openStatusMenu: NSMenu?
+    var isUpdating = false   // set before NSApp.terminate() in update flow; skips quit confirmation
 
     // Overlay — spotlight mode
     var panel:          NSPanel?
@@ -3402,6 +3679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     /// through here. Returns `.terminateCancel` if the user backs out, so the
     /// app stays alive.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isUpdating { return .terminateNow }
         NSApp.activate(ignoringOtherApps: true)
         let prompt = quitConfirmPrompts.randomElement() ?? quitConfirmPrompts[0]
         let alert = NSAlert()
@@ -3452,6 +3730,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         startNudgeTimer()
         startUsageTimer()
 
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willBecomeActiveNotification,
+            object: nil, queue: .main) { _ in
+            PermissionManager.shared.refreshAccessibilityState()
+        }
+
         // Silent background update check
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
             self.checkForUpdates(userInitiated: false)
@@ -3475,7 +3759,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func showStatusMenu() {
+        // Toggle: a second right-click dismisses the open menu cleanly so
+        // About / Update windows can appear without the dropdown in the way.
+        if let existing = openStatusMenu {
+            existing.cancelTracking()
+            return
+        }
         let menu = NSMenu()
+        menu.delegate = self
 
         // ── Favorite workflows — direct one-click access at the very top ──
         let saved = SessionManager.shared.all
@@ -3624,9 +3915,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "About Axe",           key: "",  action: #selector(showAbout))
         menu.addItem(.separator())
         addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
+        openStatusMenu  = menu
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
-        DispatchQueue.main.async { self.statusItem.menu = nil }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        if menu === openStatusMenu {
+            statusItem.menu = nil
+            openStatusMenu  = nil
+        }
     }
 
     @discardableResult
@@ -3714,13 +4012,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func handleUpdateResult(latest: String, notes: String, userInitiated: Bool) {
+        NSApp.activate(ignoringOtherApps: true)
         guard isNewerVersion(latest, than: appVersion) else {
             if userInitiated {
                 let a = NSAlert()
                 a.messageText     = "Axe is up to date"
                 a.informativeText = "You're running the latest version (v\(appVersion))."
                 a.addButton(withTitle: "OK")
-                a.runModal()
+                if let keyWin = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                    a.beginSheetModal(for: keyWin)
+                } else {
+                    a.runModal()
+                }
             }
             return
         }
@@ -3766,6 +4069,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func tidyWorkflow() {
         driftExtraApps.forEach { $0.terminate() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.refreshSessionsPanel() }
+    }
+
+    @objc func reapplyWindowLayout() {
+        guard let activeID  = AppSettings.activeWorkflowID,
+              let active    = SessionManager.shared.all.first(where: { $0.id == activeID }),
+              let snapshots = active.windowSnapshots,
+              PermissionManager.shared.accessibility == .granted
+        else { return }
+        SessionManager.applyWindowSnapshots(snapshots)
     }
 
     private func buildDriftStrip() -> NSView? {
@@ -3841,9 +4153,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         catchUpBtn.isHidden = driftMissingApps.isEmpty
         tidyBtn.isHidden    = driftExtraApps.isEmpty
 
+        let hasSnapshots = active.windowSnapshots != nil
+            && PermissionManager.shared.accessibility == .granted
+        let reapplyBtn = NSButton(title: "Re-apply layout", target: self, action: #selector(reapplyWindowLayout))
+        reapplyBtn.bezelStyle = .rounded; reapplyBtn.font = .systemFont(ofSize: 11)
+        reapplyBtn.translatesAutoresizingMaskIntoConstraints = false
+        reapplyBtn.isHidden = !hasSnapshots
+
         strip.addSubview(titleLbl); strip.addSubview(missingRow)
         strip.addSubview(driftRow); strip.addSubview(statusLbl)
-        strip.addSubview(catchUpBtn); strip.addSubview(tidyBtn)
+        strip.addSubview(catchUpBtn); strip.addSubview(tidyBtn); strip.addSubview(reapplyBtn)
         NSLayoutConstraint.activate([
             titleLbl.topAnchor.constraint(equalTo: strip.topAnchor, constant: 8),
             titleLbl.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 12),
@@ -3854,6 +4173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             statusLbl.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 12),
             statusLbl.topAnchor.constraint(equalTo: missingRow.bottomAnchor, constant: 5),
             statusLbl.bottomAnchor.constraint(equalTo: strip.bottomAnchor, constant: -8),
+            reapplyBtn.trailingAnchor.constraint(equalTo: catchUpBtn.leadingAnchor, constant: -4),
+            reapplyBtn.centerYAnchor.constraint(equalTo: strip.centerYAnchor),
             catchUpBtn.trailingAnchor.constraint(equalTo: tidyBtn.leadingAnchor, constant: -4),
             catchUpBtn.centerYAnchor.constraint(equalTo: strip.centerYAnchor),
             tidyBtn.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -10),
@@ -4435,7 +4756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.messageText = "Edit Workflow"
         alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
 
-        let av = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 132))
+        let av = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 195))
         let nameField = NSTextField(frame: .zero)
         nameField.stringValue = session.name; nameField.placeholderString = "Workflow name"
         nameField.translatesAutoresizingMaskIntoConstraints = false
@@ -4467,10 +4788,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         autoChk.state = session.autoLaunchOnLogin ? .on : .off
         autoChk.translatesAutoresizingMaskIntoConstraints = false
 
+        let axGranted = PermissionManager.shared.refreshAccessibilityState() == .granted
+        let winChkTitle = axGranted
+            ? "Capture window positions"
+            : "Capture window positions  (requires Accessibility — set up in Settings)"
+        let winChk = NSButton(checkboxWithTitle: winChkTitle, target: nil, action: nil)
+        winChk.state = session.captureWindowState ? .on : .off
+        winChk.isEnabled = axGranted
+        if !axGranted { winChk.contentTintColor = .tertiaryLabelColor }
+        winChk.font = .systemFont(ofSize: 11)
+        winChk.translatesAutoresizingMaskIntoConstraints = false
+
         av.addSubview(nameField); av.addSubview(hkLbl)
         av.addSubview(recorder);  av.addSubview(clearBtn)
         av.addSubview(primLbl);   av.addSubview(primPop)
-        av.addSubview(autoChk)
+        av.addSubview(autoChk);   av.addSubview(winChk)
         NSLayoutConstraint.activate([
             nameField.topAnchor.constraint(equalTo: av.topAnchor),
             nameField.leadingAnchor.constraint(equalTo: av.leadingAnchor),
@@ -4488,7 +4820,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             primPop.topAnchor.constraint(equalTo: recorder.bottomAnchor, constant: 12),
             autoChk.leadingAnchor.constraint(equalTo: av.leadingAnchor),
             autoChk.topAnchor.constraint(equalTo: primPop.bottomAnchor, constant: 10),
-            autoChk.bottomAnchor.constraint(equalTo: av.bottomAnchor),
+            winChk.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            winChk.trailingAnchor.constraint(equalTo: av.trailingAnchor),
+            winChk.topAnchor.constraint(equalTo: autoChk.bottomAnchor, constant: 10),
         ])
         alert.accessoryView = av; alert.window.initialFirstResponder = nameField
 
@@ -4516,6 +4850,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         SessionManager.shared.setPrimary(id: session.id,
                                          bundleID: primIdx == 0 ? nil : session.apps[primIdx - 1].bundleID)
         SessionManager.shared.setAutoLaunch(id: session.id, enabled: autoChk.state == .on)
+        let wantsCapture = winChk.state == .on && axGranted
+        SessionManager.shared.setCaptureWindowState(id: session.id, enabled: wantsCapture)
+        if wantsCapture {
+            let snapshots = SessionManager.shared.captureWindowSnapshots(for: session.apps.map { $0.bundleID })
+            SessionManager.shared.setWindowSnapshots(id: session.id, snapshots: snapshots)
+        } else if winChk.state == .off {
+            SessionManager.shared.setWindowSnapshots(id: session.id, snapshots: nil)
+        }
         completion()
     }
 
@@ -4772,7 +5114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if createAndSwitchToNewSpace() { return }
 
         // Fallback: CGS APIs unavailable — show the manual HUD instead.
-        let hud = SpaceRestoreHUD(sessionName: session.name) { [weak self] in
+        let hud = SpaceRestoreHUD(sessionName: session.name, manualReason: true) { [weak self] in
             self?.pendingSpaceRestoreSession = nil
             self?.spaceRestoreHUD = nil
         }
