@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.7.4"
+let appVersion = "2.8.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -505,6 +505,14 @@ struct AppSettings {
     static var notchExtraHeight: CGFloat {
         get { CGFloat(d.double(forKey: "notchExtraHeight")) }
         set { d.set(Double(newValue), forKey: "notchExtraHeight") }
+    }
+    static var notchIndicatorEnabled: Bool {
+        get { d.bool(forKey: "notchIndicatorEnabled") }
+        set { d.set(newValue, forKey: "notchIndicatorEnabled") }
+    }
+    static var notchIndicatorOnRight: Bool {
+        get { d.bool(forKey: "notchIndicatorOnRight") }
+        set { d.set(newValue, forKey: "notchIndicatorOnRight") }
     }
 }
 
@@ -1256,9 +1264,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         scroll.hasVerticalScroller   = true
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers    = true
-        scroll.drawsBackground       = true
-        scroll.backgroundColor       = .windowBackgroundColor
-        scroll.contentView.drawsBackground = false
+        scroll.drawsBackground             = true
+        scroll.backgroundColor             = .windowBackgroundColor
+        scroll.contentView.drawsBackground = true
+        scroll.contentView.backgroundColor = .windowBackgroundColor
         scroll.documentView          = root
         root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
 
@@ -1268,6 +1277,17 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                      options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
                      selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                          AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
+                     },
+            toggleRow("Show notch indicator", icon: "oval.tophalf.filled", iconColor: .systemGray,
+                      on: AppSettings.notchIndicatorEnabled) { [weak self] on in
+                          AppSettings.notchIndicatorEnabled = on
+                          (NSApp.delegate as? AppDelegate)?.syncNotchIndicator()
+                      },
+            popupRow("Notch indicator side", icon: "sidebar.left", iconColor: .systemGray,
+                     options: ["Left of notch", "Right of notch"],
+                     selected: AppSettings.notchIndicatorOnRight ? 1 : 0) { idx in
+                         AppSettings.notchIndicatorOnRight = (idx == 1)
+                         (NSApp.delegate as? AppDelegate)?.resetNotchIndicator()
                      },
             toggleRow("Launch at Login", icon: "arrow.circlepath", iconColor: .systemGreen,
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
@@ -2081,7 +2101,10 @@ final class PermissionManager {
     }
 
     func openAccessibilitySettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        let scheme = ProcessInfo.processInfo.isOperatingSystemAtLeast(
+            OperatingSystemVersion(majorVersion: 13, minorVersion: 0, patchVersion: 0))
+            ? "x-apple.systemsettings" : "x-apple.systempreferences"
+        let url = URL(string: "\(scheme):com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
     }
 }
@@ -3066,6 +3089,7 @@ private extension String {
 final class UpdateWindow: NSObject, NSWindowDelegate {
     private var window:   NSWindow?
     private weak var brewBtn: NSButton?
+    private var selfUpdater: SelfUpdater?
     private let latestVersion: String
     private let releaseNotes:  String
 
@@ -3180,18 +3204,19 @@ final class UpdateWindow: NSObject, NSWindowDelegate {
         let laterBtn = NSButton(title: "Later", target: self, action: #selector(laterTapped))
         laterBtn.bezelStyle = .rounded
 
-        let dmgBtn = NSButton(title: "Download DMG", target: self, action: #selector(dmgTapped))
-        dmgBtn.bezelStyle = .rounded
-
-        let brewBtn = NSButton(title: "Update with Homebrew", target: self, action: #selector(brewTapped))
-        brewBtn.bezelStyle    = .rounded
-        brewBtn.keyEquivalent = "\r"
+        let brewBtn = NSButton(title: "Homebrew", target: self, action: #selector(brewTapped))
+        brewBtn.bezelStyle = .rounded
         self.brewBtn = brewBtn
+
+        let installBtn = NSButton(title: "Install Update", target: self, action: #selector(installTapped))
+        installBtn.bezelStyle    = .rounded
+        installBtn.keyEquivalent = "\r"
+        if #available(macOS 11.0, *) { installBtn.controlSize = .large }
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let btnRow = NSStackView(views: [laterBtn, spacer, dmgBtn, brewBtn])
+        let btnRow = NSStackView(views: [laterBtn, spacer, brewBtn, installBtn])
         btnRow.orientation = .horizontal
         btnRow.spacing     = 8
 
@@ -3221,10 +3246,11 @@ final class UpdateWindow: NSObject, NSWindowDelegate {
         window?.close()
     }
 
-    @objc private func dmgTapped() {
-        NSWorkspace.shared.open(
-            URL(string: "https://github.com/emerytech/homebrew-axe/releases/latest/download/Axe.dmg")!)
+    @objc private func installTapped() {
+        let updater = SelfUpdater()
+        selfUpdater = updater
         window?.close()
+        updater.install(version: latestVersion)
     }
 
     @objc private func brewTapped() {
@@ -3914,59 +3940,96 @@ final class NotchResizeHandle: NSView {
 }
 
 // MARK: - NotchIndicator
-/// Persistent mini-panel that lives in the hardware-notch area whenever Axe is
-/// running in notch mode. Shows the running-app count; hover to expand and reveal
-/// quick-action buttons. Dismissed/reshown in sync with the main overlay.
+/// Minimal pill to the left of the hardware notch. Shows ⚡ + running app count.
+/// Hover opens the full Axe overlay. Styled to look like a notch extension.
 final class NotchIndicatorPanel: NSPanel {
 
-    var onOpen:        (() -> Void)?
-    var onSaveAxe:     (() -> Void)?
-    var onRestoreLast: (() -> Void)?
-    var onSettings:    (() -> Void)?
+    var onOpen: (() -> Void)?
 
-    private weak var countLabel:   NSTextField?
-    private weak var expandStack:  NSStackView?
-    private weak var sessionLabel: NSTextField?
-
-    private let collapsedW: CGFloat = 84
-    private let expandedW:  CGFloat = 320
-    private let panelH:     CGFloat = 28
-    private var centerX:    CGFloat = 0
-    private var topY:       CGFloat = 0
-    private var isExpanded  = false
+    private weak var countLabel: NSTextField?
+    private weak var pillView: NSView?
+    private var onRight: Bool = false
+    private static let pillW: CGFloat = 46
+    // Extra window space on the free end so the corner can bow outward
+    private static let edgeMargin: CGFloat = 9
     private var trackingArea: NSTrackingArea?
+    private var hoverItem: DispatchWorkItem?
 
-    convenience init(screen: NSScreen) {
-        let f = NSRect(x: screen.frame.midX - 42,
-                       y: screen.frame.maxY - 28,
-                       width: 84, height: 28)
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        return frameRect
+    }
+
+    convenience init(screen: NSScreen, onRight: Bool = false) {
+        let overlap: CGFloat = 10
+        let em  = NotchIndicatorPanel.edgeMargin
+        let pW  = NotchIndicatorPanel.pillW
+        let f: NSRect
+        if onRight {
+            let area: NSRect
+            if #available(macOS 12.0, *), let a = screen.auxiliaryTopRightArea {
+                area = a
+            } else {
+                area = NSRect(x: screen.frame.midX + 85, y: screen.frame.maxY - 24,
+                              width: screen.frame.midX - 85, height: 24)
+            }
+            // Slide overlap pt under the notch on the left side; em pt of extra
+            // space on the right for the bowing corner.
+            f = NSRect(x: area.minX - overlap,
+                       y: area.minY,
+                       width: pW + em,
+                       height: area.height)
+        } else {
+            let area: NSRect
+            if #available(macOS 12.0, *), let a = screen.auxiliaryTopLeftArea {
+                area = a
+            } else {
+                area = NSRect(x: screen.frame.minX,
+                              y: screen.frame.maxY - 24,
+                              width: screen.frame.midX - 85,
+                              height: 24)
+            }
+            // Slide overlap pt under the notch on the right side; em pt of extra
+            // space on the left for the bowing corner.
+            f = NSRect(x: area.maxX - pW + overlap - em,
+                       y: area.minY,
+                       width: pW + em,
+                       height: area.height)
+        }
         self.init(contentRect: f,
-                  styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+                  styleMask: [.borderless, .nonactivatingPanel],
                   backing: .buffered, defer: false)
-        centerX = screen.frame.midX
-        topY    = screen.frame.maxY
-        level                      = .popUpMenu
-        isReleasedWhenClosed       = false
-        backgroundColor            = .clear
-        isOpaque                   = false
-        hasShadow                  = false
-        titleVisibility            = .hidden
-        titlebarAppearsTransparent = true
-        isMovable                  = false
-        collectionBehavior         = [.canJoinAllSpaces, .stationary]
+        level                = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
+        isReleasedWhenClosed = false
+        backgroundColor      = .clear
+        isOpaque             = false
+        hasShadow            = false
+        isMovable            = false
+        collectionBehavior   = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        self.onRight         = onRight
         buildContent()
+        contentView?.layoutSubtreeIfNeeded()
+        applyPillMask()
     }
 
     private func buildContent() {
         guard let cv = contentView else { return }
         cv.wantsLayer = true
-        cv.layer?.backgroundColor = NSColor.black.cgColor
-        cv.layer?.cornerRadius    = 10
-        if #available(macOS 13.0, *) { cv.layer?.cornerCurve = .continuous }
-        // Flat top corners (sit flush against menu bar), rounded bottom
-        cv.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        cv.layer?.backgroundColor = NSColor.clear.cgColor
 
-        // ── Bolt + count (always visible) ─────────────────────────
+        let pillView = NSView()
+        pillView.wantsLayer = true
+        pillView.layer?.backgroundColor = NSColor.black.cgColor
+        pillView.translatesAutoresizingMaskIntoConstraints = false
+        self.pillView = pillView
+        cv.addSubview(pillView)
+
+        NSLayoutConstraint.activate([
+            pillView.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            pillView.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            pillView.topAnchor.constraint(equalTo: cv.topAnchor),
+            pillView.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+
         let bolt = NSImageView()
         if let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 9, weight: .bold)) {
@@ -3981,73 +4044,107 @@ final class NotchIndicatorPanel: NSPanel {
         count.translatesAutoresizingMaskIntoConstraints = false
         countLabel = count
 
-        cv.addSubview(bolt); cv.addSubview(count)
-        NSLayoutConstraint.activate([
-            bolt.centerYAnchor.constraint(equalTo: cv.centerYAnchor),
-            bolt.centerXAnchor.constraint(equalTo: cv.centerXAnchor, constant: -14),
-            bolt.widthAnchor.constraint(equalToConstant: 10),
-            bolt.heightAnchor.constraint(equalToConstant: 12),
-            count.centerYAnchor.constraint(equalTo: cv.centerYAnchor),
-            count.leadingAnchor.constraint(equalTo: bolt.trailingAnchor, constant: 4),
-        ])
+        pillView.addSubview(bolt); pillView.addSubview(count)
+        if onRight {
+            // Notch is on the left; content near leading edge
+            NSLayoutConstraint.activate([
+                bolt.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+                bolt.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 14),
+                bolt.widthAnchor.constraint(equalToConstant: 10),
+                bolt.heightAnchor.constraint(equalToConstant: 12),
+                count.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+                count.leadingAnchor.constraint(equalTo: bolt.trailingAnchor, constant: 3),
+            ])
+        } else {
+            // Notch is on the right; content near trailing edge
+            NSLayoutConstraint.activate([
+                count.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+                count.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -14),
+                bolt.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+                bolt.trailingAnchor.constraint(equalTo: count.leadingAnchor, constant: -3),
+                bolt.widthAnchor.constraint(equalToConstant: 10),
+                bolt.heightAnchor.constraint(equalToConstant: 12),
+            ])
+        }
 
-        // ── Expanded action strip (hidden by default) ──────────────
-        let strip = buildExpandStrip()
-        strip.alphaValue = 0
-        strip.translatesAutoresizingMaskIntoConstraints = false
-        cv.addSubview(strip)
-        expandStack = strip
-        NSLayoutConstraint.activate([
-            strip.topAnchor.constraint(equalTo: cv.topAnchor),
-            strip.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
-            strip.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -8),
-        ])
-
-        // Click anywhere → open main overlay
         let tap = NSClickGestureRecognizer(target: self, action: #selector(indicatorTapped))
-        cv.addGestureRecognizer(tap)
+        pillView.addGestureRecognizer(tap)
 
         refreshTracking()
     }
 
-    private func buildExpandStrip() -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal; stack.spacing = 2; stack.alignment = .centerY
+    // MARK: Shape mask
 
-        func makeBtn(_ sym: String, tip: String, sel: Selector) -> NSButton {
-            let b = NSButton(); b.isBordered = false; b.wantsLayer = true
-            b.toolTip = tip; b.target = self; b.action = sel
-            if let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
-                    .withSymbolConfiguration(.init(pointSize: 12, weight: .medium)) { b.image = img }
-            b.contentTintColor = .white
-            b.widthAnchor.constraint(equalToConstant: 26).isActive  = true
-            b.heightAnchor.constraint(equalToConstant: 26).isActive = true
-            return b
+    private func applyPillMask() {
+        guard let pv = pillView, let layer = pv.layer else { return }
+        let W = layer.bounds.width
+        let H = layer.bounds.height
+        guard W > 0, H > 0 else { return }
+
+        let em = NotchIndicatorPanel.edgeMargin  // 9
+        let Rc: CGFloat = em                     // bowing-corner radius = margin
+        let Rv: CGFloat = 10                     // convex bottom-corner radius
+        let pW = NotchIndicatorPanel.pillW       // 46
+
+        let path = CGMutablePath()
+
+        if onRight {
+            // Pill sits RIGHT of notch; notch edge is on the LEFT side of the window.
+            // Top-right corner bows outward (up-right) into the bezel.
+            // Bottom-right: convex rounded corner.
+            // Left side: flat, hidden under the notch.
+            path.move(to: CGPoint(x: W, y: H))
+            // Top edge going left (toward notch)
+            path.addLine(to: CGPoint(x: 0, y: H))
+            // Left edge going down (flat, under notch)
+            path.addLine(to: CGPoint(x: 0, y: 0))
+            // Bottom edge going right to bottom-right arc
+            path.addLine(to: CGPoint(x: pW - Rv, y: 0))
+            // Convex bottom-right: CCW arc 270°→0°, center (pW-Rv, Rv)
+            path.addArc(center: CGPoint(x: pW - Rv, y: Rv),
+                        radius: Rv,
+                        startAngle: .pi * 3 / 2, endAngle: 0, clockwise: false)
+            // Right wall straight up to start of top-right arc
+            path.addLine(to: CGPoint(x: pW, y: H - Rc))
+            // Top-right arc: CW 180°→90°, center (W, H-Rc).
+            //   Bows RIGHT — mirrors the left-side top-left arc.
+            path.addArc(center: CGPoint(x: W, y: H - Rc),
+                        radius: Rc,
+                        startAngle: .pi, endAngle: .pi / 2, clockwise: true)
+            path.closeSubpath()
+        } else {
+            // Pill sits LEFT of notch; notch edge is on the RIGHT side of the window.
+            // Top-left corner bows outward (up-left) into the bezel.
+            // Bottom-left: convex rounded corner.
+            // Right side: flat, hidden under the notch.
+            path.move(to: CGPoint(x: 0, y: H))
+            // Top edge going right
+            path.addLine(to: CGPoint(x: W, y: H))
+            // Right edge going down
+            path.addLine(to: CGPoint(x: W, y: 0))
+            // Bottom edge going left to bottom-left arc
+            path.addLine(to: CGPoint(x: em + Rv, y: 0))
+            // Convex bottom-left: CW arc 270°→180°, center (em+Rv, Rv)
+            path.addArc(center: CGPoint(x: em + Rv, y: Rv),
+                        radius: Rv,
+                        startAngle: .pi * 3 / 2, endAngle: .pi, clockwise: true)
+            // Left wall straight up to start of top-left arc
+            path.addLine(to: CGPoint(x: em, y: H - Rc))
+            // Top-left arc: CCW 0°→90°, center (0, H-Rc).
+            //   Bows LEFT — mirrors notch top-right corner curving into the bezel.
+            path.addArc(center: CGPoint(x: 0, y: H - Rc),
+                        radius: Rc,
+                        startAngle: 0, endAngle: .pi / 2, clockwise: false)
+            path.closeSubpath()
         }
 
-        func hairline() -> NSView {
-            let v = NSView(); v.wantsLayer = true
-            v.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
-            v.widthAnchor.constraint(equalToConstant: 1).isActive  = true
-            v.heightAnchor.constraint(equalToConstant: 14).isActive = true
-            return v
-        }
-
-        let sessLbl = NSTextField(labelWithString: "")
-        sessLbl.font      = .systemFont(ofSize: 10)
-        sessLbl.textColor = NSColor.white.withAlphaComponent(0.45)
-        sessLbl.isHidden  = true; sessionLabel = sessLbl
-
-        stack.addArrangedSubview(hairline())
-        stack.addArrangedSubview(makeBtn("tray.and.arrow.down.fill", tip: "Save & Axe All",       sel: #selector(saveAxeTapped)))
-        stack.addArrangedSubview(makeBtn("play.circle.fill",         tip: "Restore last session", sel: #selector(restoreTapped)))
-        stack.addArrangedSubview(sessLbl)
-        stack.addArrangedSubview(hairline())
-        stack.addArrangedSubview(makeBtn("gear",                     tip: "Settings",             sel: #selector(settingsTapped)))
-        return stack
+        let maskLayer = CAShapeLayer()
+        maskLayer.frame = layer.bounds
+        maskLayer.path  = path
+        layer.mask = maskLayer
     }
 
-    // MARK: Tracking / hover
+    // MARK: Tracking — hover opens the overlay after a brief delay
 
     private func refreshTracking() {
         guard let cv = contentView else { return }
@@ -4058,38 +4155,23 @@ final class NotchIndicatorPanel: NSPanel {
         cv.addTrackingArea(ta); trackingArea = ta
     }
 
-    override func mouseEntered(with event: NSEvent) { setExpanded(true) }
-    override func mouseExited(with event: NSEvent)  { setExpanded(false) }
-
-    private func setExpanded(_ expanding: Bool) {
-        guard expanding != isExpanded else { return }
-        isExpanded = expanding
-        let newW = expanding ? expandedW : collapsedW
-        let newF = NSRect(x: centerX - newW / 2, y: topY - panelH, width: newW, height: panelH)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = expanding ? 0.18 : 0.13
-            ctx.timingFunction = CAMediaTimingFunction(name: expanding ? .easeOut : .easeIn)
-            animator().setFrame(newF, display: true)
-            expandStack?.animator().alphaValue = expanding ? 1 : 0
-        }
+    override func mouseEntered(with event: NSEvent) {
+        let item = DispatchWorkItem { [weak self] in self?.onOpen?() }
+        hoverItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
     }
 
-    // MARK: Data update
+    override func mouseExited(with event: NSEvent) {
+        hoverItem?.cancel(); hoverItem = nil
+    }
+
+    // MARK: Data / actions
 
     func update(appCount: Int, lastSessionName: String?) {
         countLabel?.stringValue = "\(appCount)"
-        if let n = lastSessionName, !n.isEmpty {
-            sessionLabel?.stringValue = n; sessionLabel?.isHidden = false
-        } else {
-            sessionLabel?.isHidden = true
-        }
     }
 
-    // MARK: Actions
     @objc private func indicatorTapped() { onOpen?() }
-    @objc private func saveAxeTapped()   { onSaveAxe?() }
-    @objc private func restoreTapped()   { onRestoreLast?() }
-    @objc private func settingsTapped()  { onSettings?() }
 }
 
 // MARK: - App Delegate
@@ -4185,6 +4267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // Notch indicator — persistent mini-panel shown when the overlay is closed
     private var notchIndicator: NotchIndicatorPanel?
+    private var notchHoverMonitor: Any?
 
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
     var pendingSpaceRestoreSession: AppSession?
@@ -4371,6 +4454,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             object: nil, queue: .main) { _ in
             PermissionManager.shared.refreshAccessibilityState()
         }
+
+        // Create the notch indicator on launch if the setting is enabled
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.syncNotchIndicator()
+        }
+
+        // Notch indicator hardening: re-anchor after display changes, sleep/wake
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(screensDidSleep),
+            name: NSWorkspace.screensDidSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(frontmostAppChanged),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
         // Silent background update check
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
@@ -6046,6 +6148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc func activeSpaceChanged(_ note: Notification) {
+        // Update indicator visibility: full-screen spaces hide the menu bar
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.updateNotchIndicatorVisibility()
+        }
         guard let session = pendingSpaceRestoreSession else { return }
         pendingSpaceRestoreSession = nil
         spaceRestoreHUD?.dismiss()
@@ -6113,6 +6219,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
             .count
         ind.update(appCount: count, lastSessionName: SessionManager.shared.all.first?.name)
+    }
+
+    func resetNotchIndicator() {
+        notchIndicator?.orderOut(nil)
+        notchIndicator = nil
+        syncNotchIndicator()
+    }
+
+    func syncNotchIndicator() {
+        if AppSettings.notchIndicatorEnabled {
+            if notchIndicator == nil {
+                guard let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main else { return }
+                // Only create on a notch screen
+                guard #available(macOS 12.0, *), screen.auxiliaryTopLeftArea != nil else { return }
+                let ind = NotchIndicatorPanel(screen: screen, onRight: AppSettings.notchIndicatorOnRight)
+                ind.onOpen = { [weak self] in self?.openOverlayFromIndicator() }
+                notchIndicator = ind
+                updateNotchIndicator()
+            }
+            updateNotchIndicatorVisibility()
+        } else {
+            notchIndicator?.orderOut(nil)
+            notchIndicator = nil
+        }
+    }
+
+    // MARK: Notch indicator visibility helpers
+
+    /// True when the active Space has a full-screen app (menu bar is hidden).
+    private var isMenuBarHidden: Bool {
+        guard let screen = NSScreen.main else { return false }
+        // When a full-screen app hides the menu bar, visibleFrame extends all
+        // the way to frame.maxY with no reserved space at the top.
+        return screen.visibleFrame.maxY >= screen.frame.maxY - 2
+    }
+
+    /// Show or hide the indicator based on overlay state and full-screen state.
+    /// Call whenever space, frontmost app, or screen geometry changes.
+    func updateNotchIndicatorVisibility() {
+        guard let ind = notchIndicator else { return }
+        let overlayOpen = panel?.isVisible ?? false
+        if overlayOpen { return }   // showNotch/hideOverlay own this when overlay is live
+        if isMenuBarHidden {
+            ind.orderOut(nil)
+        } else {
+            ind.orderFront(nil)
+        }
+    }
+
+    // MARK: Screen / sleep observers
+
+    @objc func screenParametersChanged() {
+        // Display was added, removed, or reconfigured. Tear down the indicator
+        // and rebuild after a short settle delay so it re-anchors to the notch
+        // on whatever screen is now primary. If the new primary screen has no
+        // notch, syncNotchIndicator's guard will refuse to create one.
+        notchIndicator?.orderOut(nil)
+        notchIndicator = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !(self.panel?.isVisible ?? false) else { return }
+            self.syncNotchIndicator()
+        }
+    }
+
+    @objc func screensDidSleep() {
+        notchIndicator?.orderOut(nil)
+    }
+
+    @objc func screensDidWake() {
+        // Give the display driver time to settle before re-anchoring.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.notchIndicator?.orderOut(nil)
+            self.notchIndicator = nil
+            guard !(self.panel?.isVisible ?? false) else { return }
+            self.syncNotchIndicator()
+        }
+    }
+
+    @objc func frontmostAppChanged() {
+        // A full-screen app may have just become frontmost (or resigned).
+        // Give the Space transition a tick to settle then update visibility.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.updateNotchIndicatorVisibility()
+        }
+    }
+
+    func openOverlayFromIndicator() {
+        toggleOverlay()
+        // After the panel has appeared, watch for the mouse leaving the overlay area
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.installNotchHoverMonitor()
+        }
+    }
+
+    private func installNotchHoverMonitor() {
+        guard notchHoverMonitor == nil else { return }
+        // Use Timer(…) + RunLoop.main.add(.common) so the timer fires even while
+        // AppKit is in .eventTracking mode (which happens during mouse interaction).
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] t in
+            guard let self, let p = self.panel, p.isVisible else { t.invalidate(); return }
+            let mouse = NSEvent.mouseLocation
+            let overlayZone  = p.frame.insetBy(dx: -8, dy: -8)
+            let indicatorZone = self.notchIndicator?.frame ?? .zero
+            if !overlayZone.contains(mouse) && !indicatorZone.contains(mouse) {
+                t.invalidate()
+                self.notchHoverMonitor = nil
+                self.hideOverlay()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        notchHoverMonitor = timer
+    }
+
+    func removeNotchHoverMonitor() {
+        (notchHoverMonitor as? Timer)?.invalidate()
+        notchHoverMonitor = nil
     }
 
     @objc func killedAppDidTerminate(_ notification: Notification) {
@@ -6367,18 +6590,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if panel == nil { buildPanel(); lastBuiltStyle = .notch }
         guard let screen = NSScreen.main, let p = panel else { return }
 
-        // Create the persistent indicator on first open
-        if notchIndicator == nil {
-            let ind = NotchIndicatorPanel(screen: screen)
-            ind.onOpen        = { [weak self] in self?.toggleOverlay() }
-            ind.onSaveAxe     = { [weak self] in self?.saveSessionInlineAxeAll() }
-            ind.onRestoreLast = { [weak self] in
-                guard let s = SessionManager.shared.all.first else { return }
-                SessionManager.shared.restore(s)
-            }
-            ind.onSettings = { [weak self] in self?.settingsWindow.show() }
+        // Create or tear down the persistent indicator based on current setting
+        if AppSettings.notchIndicatorEnabled, notchIndicator == nil {
+            let ind = NotchIndicatorPanel(screen: screen, onRight: AppSettings.notchIndicatorOnRight)
+            ind.onOpen = { [weak self] in self?.openOverlayFromIndicator() }
             notchIndicator = ind
             updateNotchIndicator()
+        } else if !AppSettings.notchIndicatorEnabled {
+            notchIndicator?.orderOut(nil); notchIndicator = nil
         }
         // Hide indicator while the full overlay is open (it sits underneath)
         notchIndicator?.orderOut(nil)
@@ -6504,6 +6723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 // Restore the persistent notch indicator now that the overlay is gone
                 self?.updateNotchIndicator()
                 self?.notchIndicator?.orderFront(nil)
+                self?.removeNotchHoverMonitor()
             }
         }
     }
