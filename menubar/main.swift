@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.8.0"
+let appVersion = "2.9.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -514,6 +514,10 @@ struct AppSettings {
         get { d.bool(forKey: "notchIndicatorOnRight") }
         set { d.set(newValue, forKey: "notchIndicatorOnRight") }
     }
+    static var menuBarBadgeEnabled: Bool {
+        get { d.object(forKey: "menuBarBadgeEnabled") == nil ? true : d.bool(forKey: "menuBarBadgeEnabled") }
+        set { d.set(newValue, forKey: "menuBarBadgeEnabled") }
+    }
 }
 
 // MARK: - HotKey (Carbon — no Accessibility permission required)
@@ -630,6 +634,7 @@ struct AppEntry {
     let app:        NSRunningApplication
     let memMB:      Int?
     let cpuPercent: Double?
+    let category:   String
     var name:  String    { app.localizedName ?? app.bundleIdentifier ?? "Unknown" }
     /// Cached via `IconCache` so the first row paint always has an icon
     /// instead of a blank placeholder. Falls back to `NSRunningApplication.icon`
@@ -642,6 +647,61 @@ struct AppEntry {
         app        = a
         memMB      = residentMB(for: a.processIdentifier)
         cpuPercent = CPUSampler.shared.sample(a.processIdentifier)
+        category   = AppEntry.readCategory(a)
+    }
+
+    static func readCategory(_ a: NSRunningApplication) -> String {
+        guard let url = a.bundleURL,
+              let raw = Bundle(url: url)?.infoDictionary?["LSApplicationCategoryType"] as? String
+        else { return "Other" }
+        switch raw {
+        case "public.app-category.developer-tools":  return "Developer Tools"
+        case "public.app-category.productivity":     return "Productivity"
+        case "public.app-category.utilities":        return "Utilities"
+        case "public.app-category.entertainment":    return "Entertainment"
+        case "public.app-category.social-networking": return "Social"
+        case "public.app-category.music":            return "Music"
+        case "public.app-category.video":            return "Video"
+        case "public.app-category.graphics-design":  return "Design"
+        case "public.app-category.photography":      return "Photography"
+        case "public.app-category.finance":          return "Finance"
+        case "public.app-category.games",
+             "public.app-category.games-action",
+             "public.app-category.games-adventure",
+             "public.app-category.games-arcade",
+             "public.app-category.games-board",
+             "public.app-category.games-card",
+             "public.app-category.games-casino",
+             "public.app-category.games-dice",
+             "public.app-category.games-educational",
+             "public.app-category.games-family",
+             "public.app-category.games-kids",
+             "public.app-category.games-music",
+             "public.app-category.games-puzzle",
+             "public.app-category.games-racing",
+             "public.app-category.games-role-playing",
+             "public.app-category.games-simulation",
+             "public.app-category.games-sports",
+             "public.app-category.games-strategy",
+             "public.app-category.games-trivia",
+             "public.app-category.games-word":       return "Games"
+        case "public.app-category.education":        return "Education"
+        case "public.app-category.health-fitness":   return "Health & Fitness"
+        case "public.app-category.reference":        return "Reference"
+        case "public.app-category.news":             return "News"
+        case "public.app-category.business":         return "Business"
+        case "public.app-category.lifestyle":        return "Lifestyle"
+        default:                                     return "Other"
+        }
+    }
+}
+
+enum TableRow {
+    case sectionHeader(String)
+    case app(AppEntry)
+    var appEntry: AppEntry? {
+        guard case .app(let e) = self else { return nil }
+        return e
     }
 }
 
@@ -1196,17 +1256,42 @@ private func drawAxeIcon(px: CGFloat) {
     NSGraphicsContext.restoreGraphicsState()
 }
 
-private func makeMenuBarIcon() -> NSImage {
+private func makeMenuBarIcon(badgeCount: Int = 0) -> NSImage {
     let size: CGFloat = 18
-    let img = NSImage(size: NSSize(width: size, height: size))
+    // Badge needs a little extra horizontal room for 2-digit counts
+    let badgeW: CGFloat = badgeCount > 9 ? 13 : 10
+    let totalW = badgeCount > 0 ? size + badgeW - 4 : size
+    let img = NSImage(size: NSSize(width: totalW, height: size))
     for scale: CGFloat in [1, 2] {
         let px = size * scale
+        let tw = totalW * scale
         guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: Int(px), pixelsHigh: Int(px),
+            bitmapDataPlanes: nil, pixelsWide: Int(tw), pixelsHigh: Int(px),
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { continue }
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         drawAxeIcon(px: px)
+        if badgeCount > 0 {
+            // Badge: filled red pill in bottom-right, partially overlapping icon
+            let label = "\(min(badgeCount, 99))"
+            let bh: CGFloat = px * 0.44
+            let fontSize = px * 0.26
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
+                .foregroundColor: NSColor.white,
+            ]
+            let textSize = label.size(withAttributes: attrs)
+            let bw = max(bh, textSize.width + px * 0.14)
+            let bx = tw - bw
+            let by: CGFloat = 0
+            let badgeRect = NSRect(x: bx, y: by, width: bw, height: bh)
+            let badgePath = NSBezierPath(roundedRect: badgeRect, xRadius: bh / 2, yRadius: bh / 2)
+            NSColor(srgbRed: 0.96, green: 0.25, blue: 0.25, alpha: 1).setFill()
+            badgePath.fill()
+            let tx = bx + (bw - textSize.width) / 2
+            let ty = by + (bh - textSize.height) / 2
+            label.draw(at: NSPoint(x: tx, y: ty), withAttributes: attrs)
+        }
         NSGraphicsContext.current = nil
         img.addRepresentation(rep)
     }
@@ -1289,6 +1374,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                          AppSettings.notchIndicatorOnRight = (idx == 1)
                          (NSApp.delegate as? AppDelegate)?.resetNotchIndicator()
                      },
+            toggleRow("Show app count badge", icon: "number.circle.fill", iconColor: .systemRed,
+                      on: AppSettings.menuBarBadgeEnabled) { on in
+                          AppSettings.menuBarBadgeEnabled = on
+                          (NSApp.delegate as? AppDelegate)?.updateMenuBarIcon()
+                      },
             toggleRow("Launch at Login", icon: "arrow.circlepath", iconColor: .systemGreen,
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits", icon: "xmark.circle.fill", iconColor: .systemOrange,
@@ -4217,6 +4307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Data
     var allApps:          [AppEntry]  = []
     var filtered:         [AppEntry]  = []
+    var displayRows:      [TableRow]  = []
     var checkedPIDs:      Set<pid_t>  = []
     var sortByMemory:     Bool        = false
     var cpuRefreshTimer:  Timer?
@@ -4277,6 +4368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private var driftMissingApps: [SavedApp]             = []
     private var driftExtraApps:   [NSRunningApplication] = []
     private weak var inlineNameField: NSTextField?
+    private weak var sessionsSearchField: NSSearchField?
+    private var sessionsFilterQuery: String = ""
     private var expandedSessionID: UUID?
     var updateWindow: UpdateWindow?
     var selfUpdater:  SelfUpdater?
@@ -4485,10 +4578,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let btn = statusItem.button!
-        btn.image  = makeMenuBarIcon()
         btn.action = #selector(statusItemClicked)
         btn.target = self
         btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        updateMenuBarIcon()
+    }
+
+    func updateMenuBarIcon() {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let count = AppSettings.menuBarBadgeEnabled
+            ? NSWorkspace.shared.runningApplications
+                .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+                .count
+            : 0
+        statusItem.button?.image = makeMenuBarIcon(badgeCount: count)
     }
 
     @objc func statusItemClicked() {
@@ -5277,6 +5380,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             hdrDiv.heightAnchor.constraint(equalToConstant: 1),
         ])
 
+        // ── Search / filter bar ─────────────────────────────────────
+        let searchBar = NSView()
+        searchBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(searchBar)
+
+        let sf = NSSearchField()
+        sf.placeholderString = "Filter sessions…"
+        sf.font = .systemFont(ofSize: 12)
+        sf.focusRingType = .none
+        sf.controlSize = .small
+        sf.translatesAutoresizingMaskIntoConstraints = false
+        sf.target = self; sf.action = #selector(sessionsSearchChanged(_:))
+        (sf.cell as? NSSearchFieldCell)?.cancelButtonCell?.target = self
+        (sf.cell as? NSSearchFieldCell)?.cancelButtonCell?.action = #selector(sessionsSearchChanged(_:))
+        searchBar.addSubview(sf)
+        sessionsSearchField = sf
+
+        let searchBarH: CGFloat = 32
+        NSLayoutConstraint.activate([
+            sf.leadingAnchor.constraint(equalTo: searchBar.leadingAnchor, constant: 10),
+            sf.trailingAnchor.constraint(equalTo: searchBar.trailingAnchor, constant: -10),
+            sf.centerYAnchor.constraint(equalTo: searchBar.centerYAnchor),
+            searchBar.heightAnchor.constraint(equalToConstant: searchBarH),
+        ])
+
+        let searchDiv = divider()
+        searchDiv.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(searchDiv)
+
         // ── Scrollable sessions list ────────────────────────────────
         let listStack = FlippedStackView()
         listStack.orientation = .vertical; listStack.spacing = 0; listStack.alignment = .leading
@@ -5295,7 +5427,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         listStack.widthAnchor.constraint(equalTo: listSV.contentView.widthAnchor).isActive = true
 
         NSLayoutConstraint.activate([
-            listSV.topAnchor.constraint(equalTo: hdrDiv.bottomAnchor),
+            searchBar.topAnchor.constraint(equalTo: hdrDiv.bottomAnchor),
+            searchBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            searchBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            searchDiv.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
+            searchDiv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            searchDiv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            searchDiv.heightAnchor.constraint(equalToConstant: 1),
+            listSV.topAnchor.constraint(equalTo: searchDiv.bottomAnchor),
             listSV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             listSV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             listSV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
@@ -5522,47 +5661,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             div.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
 
-        // ── Quick save bar
-        let saveBar = buildQuickSaveBar()
-        stack.addArrangedSubview(saveBar)
-        saveBar.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        addDivider()
+        let query = sessionsFilterQuery.trimmingCharacters(in: .whitespaces)
+        let isFiltering = !query.isEmpty
 
-        // ── Permission gate banner (only when Accessibility not granted)
-        if let banner = buildPermissionGateBanner() {
-            let padWrap = NSView(); padWrap.translatesAutoresizingMaskIntoConstraints = false
-            padWrap.addSubview(banner)
-            NSLayoutConstraint.activate([
-                banner.leadingAnchor.constraint(equalTo: padWrap.leadingAnchor, constant: 10),
-                banner.trailingAnchor.constraint(equalTo: padWrap.trailingAnchor, constant: -10),
-                banner.topAnchor.constraint(equalTo: padWrap.topAnchor, constant: 8),
-                banner.bottomAnchor.constraint(equalTo: padWrap.bottomAnchor, constant: -8),
-            ])
-            stack.addArrangedSubview(padWrap)
-            padWrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        // Hide quick-save bar, permission banner, drift/suggest when filtering
+        if !isFiltering {
+            let saveBar = buildQuickSaveBar()
+            stack.addArrangedSubview(saveBar)
+            saveBar.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             addDivider()
+
+            if let banner = buildPermissionGateBanner() {
+                let padWrap = NSView(); padWrap.translatesAutoresizingMaskIntoConstraints = false
+                padWrap.addSubview(banner)
+                NSLayoutConstraint.activate([
+                    banner.leadingAnchor.constraint(equalTo: padWrap.leadingAnchor, constant: 10),
+                    banner.trailingAnchor.constraint(equalTo: padWrap.trailingAnchor, constant: -10),
+                    banner.topAnchor.constraint(equalTo: padWrap.topAnchor, constant: 8),
+                    banner.bottomAnchor.constraint(equalTo: padWrap.bottomAnchor, constant: -8),
+                ])
+                stack.addArrangedSubview(padWrap)
+                padWrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                addDivider()
+            }
+
+            if let strip = buildDriftStrip() {
+                stack.addArrangedSubview(strip)
+                strip.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                addDivider()
+            }
+
+            if let card = buildSuggestCard() {
+                stack.addArrangedSubview(card)
+                card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                addDivider()
+            }
         }
 
-        // ── Drift strip
-        if let strip = buildDriftStrip() {
-            stack.addArrangedSubview(strip)
-            strip.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            addDivider()
+        let allSessions = SessionManager.shared.all
+
+        func sessionMatches(_ s: AppSession) -> Bool {
+            let q = query.lowercased()
+            if s.name.lowercased().contains(q) { return true }
+            return s.apps.contains { $0.name.lowercased().contains(q) }
         }
 
-        // ── Suggest card
-        if let card = buildSuggestCard() {
-            stack.addArrangedSubview(card)
-            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            addDivider()
-        }
-
-        let all       = SessionManager.shared.all
+        let all = isFiltering ? allSessions.filter(sessionMatches) : allSessions
         let workflows = all.filter { $0.isFavorite }
         let recents   = all.filter { !$0.isFavorite }
 
-        if all.isEmpty {
+        if allSessions.isEmpty {
             let empty = NSTextField(labelWithString: "No sessions yet.\nType a name above and tap \"Save & Close All\".")
+            empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
+            empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            let wrap = NSView(); wrap.translatesAutoresizingMaskIntoConstraints = false
+            wrap.addSubview(empty)
+            NSLayoutConstraint.activate([
+                empty.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 16),
+                empty.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -16),
+                empty.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 24),
+                empty.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -24),
+            ])
+            stack.addArrangedSubview(wrap)
+            wrap.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            return
+        }
+
+        if isFiltering && all.isEmpty {
+            let empty = NSTextField(labelWithString: "No sessions match \"\(query)\".")
             empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
             empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
             empty.translatesAutoresizingMaskIntoConstraints = false
@@ -6071,6 +6238,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if wantSessions != isShowingSessions { toggleSessionsPanel() }
     }
 
+    @objc func sessionsSearchChanged(_ sender: NSSearchField) {
+        sessionsFilterQuery = sender.stringValue
+        refreshSessionsPanel()
+    }
+
     @objc func saveSessionFromPanel() {
         // Reuse the existing save-session flow
         saveSession()
@@ -6204,6 +6376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc func workspaceChanged() {
+        updateMenuBarIcon()
         updateNotchIndicator()   // always refresh count, even when overlay is hidden
         guard let p = panel, p.isVisible else { return }
         NSObject.cancelPreviousPerformRequests(withTarget: self,
@@ -6358,8 +6531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         guard let tv = tableView else { return }
         let visible = tv.rows(in: tv.visibleRect)
         for row in visible.location ..< (visible.location + visible.length) {
-            guard row < filtered.count else { break }
-            let e   = filtered[row]
+            guard let e = appEntry(atRow: row) else { continue }
             let pid = e.app.processIdentifier
             guard let cell = tv.view(atColumn: 0, row: row, makeIfNecessary: false) as? AppRowCell
             else { continue }
@@ -6393,7 +6565,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         searchField = nil; tableView = nil; emptyView = nil
         hintLabel = nil; sortButton = nil; axeCheckedButton = nil; halfAxeButton = nil
         overlayTabStrip = nil; appListContainer = nil
-        sessionsPanelView = nil; sessionsListStack = nil
+        sessionsPanelView = nil; sessionsListStack = nil; sessionsSearchField = nil
+        sessionsFilterQuery = ""
         settingsPanelView = nil; overlaySettingsBtn = nil; colHeaderView = nil
         listScrollHeightConstraint = nil; baseListScrollHeight = 0
         panelInnerHeightConstraint = nil; basePanelInnerHeight = 0
@@ -7482,13 +7655,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         filtered = query.isEmpty
             ? allApps
             : allApps.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        displayRows = buildDisplayRows(from: filtered)
         // Drop checked PIDs and stale CPU baselines for apps no longer running
         let alivePIDs = Set(allApps.map { $0.app.processIdentifier })
         CPUSampler.shared.purge(keeping: alivePIDs)
         checkedPIDs   = checkedPIDs.intersection(alivePIDs)
         tableView?.reloadData()
         if !filtered.isEmpty && checkedPIDs.isEmpty {
-            tableView?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            let firstApp = displayRows.firstIndex { $0.appEntry != nil } ?? 0
+            tableView?.selectRowIndexes(IndexSet(integer: firstApp), byExtendingSelection: false)
         }
         updateEmptyState(query: query)
         updateHint()
@@ -7497,6 +7672,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         if !AnimationConstants.reduceMotion {
             DispatchQueue.main.async { [weak self] in self?.animateRowsIn() }
         }
+    }
+
+    func buildDisplayRows(from apps: [AppEntry]) -> [TableRow] {
+        // Collect unique categories in appearance order
+        var seen = Set<String>()
+        var orderedCategories: [String] = []
+        for app in apps {
+            if seen.insert(app.category).inserted {
+                orderedCategories.append(app.category)
+            }
+        }
+        // Sort categories alphabetically, "Other" always last
+        orderedCategories.sort {
+            if $1 == "Other" { return true }
+            if $0 == "Other" { return false }
+            return $0 < $1
+        }
+        // Only add section headers when apps span more than one category
+        guard orderedCategories.count > 1 else { return apps.map { .app($0) } }
+        var rows: [TableRow] = []
+        for cat in orderedCategories {
+            rows.append(.sectionHeader(cat))
+            rows.append(contentsOf: apps.filter { $0.category == cat }.map { .app($0) })
+        }
+        return rows
+    }
+
+    func appEntry(atRow row: Int) -> AppEntry? {
+        guard row >= 0, row < displayRows.count else { return nil }
+        return displayRows[row].appEntry
     }
 
     /// Fade-in + 4pt vertical slide for each visible row, staggered 15ms
@@ -7710,7 +7915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         } else {
             let rows = tableView?.selectedRowIndexes ?? IndexSet()
             guard !rows.isEmpty else { return }
-            let targets = rows.compactMap { filtered[safe: $0] }
+            let targets = rows.compactMap { appEntry(atRow: $0) }
             confirmAndExecuteKill(targets: targets, force: force)
         }
     }
@@ -7727,7 +7932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             targets = filtered.filter { checkedPIDs.contains($0.app.processIdentifier) }
         } else {
             let rows = tableView?.selectedRowIndexes ?? IndexSet()
-            targets = rows.compactMap { filtered[safe: $0] }
+            targets = rows.compactMap { appEntry(atRow: $0) }
         }
         guard !targets.isEmpty else { return }
         targets.forEach { $0.app.hide() }
@@ -7742,8 +7947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     /// The Axe items render red, the Half-Axe item purple, matching the
     /// overlay's action buttons.
     func rowContextMenu(forRow row: Int) -> NSMenu? {
-        guard row >= 0, row < filtered.count else { return nil }
-        let entry = filtered[row]
+        guard let entry = appEntry(atRow: row) else { return nil }
         let pidNum = NSNumber(value: entry.app.processIdentifier)
 
         func makeItem(_ title: String, color: NSColor, selector: Selector) -> NSMenuItem {
@@ -8233,37 +8437,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     @objc func tableDoubleClicked() {
         let row = tableView?.clickedRow ?? -1
-        guard row >= 0, row < filtered.count else { return }
+        guard let e = appEntry(atRow: row) else { return }
         let force = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
-        confirmAndExecuteKill(targets: [filtered[row]], force: force)
+        confirmAndExecuteKill(targets: [e], force: force)
     }
 
     // MARK: NSTableViewDataSource
 
-    func numberOfRows(in tableView: NSTableView) -> Int { filtered.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { displayRows.count }
+
+    func tableView(_ tv: NSTableView, isGroupRow row: Int) -> Bool {
+        guard row >= 0, row < displayRows.count else { return false }
+        if case .sectionHeader = displayRows[row] { return true }
+        return false
+    }
+
+    func tableView(_ tv: NSTableView, shouldSelectRow row: Int) -> Bool {
+        return !self.tableView(tv, isGroupRow: row)
+    }
+
+    func tableView(_ tv: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if self.tableView(tv, isGroupRow: row) { return 22 }
+        return tv.rowHeight
+    }
 
     // MARK: NSTableViewDelegate
 
     func tableView(_ tv: NSTableView, viewFor col: NSTableColumn?, row: Int) -> NSView? {
-        let id = NSUserInterfaceItemIdentifier("AppRow")
-        let cell = tv.makeView(withIdentifier: id, owner: nil) as? AppRowCell
-                   ?? { let c = AppRowCell(frame: .zero); c.identifier = id; return c }()
-        let e = filtered[row]
-        let pid = e.app.processIdentifier
-        cell.appName.stringValue  = e.name
-        cell.appIcon.image        = e.icon
-        cell.statsView.configure(cpu: e.cpuPercent, mem: e.memMB)
-        cell.checkBox.state       = checkedPIDs.contains(pid) ? .on : .off
-        cell.onCheckToggle = { [weak self] checked in
-            guard let self else { return }
-            if checked { self.checkedPIDs.insert(pid) }
-            else       { self.checkedPIDs.remove(pid) }
-            self.updateHint()
-            if let rv = self.tableView?.rowView(atRow: row, makeIfNecessary: false) as? AnimatedRowView {
-                rv.springCheck()
+        switch displayRows[safe: row] {
+        case .sectionHeader(let title):
+            let id = NSUserInterfaceItemIdentifier("GroupHeader")
+            let cell = tv.makeView(withIdentifier: id, owner: nil) as? NSTableCellView
+                       ?? { let c = NSTableCellView(); c.identifier = id; return c }()
+            if cell.textField == nil {
+                let lbl = NSTextField(labelWithString: "")
+                lbl.font = .systemFont(ofSize: 9, weight: .semibold)
+                lbl.textColor = .tertiaryLabelColor
+                lbl.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(lbl); cell.textField = lbl
+                NSLayoutConstraint.activate([
+                    lbl.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 11),
+                    lbl.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                ])
             }
+            cell.textField?.stringValue = title.uppercased()
+            return cell
+
+        case .app(let e):
+            let id = NSUserInterfaceItemIdentifier("AppRow")
+            let cell = tv.makeView(withIdentifier: id, owner: nil) as? AppRowCell
+                       ?? { let c = AppRowCell(frame: .zero); c.identifier = id; return c }()
+            let pid = e.app.processIdentifier
+            cell.appName.stringValue  = e.name
+            cell.appIcon.image        = e.icon
+            cell.statsView.configure(cpu: e.cpuPercent, mem: e.memMB)
+            cell.checkBox.state       = checkedPIDs.contains(pid) ? .on : .off
+            cell.onCheckToggle = { [weak self] checked in
+                guard let self else { return }
+                if checked { self.checkedPIDs.insert(pid) }
+                else       { self.checkedPIDs.remove(pid) }
+                self.updateHint()
+                if let rv = self.tableView?.rowView(atRow: row, makeIfNecessary: false) as? AnimatedRowView {
+                    rv.springCheck()
+                }
+            }
+            return cell
+
+        default:
+            return nil
         }
-        return cell
     }
 
     /// Provide our custom row view so selection fades smoothly with extra
