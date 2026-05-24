@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.7.3"
+let appVersion = "2.7.4"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -22,10 +22,12 @@ let appVersion = "2.7.3"
 //                (Moom, Silenz et al); 3-arg form with NULL,NULL = normal user Space.
 //   Switch:      CGSShowSpaces — present on all versions probed.
 private enum CGSSpace {
-    typealias ConnFn   = @convention(c) () -> UInt32
-    typealias CreateFn = @convention(c) (UInt32, UnsafeMutableRawPointer?, CFDictionary?) -> UInt64
-    typealias AddFn    = @convention(c) (UInt32, Int32) -> UInt64
-    typealias ShowFn   = @convention(c) (UInt32, CFArray) -> Int32
+    typealias ConnFn         = @convention(c) () -> UInt32
+    typealias CreateFn       = @convention(c) (UInt32, UnsafeMutableRawPointer?, CFDictionary?) -> UInt64
+    typealias Create2Fn      = @convention(c) (UInt32, Int32) -> UInt64
+    typealias AddFn          = @convention(c) (UInt32, Int32) -> UInt64
+    typealias ShowFn         = @convention(c) (UInt32, CFArray) -> Int32
+    typealias AddDisplayFn   = @convention(c) (UInt32, UInt32, CFArray) -> Void
 
     /// Creates a new desktop Space and switches to it. Returns false if the
     /// private APIs are unavailable (caller should fall back to the manual HUD).
@@ -41,17 +43,29 @@ private enum CGSSpace {
         let cid  = conn()
         guard cid != 0 else { return false }
 
-        let sid: UInt64
+        var sid: UInt64 = 0
         if let pCreate = dlsym(lib, "CGSSpaceCreate") {
+            // 3-arg form (macOS 12–15): (connection, nil, nil) → user space type 0
             let create = unsafeBitCast(pCreate, to: CreateFn.self)
             sid = create(cid, nil, nil)
-        } else if let pAdd = dlsym(lib, "CGSAddSpace") {
+            if sid == 0 {
+                // Try 2-arg form in case signature changed
+                let create2 = unsafeBitCast(pCreate, to: Create2Fn.self)
+                sid = create2(cid, 0)
+            }
+        }
+        if sid == 0, let pAdd = dlsym(lib, "CGSAddSpace") {
             let add = unsafeBitCast(pAdd, to: AddFn.self)
             sid = add(cid, 0)
-        } else {
-            return false
         }
         guard sid != 0 else { return false }
+
+        // macOS 14+: the space must be registered with the active display
+        // before CGSShowSpaces can switch to it.
+        if let pAddDisp = dlsym(lib, "CGSAddSpacesToDisplay") {
+            let addDisp = unsafeBitCast(pAddDisp, to: AddDisplayFn.self)
+            addDisp(cid, CGMainDisplayID(), [NSNumber(value: sid)] as CFArray)
+        }
 
         _ = show(cid, [NSNumber(value: sid)] as CFArray)
         return true
@@ -1199,6 +1213,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private weak var axPermSubtitleLabel: NSTextField?
     private weak var axPermBtn: NSButton?
     private var permissionObserver: NSObjectProtocol?
+    // Standalone window category navigation
+    private weak var standaloneTabs:   NSSegmentedControl?
+    private weak var standaloneScroll: NSScrollView?
+    private var sectionAnchors: [Int: NSView] = [:]  // category index → first-section wrapper
 
     func show() {
         if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
@@ -1238,78 +1256,81 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         scroll.hasVerticalScroller   = true
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers    = true
-        scroll.drawsBackground       = false
+        scroll.drawsBackground       = true
+        scroll.backgroundColor       = .windowBackgroundColor
+        scroll.contentView.drawsBackground = false
         scroll.documentView          = root
         root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
 
+        // Category 0 = General, 1 = Behaviour, 2 = Sessions, 3 = Advanced
         addSection("General", to: root, rows: [
-            popupRow("Interface style",
+            popupRow("Interface style", icon: "macwindow.on.rectangle", iconColor: .systemBlue,
                      options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
                      selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                          AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
                      },
-            toggleRow("Launch at Login",
+            toggleRow("Launch at Login", icon: "arrow.circlepath", iconColor: .systemGreen,
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
-            toggleRow("Close overlay when last app quits",
-                      on: AppSettings.autoClose)     { AppSettings.autoClose = $0 },
-            toggleRow("Automatically install updates",
-                      on: AppSettings.autoUpdate)    { AppSettings.autoUpdate = $0 },
-        ])
+            toggleRow("Close overlay when last app quits", icon: "xmark.circle.fill", iconColor: .systemOrange,
+                      on: AppSettings.autoClose) { AppSettings.autoClose = $0 },
+            toggleRow("Automatically install updates", icon: "arrow.down.circle.fill", iconColor: .systemGreen,
+                      on: AppSettings.autoUpdate) { AppSettings.autoUpdate = $0 },
+        ], anchorCategory: 0)
 
         addSection("Axe Behaviour", to: root, rows: [
-            popupRow("Default mode",
+            popupRow("Default mode", icon: "bolt.fill", iconColor: .systemRed,
                      options: ["Graceful  (SIGTERM → SIGKILL)", "Force  (immediate SIGKILL)"],
                      selected: AppSettings.killMode.rawValue) { AppSettings.killMode = KillMode(rawValue: $0) ?? .graceful },
-            popupRow("Grace period",
+            popupRow("Grace period", icon: "clock.fill", iconColor: .systemOrange,
                      options: ["Instant", "2 seconds", "5 seconds"],
                      selected: [0.0, 2.0, 5.0].firstIndex(of: AppSettings.gracePeriod) ?? 1)
                 { AppSettings.gracePeriod = [0.0, 2.0, 5.0][safe: $0] ?? 2 },
-            toggleRow("Confirm before axing",
+            toggleRow("Confirm before axing", icon: "shield.fill", iconColor: .systemBlue,
                       on: AppSettings.confirmKill) { AppSettings.confirmKill = $0 },
-            toggleRow("Play chop sound when axing",
+            toggleRow("Play chop sound when axing", icon: "speaker.wave.2.fill", iconColor: .systemPurple,
                       on: AppSettings.soundEnabled) {
                           AppSettings.soundEnabled = $0
-                          if $0 { ChopSound.shared.play() }   // preview on enable
+                          if $0 { ChopSound.shared.play() }
                       },
             animationDemoRow(),
-            popupRow("Destruction animation",
+            popupRow("Destruction animation", icon: "sparkles", iconColor: .systemYellow,
                      options: KillAnimation.allCases.map(\.label),
                      selected: AppSettings.killAnimation.rawValue) {
                          AppSettings.killAnimation = KillAnimation(rawValue: $0) ?? .shatter
                      },
-        ])
+        ], anchorCategory: 1)
 
         addSection(pun("Battle Phrases", "Phrases"), to: root, rows: [
             phraseRow(),
         ])
 
         addSection("Workflows", to: root, rows: [
-            popupRow("Max saved workflows",
+            popupRow("Max saved workflows", icon: "tray.full.fill", iconColor: .systemBlue,
                      options: ["5", "10", "20", "50"],
                      selected: [5, 10, 20, 50].firstIndex(of: AppSettings.maxSessions) ?? 1)
                 { AppSettings.maxSessions = [5, 10, 20, 50][safe: $0] ?? 10 },
-            toggleRow("Ignore system apps when saving",
+            toggleRow("Ignore system apps when saving", icon: "square.stack.fill", iconColor: .systemGray,
                       on: AppSettings.ignoreSystemOnSave) { AppSettings.ignoreSystemOnSave = $0 },
-            toggleRow("Close others when switching workflows",
+            toggleRow("Close others when switching workflows", icon: "rectangle.on.rectangle.slash.fill", iconColor: .systemOrange,
                       on: AppSettings.closeOthersOnRestore) { AppSettings.closeOthersOnRestore = $0 },
-            popupRow("Pause & reopen delay",
+            popupRow("Pause & reopen delay", icon: "timer", iconColor: .systemPurple,
                      options: ["5 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours"],
                      selected: [5, 15, 30, 60, 120].firstIndex(of: AppSettings.scheduledReopenMinutes) ?? 1) {
                          AppSettings.scheduledReopenMinutes = [5, 15, 30, 60, 120][safe: $0] ?? 15
                      },
-        ])
+        ], anchorCategory: 2)
 
         addSection("App List", to: root, rows: [
-            toggleRow("Show background agents and helpers",
+            toggleRow("Show background agents and helpers", icon: "eye.fill", iconColor: .systemBlue,
                       on: AppSettings.showBackground) { AppSettings.showBackground = $0 },
-        ])
+        ], anchorCategory: 3)
 
         addSection("Keyboard Shortcut", to: root, rows: [
             shortcutRow(),
         ])
 
         addSection("Personality", to: root, rows: [
-            toggleRow("Punny mode  ·  go crazy on the puns",
+            toggleRow("Punny mode  ·  go crazy on the puns", icon: "face.smiling.fill", iconColor: .systemYellow,
                       on: AppSettings.punnyMode) { AppSettings.punnyMode = $0 },
         ])
 
@@ -1338,38 +1359,68 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
 
     private func buildUI(in w: NSWindow) {
+        sectionAnchors.removeAll()
+        let cv = w.contentView!
+
+        // ── Category tab bar ──────────────────────────────────────
+        let tabs = NSSegmentedControl(
+            labels: ["General", "Behaviour", "Sessions", "Advanced"],
+            trackingMode: .selectOne, target: self,
+            action: #selector(standaloneTabChanged(_:)))
+        tabs.selectedSegment  = 0
+        tabs.controlSize      = .regular
+        tabs.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(tabs)
+        standaloneTabs = tabs
+
         let scroll = buildSettingsScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        w.contentView?.addSubview(scroll)
+        cv.addSubview(scroll)
+        standaloneScroll = scroll
+
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
+            tabs.topAnchor.constraint(equalTo: cv.topAnchor, constant: 14),
+            tabs.centerXAnchor.constraint(equalTo: cv.centerXAnchor),
+            tabs.widthAnchor.constraint(equalToConstant: 360),
+            scroll.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 4),
+            scroll.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
         ])
-        w.contentView?.layoutSubtreeIfNeeded()
+
+        cv.layoutSubtreeIfNeeded()
         guard let root = scroll.documentView as? FlippedStackView else { return }
-        let contentH  = root.fittingSize.height
-        let screenH   = (w.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
-        // Cap the window so it never spills below the screen on small laptops.
-        // The scroll view handles overflow when content > available height.
-        let target    = min(contentH + 28, screenH * 0.85)
-        var f = w.frame
-        f.size.height = target
-        f.origin.y   -= (target - w.frame.height) / 2
-        w.setFrame(f, display: false)
-        w.center()
+        let screenH = (w.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let target  = min(root.fittingSize.height + 28 + 50, screenH * 0.85)
+        var f = w.frame; f.size.height = target
+        f.origin.y -= (target - w.frame.height) / 2
+        w.setFrame(f, display: false); w.center()
+    }
+
+    @objc private func standaloneTabChanged(_ sender: NSSegmentedControl) {
+        guard let scroll = standaloneScroll,
+              let anchor = sectionAnchors[sender.selectedSegment],
+              let docView = scroll.documentView else { return }
+        let pt = anchor.convert(anchor.bounds.origin, to: docView)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            scroll.contentView.animator().setBoundsOrigin(NSPoint(x: 0, y: pt.y))
+        }
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 
     // ── Section builders ─────────────────────────────────────────
 
-    private func addSection(_ title: String, to stack: NSStackView, rows: [NSView]) {
+    private func addSection(_ title: String, to stack: NSStackView, rows: [NSView],
+                            anchorCategory: Int? = nil) {
         let header = NSTextField(labelWithString: title.uppercased())
         header.font = .systemFont(ofSize: 11, weight: .semibold)
         header.textColor = .secondaryLabelColor
         let hPad = padded(header, top: 22, left: 20, bottom: 7)
         stack.addArrangedSubview(hPad)
         hPad.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        if let cat = anchorCategory { sectionAnchors[cat] = hPad }
 
         let box = NSBox(); box.boxType = .custom
         box.fillColor   = NSColor.controlBackgroundColor
@@ -1400,9 +1451,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         wrapper.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
-    private func toggleRow(_ label: String, on: Bool, handler: @escaping (Bool) -> Void) -> NSView {
+    private func toggleRow(_ label: String,
+                           icon: String? = nil, iconColor: NSColor = .controlAccentColor,
+                           on: Bool, handler: @escaping (Bool) -> Void) -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
-        row.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        row.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+        if let iconName = icon { row.addArrangedSubview(makeRowIcon(iconName, color: iconColor)) }
         let lbl = NSTextField(labelWithString: label)
         lbl.font = .systemFont(ofSize: 13, weight: .regular)
         lbl.textColor = .labelColor
@@ -1506,10 +1560,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    private func popupRow(_ label: String, options: [String], selected: Int,
+    private func popupRow(_ label: String,
+                          icon: String? = nil, iconColor: NSColor = .controlAccentColor,
+                          options: [String], selected: Int,
                           handler: @escaping (Int) -> Void) -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
         row.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        if let iconName = icon { row.addArrangedSubview(makeRowIcon(iconName, color: iconColor)) }
         let lbl = NSTextField(labelWithString: label)
         lbl.font = .systemFont(ofSize: 13, weight: .regular)
         lbl.textColor = .labelColor
@@ -1520,6 +1577,29 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let box = PopupBox(pop, handler: handler)
         row.addArrangedSubview(lbl); row.addArrangedSubview(box)
         return row
+    }
+
+    private func makeRowIcon(_ symbolName: String, color: NSColor) -> NSView {
+        let bg = NSView(); bg.wantsLayer = true
+        bg.layer?.backgroundColor = color.withAlphaComponent(0.15).cgColor
+        bg.layer?.cornerRadius    = 6
+        if #available(macOS 13.0, *) { bg.layer?.cornerCurve = .continuous }
+        let iv = NSImageView()
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .medium)) {
+            iv.image = img
+        }
+        iv.contentTintColor = color
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(iv)
+        bg.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            bg.widthAnchor.constraint(equalToConstant: 28),
+            bg.heightAnchor.constraint(equalToConstant: 28),
+            iv.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            iv.centerYAnchor.constraint(equalTo: bg.centerYAnchor),
+        ])
+        return bg
     }
 
     /// A sample app row plus a "Test Animation" button that previews the
@@ -3833,6 +3913,185 @@ final class NotchResizeHandle: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 }
 
+// MARK: - NotchIndicator
+/// Persistent mini-panel that lives in the hardware-notch area whenever Axe is
+/// running in notch mode. Shows the running-app count; hover to expand and reveal
+/// quick-action buttons. Dismissed/reshown in sync with the main overlay.
+final class NotchIndicatorPanel: NSPanel {
+
+    var onOpen:        (() -> Void)?
+    var onSaveAxe:     (() -> Void)?
+    var onRestoreLast: (() -> Void)?
+    var onSettings:    (() -> Void)?
+
+    private weak var countLabel:   NSTextField?
+    private weak var expandStack:  NSStackView?
+    private weak var sessionLabel: NSTextField?
+
+    private let collapsedW: CGFloat = 84
+    private let expandedW:  CGFloat = 320
+    private let panelH:     CGFloat = 28
+    private var centerX:    CGFloat = 0
+    private var topY:       CGFloat = 0
+    private var isExpanded  = false
+    private var trackingArea: NSTrackingArea?
+
+    convenience init(screen: NSScreen) {
+        let f = NSRect(x: screen.frame.midX - 42,
+                       y: screen.frame.maxY - 28,
+                       width: 84, height: 28)
+        self.init(contentRect: f,
+                  styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+                  backing: .buffered, defer: false)
+        centerX = screen.frame.midX
+        topY    = screen.frame.maxY
+        level                      = .popUpMenu
+        isReleasedWhenClosed       = false
+        backgroundColor            = .clear
+        isOpaque                   = false
+        hasShadow                  = false
+        titleVisibility            = .hidden
+        titlebarAppearsTransparent = true
+        isMovable                  = false
+        collectionBehavior         = [.canJoinAllSpaces, .stationary]
+        buildContent()
+    }
+
+    private func buildContent() {
+        guard let cv = contentView else { return }
+        cv.wantsLayer = true
+        cv.layer?.backgroundColor = NSColor.black.cgColor
+        cv.layer?.cornerRadius    = 10
+        if #available(macOS 13.0, *) { cv.layer?.cornerCurve = .continuous }
+        // Flat top corners (sit flush against menu bar), rounded bottom
+        cv.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+
+        // ── Bolt + count (always visible) ─────────────────────────
+        let bolt = NSImageView()
+        if let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 9, weight: .bold)) {
+            bolt.image = img
+        }
+        bolt.contentTintColor = NSColor(red: 1, green: 0.28, blue: 0.28, alpha: 1)
+        bolt.translatesAutoresizingMaskIntoConstraints = false
+
+        let count = NSTextField(labelWithString: "0")
+        count.font      = .systemFont(ofSize: 11, weight: .semibold)
+        count.textColor = .white
+        count.translatesAutoresizingMaskIntoConstraints = false
+        countLabel = count
+
+        cv.addSubview(bolt); cv.addSubview(count)
+        NSLayoutConstraint.activate([
+            bolt.centerYAnchor.constraint(equalTo: cv.centerYAnchor),
+            bolt.centerXAnchor.constraint(equalTo: cv.centerXAnchor, constant: -14),
+            bolt.widthAnchor.constraint(equalToConstant: 10),
+            bolt.heightAnchor.constraint(equalToConstant: 12),
+            count.centerYAnchor.constraint(equalTo: cv.centerYAnchor),
+            count.leadingAnchor.constraint(equalTo: bolt.trailingAnchor, constant: 4),
+        ])
+
+        // ── Expanded action strip (hidden by default) ──────────────
+        let strip = buildExpandStrip()
+        strip.alphaValue = 0
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(strip)
+        expandStack = strip
+        NSLayoutConstraint.activate([
+            strip.topAnchor.constraint(equalTo: cv.topAnchor),
+            strip.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            strip.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -8),
+        ])
+
+        // Click anywhere → open main overlay
+        let tap = NSClickGestureRecognizer(target: self, action: #selector(indicatorTapped))
+        cv.addGestureRecognizer(tap)
+
+        refreshTracking()
+    }
+
+    private func buildExpandStrip() -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal; stack.spacing = 2; stack.alignment = .centerY
+
+        func makeBtn(_ sym: String, tip: String, sel: Selector) -> NSButton {
+            let b = NSButton(); b.isBordered = false; b.wantsLayer = true
+            b.toolTip = tip; b.target = self; b.action = sel
+            if let img = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(.init(pointSize: 12, weight: .medium)) { b.image = img }
+            b.contentTintColor = .white
+            b.widthAnchor.constraint(equalToConstant: 26).isActive  = true
+            b.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            return b
+        }
+
+        func hairline() -> NSView {
+            let v = NSView(); v.wantsLayer = true
+            v.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+            v.widthAnchor.constraint(equalToConstant: 1).isActive  = true
+            v.heightAnchor.constraint(equalToConstant: 14).isActive = true
+            return v
+        }
+
+        let sessLbl = NSTextField(labelWithString: "")
+        sessLbl.font      = .systemFont(ofSize: 10)
+        sessLbl.textColor = NSColor.white.withAlphaComponent(0.45)
+        sessLbl.isHidden  = true; sessionLabel = sessLbl
+
+        stack.addArrangedSubview(hairline())
+        stack.addArrangedSubview(makeBtn("tray.and.arrow.down.fill", tip: "Save & Axe All",       sel: #selector(saveAxeTapped)))
+        stack.addArrangedSubview(makeBtn("play.circle.fill",         tip: "Restore last session", sel: #selector(restoreTapped)))
+        stack.addArrangedSubview(sessLbl)
+        stack.addArrangedSubview(hairline())
+        stack.addArrangedSubview(makeBtn("gear",                     tip: "Settings",             sel: #selector(settingsTapped)))
+        return stack
+    }
+
+    // MARK: Tracking / hover
+
+    private func refreshTracking() {
+        guard let cv = contentView else { return }
+        if let old = trackingArea { cv.removeTrackingArea(old) }
+        let ta = NSTrackingArea(rect: cv.bounds,
+                                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                owner: self, userInfo: nil)
+        cv.addTrackingArea(ta); trackingArea = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) { setExpanded(true) }
+    override func mouseExited(with event: NSEvent)  { setExpanded(false) }
+
+    private func setExpanded(_ expanding: Bool) {
+        guard expanding != isExpanded else { return }
+        isExpanded = expanding
+        let newW = expanding ? expandedW : collapsedW
+        let newF = NSRect(x: centerX - newW / 2, y: topY - panelH, width: newW, height: panelH)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = expanding ? 0.18 : 0.13
+            ctx.timingFunction = CAMediaTimingFunction(name: expanding ? .easeOut : .easeIn)
+            animator().setFrame(newF, display: true)
+            expandStack?.animator().alphaValue = expanding ? 1 : 0
+        }
+    }
+
+    // MARK: Data update
+
+    func update(appCount: Int, lastSessionName: String?) {
+        countLabel?.stringValue = "\(appCount)"
+        if let n = lastSessionName, !n.isEmpty {
+            sessionLabel?.stringValue = n; sessionLabel?.isHidden = false
+        } else {
+            sessionLabel?.isHidden = true
+        }
+    }
+
+    // MARK: Actions
+    @objc private func indicatorTapped() { onOpen?() }
+    @objc private func saveAxeTapped()   { onSaveAxe?() }
+    @objc private func restoreTapped()   { onRestoreLast?() }
+    @objc private func settingsTapped()  { onSettings?() }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate,
@@ -3867,6 +4126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         "Execution Chamber", "The Chair", "Russian Roulette", "The Scaffold",
         "The Plank", "The Dungeon", "Final Destination", "The Pit",
         "The Condemned", "End of the Line", "The Drop", "Lights Out",
+        "The Gallows Hill", "Dead Man Walking",
     ]
     var appListContainer:  NSView?         // the NSScrollView holding the app table
     var sessionsPanelView: NSView?         // replaces the table area in sessions mode
@@ -3922,6 +4182,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var phraseIndex:       Int    = 0
     var phraseTimer:       Timer?
     var usageTimer:        Timer?
+
+    // Notch indicator — persistent mini-panel shown when the overlay is closed
+    private var notchIndicator: NotchIndicatorPanel?
 
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
     var pendingSpaceRestoreSession: AppSession?
@@ -4854,6 +5117,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func buildSessionsPanel() -> NSView {
         let container = NSView()
 
+        // ── Visual background — matches NSTableView sourceList appearance ──
+        let bgFX = NSVisualEffectView()
+        bgFX.material = .sidebar
+        bgFX.blendingMode = .withinWindow
+        bgFX.state = .active
+        bgFX.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(bgFX)   // added first → sits behind all content
+
         // ── Header bar ─────────────────────────────────────────────
         let header = NSView()
         header.wantsLayer = true
@@ -4915,6 +5186,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         listSV.hasVerticalScroller = true; listSV.autohidesScrollers = true
         listSV.hasHorizontalScroller = false; listSV.horizontalScrollElasticity = .none
         listSV.drawsBackground = false
+        listSV.backgroundColor = .clear
+        listSV.contentView.drawsBackground = false
         listSV.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(listSV)
         listStack.widthAnchor.constraint(equalTo: listSV.contentView.widthAnchor).isActive = true
@@ -4924,6 +5197,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             listSV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             listSV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             listSV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            // bgFX fills the entire panel so sidebar material shows behind all content
+            bgFX.topAnchor.constraint(equalTo: container.topAnchor),
+            bgFX.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            bgFX.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            bgFX.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         return container
@@ -5820,11 +6098,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc func workspaceChanged() {
+        updateNotchIndicator()   // always refresh count, even when overlay is hidden
         guard let p = panel, p.isVisible else { return }
         NSObject.cancelPreviousPerformRequests(withTarget: self,
                                                selector: #selector(liveRefresh), object: nil)
         perform(#selector(liveRefresh), with: nil, afterDelay: 0.25)
         if isShowingSessions { refreshSessionsPanel() }
+    }
+
+    private func updateNotchIndicator() {
+        guard let ind = notchIndicator else { return }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let count = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+            .count
+        ind.update(appCount: count, lastSessionName: SessionManager.shared.all.first?.name)
     }
 
     @objc func killedAppDidTerminate(_ notification: Notification) {
@@ -5889,6 +6177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         notchPanelTopY = 0
         isShowingSessions = false; isShowingSettings = false
         lastBuiltStyle = nil
+        // Hide indicator when leaving notch mode (it only lives in notch mode)
+        notchIndicator?.orderOut(nil); notchIndicator = nil
     }
 
     func showOverlay() {
@@ -6076,6 +6366,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func showNotch() {
         if panel == nil { buildPanel(); lastBuiltStyle = .notch }
         guard let screen = NSScreen.main, let p = panel else { return }
+
+        // Create the persistent indicator on first open
+        if notchIndicator == nil {
+            let ind = NotchIndicatorPanel(screen: screen)
+            ind.onOpen        = { [weak self] in self?.toggleOverlay() }
+            ind.onSaveAxe     = { [weak self] in self?.saveSessionInlineAxeAll() }
+            ind.onRestoreLast = { [weak self] in
+                guard let s = SessionManager.shared.all.first else { return }
+                SessionManager.shared.restore(s)
+            }
+            ind.onSettings = { [weak self] in self?.settingsWindow.show() }
+            notchIndicator = ind
+            updateNotchIndicator()
+        }
+        // Hide indicator while the full overlay is open (it sits underneath)
+        notchIndicator?.orderOut(nil)
         let g = makeNotchGeometry()
 
         // Push the panel a few pixels ABOVE screen.maxY so its rendered top
@@ -6195,6 +6501,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 self?.panel?.orderOut(nil)
                 layer.opacity = 1
                 layer.transform = CATransform3DIdentity
+                // Restore the persistent notch indicator now that the overlay is gone
+                self?.updateNotchIndicator()
+                self?.notchIndicator?.orderFront(nil)
             }
         }
     }
