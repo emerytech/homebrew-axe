@@ -9,7 +9,7 @@ import Carbon.HIToolbox
 import Darwin
 import ServiceManagement
 
-let appVersion = "2.9.0"
+let appVersion = "2.9.1"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -28,47 +28,77 @@ private enum CGSSpace {
     typealias AddFn          = @convention(c) (UInt32, Int32) -> UInt64
     typealias ShowFn         = @convention(c) (UInt32, CFArray) -> Int32
     typealias AddDisplayFn   = @convention(c) (UInt32, UInt32, CFArray) -> Void
+    // Second arg is the display UUID CFString, not a CGDirectDisplayID integer.
+    typealias SetCurrentFn   = @convention(c) (UInt32, CFString, UInt64) -> Void
 
     /// Creates a new desktop Space and switches to it. Returns false if the
     /// private APIs are unavailable (caller should fall back to the manual HUD).
     static func createAndSwitch() -> Bool {
         let lib = UnsafeMutableRawPointer(bitPattern: -2)! // RTLD_DEFAULT
 
-        guard let pConn = dlsym(lib, "_CGSDefaultConnection") ?? dlsym(lib, "CGSMainConnection"),
-              let pShow = dlsym(lib, "CGSShowSpaces")
-        else { return false }
+        guard let pConn = dlsym(lib, "_CGSDefaultConnection") ?? dlsym(lib, "CGSMainConnection")
+        else { print("[CGSSpace] no connection fn"); return false }
 
         let conn = unsafeBitCast(pConn, to: ConnFn.self)
-        let show = unsafeBitCast(pShow, to: ShowFn.self)
         let cid  = conn()
-        guard cid != 0 else { return false }
+        guard cid != 0 else { print("[CGSSpace] cid=0"); return false }
+        print("[CGSSpace] cid=\(cid)")
 
+        // ── Create the new space ──────────────────────────────────────
         var sid: UInt64 = 0
         if let pCreate = dlsym(lib, "CGSSpaceCreate") {
-            // 3-arg form (macOS 12–15): (connection, nil, nil) → user space type 0
             let create = unsafeBitCast(pCreate, to: CreateFn.self)
             sid = create(cid, nil, nil)
+            print("[CGSSpace] CGSSpaceCreate(3-arg) sid=\(sid)")
             if sid == 0 {
-                // Try 2-arg form in case signature changed
                 let create2 = unsafeBitCast(pCreate, to: Create2Fn.self)
                 sid = create2(cid, 0)
+                print("[CGSSpace] CGSSpaceCreate(2-arg) sid=\(sid)")
             }
         }
         if sid == 0, let pAdd = dlsym(lib, "CGSAddSpace") {
             let add = unsafeBitCast(pAdd, to: AddFn.self)
             sid = add(cid, 0)
+            print("[CGSSpace] CGSAddSpace sid=\(sid)")
         }
-        guard sid != 0 else { return false }
+        guard sid != 0 else { print("[CGSSpace] sid=0, giving up"); return false }
 
-        // macOS 14+: the space must be registered with the active display
-        // before CGSShowSpaces can switch to it.
+        let displayID = CGMainDisplayID()
+        print("[CGSSpace] displayID=\(displayID) sid=\(sid)")
+
+        // Register the new space with the active display so the switch works
         if let pAddDisp = dlsym(lib, "CGSAddSpacesToDisplay") {
             let addDisp = unsafeBitCast(pAddDisp, to: AddDisplayFn.self)
-            addDisp(cid, CGMainDisplayID(), [NSNumber(value: sid)] as CFArray)
+            addDisp(cid, displayID, [NSNumber(value: sid)] as CFArray)
+            print("[CGSSpace] CGSAddSpacesToDisplay done")
+        } else {
+            print("[CGSSpace] CGSAddSpacesToDisplay not found")
         }
 
-        _ = show(cid, [NSNumber(value: sid)] as CFArray)
-        return true
+        // ── Switch to the new space ───────────────────────────────────
+        // CGSManagedDisplaySetCurrentSpace expects the display UUID string
+        // (CFString), not the integer CGDirectDisplayID.
+        if let pSetCurrent = dlsym(lib, "CGSManagedDisplaySetCurrentSpace") {
+            let setCurrent = unsafeBitCast(pSetCurrent, to: SetCurrentFn.self)
+            let cfUUID  = CGDisplayCreateUUIDFromDisplayID(displayID).takeRetainedValue()
+            guard let uuidStr = CFUUIDCreateString(nil, cfUUID) else { return false }
+            print("[CGSSpace] calling SetCurrentSpace uuid=\(uuidStr)")
+            setCurrent(cid, uuidStr, sid)
+            print("[CGSSpace] SetCurrentSpace returned")
+            return true
+        }
+        print("[CGSSpace] CGSManagedDisplaySetCurrentSpace not found, trying CGSShowSpaces")
+
+        // Fallback for older macOS
+        if let pShow = dlsym(lib, "CGSShowSpaces") {
+            let show = unsafeBitCast(pShow, to: ShowFn.self)
+            _ = show(cid, [NSNumber(value: sid)] as CFArray)
+            print("[CGSSpace] CGSShowSpaces done")
+            return true
+        }
+
+        print("[CGSSpace] no switch fn found")
+        return false
     }
 }
 
@@ -517,6 +547,11 @@ struct AppSettings {
     static var menuBarBadgeEnabled: Bool {
         get { d.object(forKey: "menuBarBadgeEnabled") == nil ? true : d.bool(forKey: "menuBarBadgeEnabled") }
         set { d.set(newValue, forKey: "menuBarBadgeEnabled") }
+    }
+    // 0 = newest first (default), 1 = oldest first, 2 = name A-Z
+    static var sessionsSortOrder: Int {
+        get { d.integer(forKey: "sessionsSortOrder") }
+        set { d.set(newValue, forKey: "sessionsSortOrder") }
     }
 }
 
@@ -2229,6 +2264,55 @@ private struct PersistedSessions: Codable {
 }
 
 // v3 = adds captureWindowState / windowSnapshots (optional, defaults to nil — backward-compatible).
+struct ScheduledRestore: Codable, Equatable {
+    enum Recurrence: String, Codable { case once, daily, weekly }
+    var hour:          Int
+    var minute:        Int
+    var weekday:       Int?       // Calendar weekday 1=Sun…7=Sat, only for .weekly
+    var recurrence:    Recurrence
+    var lastFiredDate: Date?
+
+    func nextFireDate(after reference: Date = Date()) -> Date? {
+        let cal = Calendar.current
+        var comps = cal.dateComponents([.year, .month, .day], from: reference)
+        comps.hour = hour; comps.minute = minute; comps.second = 0
+        guard let todayCandidate = cal.date(from: comps) else { return nil }
+
+        switch recurrence {
+        case .once:
+            return todayCandidate > reference ? todayCandidate : nil
+        case .daily:
+            if todayCandidate > reference { return todayCandidate }
+            return cal.date(byAdding: .day, value: 1, to: todayCandidate)
+        case .weekly:
+            guard let targetWD = weekday else { return nil }
+            for offset in 0...6 {
+                guard let candidate = cal.date(byAdding: .day, value: offset, to: todayCandidate)
+                else { continue }
+                if cal.component(.weekday, from: candidate) == targetWD && candidate > reference {
+                    return candidate
+                }
+            }
+            return cal.date(byAdding: .weekOfYear, value: 1, to: todayCandidate)
+        }
+    }
+
+    var displayString: String {
+        let tf = DateFormatter(); tf.dateFormat = "h:mm a"
+        var comps = DateComponents(); comps.hour = hour; comps.minute = minute
+        let timeStr = tf.string(from: Calendar.current.date(from: comps) ?? Date())
+        switch recurrence {
+        case .once:    return "Once at \(timeStr)"
+        case .daily:   return "Daily at \(timeStr)"
+        case .weekly:
+            let dayName = weekday.flatMap {
+                Calendar.current.weekdaySymbols[safe: $0 - 1]
+            } ?? "?"
+            return "\(dayName)s at \(timeStr)"
+        }
+    }
+}
+
 struct AppSession: Codable {
     let id:                  UUID
     var name:                String
@@ -2241,6 +2325,7 @@ struct AppSession: Codable {
     var lastUsed:            Date?               = nil
     var captureWindowState:  Bool                = false
     var windowSnapshots:     [AppWindowSnapshot]? = nil
+    var scheduledRestore:    ScheduledRestore?   = nil
 }
 
 final class SessionManager {
@@ -2305,6 +2390,13 @@ final class SessionManager {
         var s = all
         guard let i = s.firstIndex(where: { $0.id == id }) else { return }
         s[i].autoLaunchOnLogin = enabled
+        all = s
+    }
+
+    func setScheduledRestore(id: UUID, restore: ScheduledRestore?) {
+        var s = all
+        guard let i = s.firstIndex(where: { $0.id == id }) else { return }
+        s[i].scheduledRestore = restore
         all = s
     }
 
@@ -4039,9 +4131,11 @@ final class NotchIndicatorPanel: NSPanel {
     private weak var countLabel: NSTextField?
     private weak var pillView: NSView?
     private var onRight: Bool = false
-    private static let pillW: CGFloat = 46
-    // Extra window space on the free end so the corner can bow outward
-    private static let edgeMargin: CGFloat = 9
+
+    // All pill dimensions are derived from the menu-bar height so the proportions
+    // hold on any Mac model or display-scaling setting.
+    private static func pillW(for h: CGFloat)  -> CGFloat { (h * 1.24).rounded() }
+    private static func edgeMargin(for h: CGFloat) -> CGFloat { (h * 0.24).rounded() }
     private var trackingArea: NSTrackingArea?
     private var hoverItem: DispatchWorkItem?
 
@@ -4050,9 +4144,6 @@ final class NotchIndicatorPanel: NSPanel {
     }
 
     convenience init(screen: NSScreen, onRight: Bool = false) {
-        let overlap: CGFloat = 10
-        let em  = NotchIndicatorPanel.edgeMargin
-        let pW  = NotchIndicatorPanel.pillW
         let f: NSRect
         if onRight {
             let area: NSRect
@@ -4062,8 +4153,9 @@ final class NotchIndicatorPanel: NSPanel {
                 area = NSRect(x: screen.frame.midX + 85, y: screen.frame.maxY - 24,
                               width: screen.frame.midX - 85, height: 24)
             }
-            // Slide overlap pt under the notch on the left side; em pt of extra
-            // space on the right for the bowing corner.
+            let pW      = NotchIndicatorPanel.pillW(for: area.height)
+            let em      = NotchIndicatorPanel.edgeMargin(for: area.height)
+            let overlap = (area.height * 0.27).rounded()
             f = NSRect(x: area.minX - overlap,
                        y: area.minY,
                        width: pW + em,
@@ -4078,8 +4170,9 @@ final class NotchIndicatorPanel: NSPanel {
                               width: screen.frame.midX - 85,
                               height: 24)
             }
-            // Slide overlap pt under the notch on the right side; em pt of extra
-            // space on the left for the bowing corner.
+            let pW      = NotchIndicatorPanel.pillW(for: area.height)
+            let em      = NotchIndicatorPanel.edgeMargin(for: area.height)
+            let overlap = (area.height * 0.27).rounded()
             f = NSRect(x: area.maxX - pW + overlap - em,
                        y: area.minY,
                        width: pW + em,
@@ -4171,10 +4264,11 @@ final class NotchIndicatorPanel: NSPanel {
         let H = layer.bounds.height
         guard W > 0, H > 0 else { return }
 
-        let em = NotchIndicatorPanel.edgeMargin  // 9
-        let Rc: CGFloat = em                     // bowing-corner radius = margin
-        let Rv: CGFloat = 10                     // convex bottom-corner radius
-        let pW = NotchIndicatorPanel.pillW       // 46
+        // All geometry derived from H so proportions hold on any display.
+        let em = NotchIndicatorPanel.edgeMargin(for: H)   // ~0.24 × H
+        let Rc = em                                        // bowing-corner radius = margin
+        let Rv = (H * 0.27).rounded()                     // convex bottom-corner radius
+        let pW = NotchIndicatorPanel.pillW(for: H)        // ~1.24 × H
 
         let path = CGMutablePath()
 
@@ -4371,6 +4465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var sessionsSearchField: NSSearchField?
     private var sessionsFilterQuery: String = ""
     private var expandedSessionID: UUID?
+    private var condemningLabel: String = "Axe"
     var updateWindow: UpdateWindow?
     var selfUpdater:  SelfUpdater?
     weak var demoRowView: NSView?     // sample row in Settings for previewing animations
@@ -4484,6 +4579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     let onboardingWindow = OnboardingWindow()
     let nudgeWindow      = NudgeWindow()
     private var nudgeTimer: Timer?
+    private var scheduleTimer: Timer?
 
     // MARK: Launch
 
@@ -4553,6 +4649,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             self.syncNotchIndicator()
         }
 
+        startScheduleTimer()
+
         // Notch indicator hardening: re-anchor after display changes, sleep/wake
         NotificationCenter.default.addObserver(
             self, selector: #selector(screenParametersChanged),
@@ -4582,6 +4680,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         btn.target = self
         btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
         updateMenuBarIcon()
+    }
+
+    func updateTabStripCount() {
+        guard let tabs = overlayTabStrip else { return }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let count = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }
+            .count
+        tabs.setLabel(count > 0 ? "\(condemningLabel)  \(count)" : condemningLabel, forSegment: 0)
     }
 
     func updateMenuBarIcon() {
@@ -5355,6 +5462,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         saveBtn.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(saveBtn)
 
+        let sortBtn = NSButton()
+        sortBtn.isBordered = false
+        let sortSymName = AppSettings.sessionsSortOrder == 2 ? "textformat.abc" : "calendar"
+        if let sym = NSImage(systemSymbolName: sortSymName, accessibilityDescription: "Sort") {
+            sortBtn.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        }
+        sortBtn.contentTintColor = AppSettings.sessionsSortOrder == 0 ? .tertiaryLabelColor : .controlAccentColor
+        sortBtn.toolTip = "Sort sessions"
+        sortBtn.target = self; sortBtn.action = #selector(showSessionsSortMenu(_:))
+        sortBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(sortBtn)
+
         let headerH: CGFloat = 36
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: container.topAnchor),
@@ -5367,6 +5487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             saveBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             saveBtn.widthAnchor.constraint(equalToConstant: 28),
             saveBtn.heightAnchor.constraint(equalToConstant: 28),
+            sortBtn.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 10),
+            sortBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            sortBtn.widthAnchor.constraint(equalToConstant: 28),
+            sortBtn.heightAnchor.constraint(equalToConstant: 28),
         ])
 
         // ── Thin divider under header ───────────────────────────────
@@ -5698,7 +5822,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             }
         }
 
-        let allSessions = SessionManager.shared.all
+        let rawSessions = SessionManager.shared.all
+        let allSessions: [AppSession]
+        switch AppSettings.sessionsSortOrder {
+        case 1:  allSessions = rawSessions.sorted { $0.date < $1.date }
+        case 2:  allSessions = rawSessions.sorted {
+                     $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        default: allSessions = rawSessions  // newest first (default storage order)
+        }
 
         func sessionMatches(_ s: AppSession) -> Bool {
             let q = query.lowercased()
@@ -5806,8 +5937,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             metaLabel.lineBreakMode = .byTruncatingTail
             metaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-            let textCol = NSStackView(views: [nameLabel, metaLabel])
-            textCol.orientation = .vertical; textCol.spacing = 2; textCol.alignment = .leading
+            var textColViews: [NSView] = [nameLabel, metaLabel]
+            if let sched = session.scheduledRestore,
+               let next = sched.nextFireDate() {
+                let relFmt = RelativeDateTimeFormatter()
+                relFmt.unitsStyle = .abbreviated
+                let schedLbl = NSTextField(labelWithString: "⏰ \(sched.displayString)  ·  \(relFmt.localizedString(for: next, relativeTo: Date()))")
+                schedLbl.font = .systemFont(ofSize: 10); schedLbl.textColor = .controlAccentColor
+                schedLbl.lineBreakMode = .byTruncatingTail
+                schedLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                textColViews.append(schedLbl)
+            }
+            let textCol = NSStackView(views: textColViews)
+            textCol.orientation = .vertical; textCol.spacing = 1; textCol.alignment = .leading
             textCol.setContentHuggingPriority(.defaultLow, for: .horizontal)
             textCol.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -5951,10 +6093,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         winChk.font = .systemFont(ofSize: 11)
         winChk.translatesAutoresizingMaskIntoConstraints = false
 
+        // ── Scheduled restore controls ──────────────────────────────
+        let schedChk = NSButton(checkboxWithTitle: "Restore on a schedule", target: nil, action: nil)
+        schedChk.state = session.scheduledRestore != nil ? .on : .off
+        schedChk.translatesAutoresizingMaskIntoConstraints = false
+
+        let existingSched = session.scheduledRestore
+        var schedTimeComps = DateComponents()
+        schedTimeComps.hour   = existingSched?.hour   ?? 9
+        schedTimeComps.minute = existingSched?.minute ?? 0
+        let schedTimePicker = NSDatePicker()
+        schedTimePicker.datePickerStyle  = .textField
+        schedTimePicker.datePickerElements = .hourMinute
+        schedTimePicker.dateValue = Calendar.current.date(from: schedTimeComps) ?? Date()
+        schedTimePicker.isEnabled = session.scheduledRestore != nil
+        schedTimePicker.translatesAutoresizingMaskIntoConstraints = false
+
+        let schedRecurPop = NSPopUpButton(frame: .zero, pullsDown: false)
+        schedRecurPop.addItems(withTitles: ["Once", "Daily", "Weekly"])
+        schedRecurPop.selectItem(at: {
+            switch existingSched?.recurrence {
+            case .once: return 0; case .daily: return 1; case .weekly: return 2; default: return 1
+            }
+        }())
+        schedRecurPop.isEnabled = session.scheduledRestore != nil
+        schedRecurPop.translatesAutoresizingMaskIntoConstraints = false
+
+        let weekdays = Calendar.current.weekdaySymbols  // ["Sunday", "Monday", ...]
+        let schedDayPop = NSPopUpButton(frame: .zero, pullsDown: false)
+        schedDayPop.addItems(withTitles: weekdays)
+        let currentWD = existingSched?.weekday ?? 2  // default Monday (weekday 2)
+        schedDayPop.selectItem(at: max(0, currentWD - 1))
+        schedDayPop.isEnabled = session.scheduledRestore != nil && existingSched?.recurrence == .weekly
+        schedDayPop.translatesAutoresizingMaskIntoConstraints = false
+
+        let schedToggleAction = ActionBox { [weak schedChk, weak schedTimePicker, weak schedRecurPop, weak schedDayPop] in
+            let on = schedChk?.state == .on
+            schedTimePicker?.isEnabled = on
+            schedRecurPop?.isEnabled   = on
+            schedDayPop?.isEnabled     = on && schedRecurPop?.indexOfSelectedItem == 2
+        }
+        schedChk.target = schedToggleAction; schedChk.action = #selector(ActionBox.invoke)
+
+        let schedRecurAction = ActionBox { [weak schedRecurPop, weak schedDayPop] in
+            schedDayPop?.isEnabled = schedRecurPop?.indexOfSelectedItem == 2
+        }
+        schedRecurPop.target = schedRecurAction; schedRecurPop.action = #selector(ActionBox.invoke)
+
         av.addSubview(nameField); av.addSubview(hkLbl)
         av.addSubview(recorder);  av.addSubview(clearBtn)
         av.addSubview(primLbl);   av.addSubview(primPop)
         av.addSubview(autoChk);   av.addSubview(winChk)
+        av.addSubview(schedChk);  av.addSubview(schedTimePicker)
+        av.addSubview(schedRecurPop); av.addSubview(schedDayPop)
         NSLayoutConstraint.activate([
             nameField.topAnchor.constraint(equalTo: av.topAnchor),
             nameField.leadingAnchor.constraint(equalTo: av.leadingAnchor),
@@ -5975,6 +6166,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             winChk.leadingAnchor.constraint(equalTo: av.leadingAnchor),
             winChk.trailingAnchor.constraint(equalTo: av.trailingAnchor),
             winChk.topAnchor.constraint(equalTo: autoChk.bottomAnchor, constant: 10),
+            schedChk.leadingAnchor.constraint(equalTo: av.leadingAnchor),
+            schedChk.topAnchor.constraint(equalTo: winChk.bottomAnchor, constant: 10),
+            schedTimePicker.leadingAnchor.constraint(equalTo: av.leadingAnchor, constant: 20),
+            schedTimePicker.topAnchor.constraint(equalTo: schedChk.bottomAnchor, constant: 8),
+            schedRecurPop.leadingAnchor.constraint(equalTo: schedTimePicker.trailingAnchor, constant: 8),
+            schedRecurPop.centerYAnchor.constraint(equalTo: schedTimePicker.centerYAnchor),
+            schedDayPop.leadingAnchor.constraint(equalTo: schedRecurPop.trailingAnchor, constant: 8),
+            schedDayPop.centerYAnchor.constraint(equalTo: schedTimePicker.centerYAnchor),
+            av.bottomAnchor.constraint(equalTo: schedTimePicker.bottomAnchor, constant: 4),
         ])
         alert.accessoryView = av; alert.window.initialFirstResponder = nameField
 
@@ -6009,6 +6209,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             SessionManager.shared.setWindowSnapshots(id: session.id, snapshots: snapshots)
         } else if winChk.state == .off {
             SessionManager.shared.setWindowSnapshots(id: session.id, snapshots: nil)
+        }
+        if schedChk.state == .on {
+            let pickerComps = Calendar.current.dateComponents([.hour, .minute], from: schedTimePicker.dateValue)
+            let recurrence: ScheduledRestore.Recurrence = [.once, .daily, .weekly][safe: schedRecurPop.indexOfSelectedItem] ?? .daily
+            let wd: Int? = recurrence == .weekly ? schedDayPop.indexOfSelectedItem + 1 : nil
+            let sched = ScheduledRestore(hour: pickerComps.hour ?? 9,
+                                         minute: pickerComps.minute ?? 0,
+                                         weekday: wd,
+                                         recurrence: recurrence,
+                                         lastFiredDate: session.scheduledRestore?.lastFiredDate)
+            SessionManager.shared.setScheduledRestore(id: session.id, restore: sched)
+        } else {
+            SessionManager.shared.setScheduledRestore(id: session.id, restore: nil)
         }
         completion()
     }
@@ -6243,6 +6456,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         refreshSessionsPanel()
     }
 
+    @objc func showSessionsSortMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let opts = [
+            (0, "Newest First",  "arrow.down.circle"),
+            (1, "Oldest First",  "arrow.up.circle"),
+            (2, "Name A–Z",      "textformat.abc"),
+        ]
+        for (idx, title, icon) in opts {
+            let item = NSMenuItem(title: title, action: #selector(setSessionsSort(_:)), keyEquivalent: "")
+            item.target = self; item.tag = idx
+            item.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+            if AppSettings.sessionsSortOrder == idx { item.state = .on }
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc func setSessionsSort(_ sender: NSMenuItem) {
+        AppSettings.sessionsSortOrder = sender.tag
+        refreshSessionsPanel()
+    }
+
     @objc func saveSessionFromPanel() {
         // Reuse the existing save-session flow
         saveSession()
@@ -6255,7 +6491,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let sessions = SessionManager.shared.all
         guard sender.tag < sessions.count else { return }
         SessionManager.shared.restore(sessions[sender.tag])
-        hideOverlay()
     }
 
     @objc func deleteSessionFromPanel(_ sender: NSButton) {
@@ -6287,17 +6522,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func restoreOnNewSpace(_ session: AppSession) {
-        // Confirm before creating a new Space and restarting apps
-        let n = session.apps.count
-        let alert = NSAlert()
-        alert.messageText     = "Open \"\(session.name)\" on a New Space?"
-        alert.informativeText = "\(n) app\(n == 1 ? "" : "s") will open on a new desktop Space. " +
-                                "Any already running will be restarted there."
-        alert.addButton(withTitle: "Create Space & Open")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        hideOverlay()
         pendingSpaceRestoreSession = session
 
         // Try to create and switch to a new Space automatically.
@@ -6379,6 +6603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         updateMenuBarIcon()
         updateNotchIndicator()   // always refresh count, even when overlay is hidden
         guard let p = panel, p.isVisible else { return }
+        updateTabStripCount()
         NSObject.cancelPreviousPerformRequests(withTarget: self,
                                                selector: #selector(liveRefresh), object: nil)
         perform(#selector(liveRefresh), with: nil, afterDelay: 0.25)
@@ -6468,6 +6693,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             self.notchIndicator = nil
             guard !(self.panel?.isVisible ?? false) else { return }
             self.syncNotchIndicator()
+        }
+    }
+
+    // MARK: Scheduled restores
+
+    func startScheduleTimer() {
+        checkScheduledRestores()
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            self?.checkScheduledRestores()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        scheduleTimer = t
+    }
+
+    func checkScheduledRestores() {
+        let now = Date()
+        var sessions = SessionManager.shared.all
+        var changed = false
+        for i in sessions.indices {
+            guard var sched = sessions[i].scheduledRestore else { continue }
+            let reference = sched.lastFiredDate ?? Date.distantPast
+            guard let next = sched.nextFireDate(after: reference), next <= now else { continue }
+
+            // Restore on a new Space without showing the confirmation alert
+            pendingSpaceRestoreSession = sessions[i]
+            if !createAndSwitchToNewSpace() {
+                // CGS API unavailable — fall back to restoring on current space
+                pendingSpaceRestoreSession = nil
+                SessionManager.shared.restore(sessions[i])
+            }
+
+            if sched.recurrence == .once {
+                sessions[i].scheduledRestore = nil
+            } else {
+                sched.lastFiredDate = now
+                sessions[i].scheduledRestore = sched
+            }
+            changed = true
+        }
+        if changed {
+            SessionManager.shared.all = sessions
+            if isShowingSessions { refreshSessionsPanel() }
         }
     }
 
@@ -6585,7 +6852,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         stopPhraseCycling()
         currentKillPhrase = ""
         isShowingSessions = false; isShowingSettings = false
-        overlayTabStrip?.setLabel(choppingBlockNames.randomElement() ?? "Axe", forSegment: 0)
+        condemningLabel = choppingBlockNames.randomElement() ?? "Axe"
+        overlayTabStrip?.setLabel(condemningLabel, forSegment: 0)
+        updateTabStripCount()
         // Sync view visibility to match the reset state — overlay may have been
         // dismissed while sessions or settings was open, leaving views in the
         // wrong hidden state.
