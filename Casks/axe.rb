@@ -7,7 +7,7 @@ cask "axe" do
   desc "Spotlight-style overlay to quickly kill running apps"
   homepage "https://github.com/emerytech/homebrew-axe"
 
-  depends_on :macos
+  depends_on macos: ">= :ventura"
 
   app "Axe.app"
 

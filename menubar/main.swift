@@ -7,9 +7,10 @@ import AppKit
 import AVFoundation
 import Carbon.HIToolbox
 import Darwin
+import IOKit
 import ServiceManagement
 
-let appVersion = "2.9.1"
+let appVersion = "3.0.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -217,6 +218,66 @@ final class ChopSound {
 enum KillMode: Int  { case graceful = 0, force = 1 }
 enum UIStyle:  Int  { case spotlight = 0, popover = 1, notch = 2 }
 
+/// Visual skin applied to the notch hub background (Appearance › Skin Gallery).
+enum NotchSkin: Int, CaseIterable {
+    case classic = 0, liquidGlass = 1, starfield = 2, circuit = 3, customImage = 4
+
+    var label: String {
+        switch self {
+        case .classic: return "Classic"; case .liquidGlass: return "Liquid Glass"
+        case .starfield: return "Starfield"; case .circuit: return "Circuit"
+        case .customImage: return "Custom Image"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .classic:     return "Solid black. Matches the hardware bezel exactly."
+        case .liquidGlass: return "Translucent frosted blur over your desktop."
+        case .starfield:   return "Animated stars drifting behind the hub."
+        case .circuit:     return "Subtle circuit-trace texture."
+        case .customImage: return "Use your own image as the backdrop."
+        }
+    }
+    /// Only these render for real; others show a "Soon" badge and aren't selectable.
+    var isImplemented: Bool { self == .classic || self == .liquidGlass }
+
+    /// Background view for a notch surface in this skin (clipped to `corners`).
+    func makeHubBackground(cornerRadius r: CGFloat, corners: CACornerMask) -> NSView {
+        switch self {
+        case .liquidGlass:
+            let container = NSView(); container.wantsLayer = true
+            container.layer?.cornerRadius = r; container.layer?.cornerCurve = .continuous
+            container.layer?.maskedCorners = corners; container.layer?.masksToBounds = true
+            let fx = NSVisualEffectView()
+            fx.material = .hudWindow            // darkest frosted material → white content stays legible
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            fx.appearance = NSAppearance(named: .darkAqua)
+            fx.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(fx)
+            let scrim = NSView(); scrim.wantsLayer = true
+            scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
+            scrim.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(scrim)
+            for v in [fx, scrim] {
+                NSLayoutConstraint.activate([
+                    v.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                    v.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                    v.topAnchor.constraint(equalTo: container.topAnchor),
+                    v.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+                ])
+            }
+            return container
+        case .classic, .starfield, .circuit, .customImage:
+            let v = NSView(); v.wantsLayer = true
+            v.layer?.backgroundColor = NSColor.black.cgColor
+            v.layer?.cornerRadius = r; v.layer?.cornerCurve = .continuous
+            v.layer?.maskedCorners = corners; v.layer?.masksToBounds = true
+            return v
+        }
+    }
+}
+
 // Destruction animation played as a row is axed.
 enum KillAnimation: Int, CaseIterable {
     case shatter  = 0  // breaks into a grid of tiles that fall under gravity
@@ -403,11 +464,9 @@ struct AppSettings {
         set { d.set(newValue, forKey: "punnyMode") }
     }
     static var launchAtLogin: Bool {
-        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
-        return false
+        SMAppService.mainApp.status == .enabled
     }
     static func setLaunchAtLogin(_ on: Bool) {
-        guard #available(macOS 13.0, *) else { return }
         try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
     }
     // Global hotkey stored as Carbon key code + Carbon modifier flags + display character
@@ -540,6 +599,32 @@ struct AppSettings {
         get { d.bool(forKey: "notchIndicatorEnabled") }
         set { d.set(newValue, forKey: "notchIndicatorEnabled") }
     }
+    /// The hover-expand notch hub (centered on the notch). Defaults ON.
+    static var notchHubEnabled: Bool {
+        get { d.object(forKey: "notchHubEnabled") == nil ? true : d.bool(forKey: "notchHubEnabled") }
+        set { d.set(newValue, forKey: "notchHubEnabled") }
+    }
+    /// Visual skin for the notch hub background (default classic = raw 0).
+    static var notchSkin: NotchSkin {
+        get { NotchSkin(rawValue: d.integer(forKey: "notchSkin")) ?? .classic }
+        set { d.set(newValue.rawValue, forKey: "notchSkin") }
+    }
+    /// Global ⌥⌘V to open the clipboard panel. Defaults ON.
+    static var clipboardHotkeyEnabled: Bool {
+        get { d.object(forKey: "clipboardHotkeyEnabled") == nil ? true : d.bool(forKey: "clipboardHotkeyEnabled") }
+        set { d.set(newValue, forKey: "clipboardHotkeyEnabled") }
+    }
+    /// Auto-paste a clicked clip into the previous app (needs Accessibility). Opt-in.
+    static var autoPasteEnabled: Bool {
+        get { d.bool(forKey: "autoPasteEnabled") }
+        set { d.set(newValue, forKey: "autoPasteEnabled") }
+    }
+    /// Set the first time the user actually axes an app. Drives the one-time
+    /// first-overlay coachmark in the hint bar, which auto-dismisses afterward.
+    static var hasMadeFirstKill: Bool {
+        get { d.bool(forKey: "hasMadeFirstKill") }
+        set { d.set(newValue, forKey: "hasMadeFirstKill") }
+    }
     static var notchIndicatorOnRight: Bool {
         get { d.bool(forKey: "notchIndicatorOnRight") }
         set { d.set(newValue, forKey: "notchIndicatorOnRight") }
@@ -571,7 +656,8 @@ private let hotKeyCallback: EventHandlerUPP = { _, inEvent, ud -> OSStatus in
                       MemoryLayout<EventHotKeyID>.size, nil, &hkID)
     guard hkID.signature == fourCC("axe!") else { return noErr }
     let d = Unmanaged<AppDelegate>.fromOpaque(ud).takeUnretainedValue()
-    DispatchQueue.main.async { d.hotkeyPressed() }
+    let id = hkID.id
+    DispatchQueue.main.async { d.hotkeyPressed(id: id) }
     return noErr
 }
 
@@ -1234,8 +1320,14 @@ final class EmptyStateView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(_ msg: String) {
+    func show(_ msg: String, symbol: String = "checkmark.circle") {
         label.stringValue = msg
+        // Match the glyph to the meaning: a checkmark reads as "all done" for an
+        // empty app list, but a search that finds nothing should show a magnifier.
+        if let sym = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            iconView.image = sym.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 28, weight: .ultraLight))
+        }
         guard isHidden else { return }
         isHidden = false
         guard !AnimationConstants.reduceMotion else { return }
@@ -1342,16 +1434,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private weak var axPermBtn: NSButton?
     private var permissionObserver: NSObjectProtocol?
     // Standalone window category navigation
-    private weak var standaloneTabs:   NSSegmentedControl?
-    private weak var standaloneScroll: NSScrollView?
-    private var sectionAnchors: [Int: NSView] = [:]  // category index → first-section wrapper
+    private var sectionAnchors: [Int: NSView] = [:]  // legacy; still referenced by addSection(anchorCategory:)
+    private var entries: [SettingsEntry] = []
+    private weak var sidebarStack: NSStackView?
+    private weak var detailContainer: NSView?
+    private var rowViews: [String: SidebarRowView] = [:]
+    private var selectedID = "general"
+    private var currentDetail: NSView?
 
     func show() {
         if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 0),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 540),
                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Axe Settings"
-        w.minSize = NSSize(width: 460, height: 360)
+        w.minSize = NSSize(width: 580, height: 460)
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.center()
@@ -1398,6 +1494,21 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                      selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                          AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
                      },
+            toggleRow("Show notch hub", icon: "macwindow", iconColor: .systemIndigo,
+                      on: AppSettings.notchHubEnabled) { on in
+                          AppSettings.notchHubEnabled = on
+                          (NSApp.delegate as? AppDelegate)?.resetNotchHub()
+                      },
+            toggleRow("Clipboard hotkey  ·  ⌥⌘V", icon: "doc.on.clipboard", iconColor: .systemTeal,
+                      on: AppSettings.clipboardHotkeyEnabled) { on in
+                          AppSettings.clipboardHotkeyEnabled = on
+                          (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey()
+                      },
+            toggleRow("Auto-paste clipboard items  ·  needs Accessibility", icon: "arrow.down.doc.fill", iconColor: .systemTeal,
+                      on: AppSettings.autoPasteEnabled) { on in
+                          AppSettings.autoPasteEnabled = on
+                          if on && !AXIsProcessTrusted() { PermissionManager.shared.requestAccessibility() }
+                      },
             toggleRow("Show notch indicator", icon: "oval.tophalf.filled", iconColor: .systemGray,
                       on: AppSettings.notchIndicatorEnabled) { [weak self] on in
                           AppSettings.notchIndicatorEnabled = on
@@ -1414,7 +1525,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                           AppSettings.menuBarBadgeEnabled = on
                           (NSApp.delegate as? AppDelegate)?.updateMenuBarIcon()
                       },
-            toggleRow("Launch at Login", icon: "arrow.circlepath", iconColor: .systemGreen,
+            toggleRow("Launch at login", icon: "arrow.circlepath", iconColor: .systemGreen,
                       on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
             toggleRow("Close overlay when last app quits", icon: "xmark.circle.fill", iconColor: .systemOrange,
                       on: AppSettings.autoClose) { AppSettings.autoClose = $0 },
@@ -1472,7 +1583,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("Keyboard Shortcut", to: root, rows: [
             shortcutRow(),
-        ])
+        ], anchorCategory: 4)
 
         addSection("Personality", to: root, rows: [
             toggleRow("Punny mode  ·  go crazy on the puns", icon: "face.smiling.fill", iconColor: .systemYellow,
@@ -1481,19 +1592,27 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         addSection("Permissions", to: root, rows: [
             permissionRow(in: root.window ?? NSApp.keyWindow ?? NSWindow()),
-        ])
+        ], anchorCategory: 5)
 
         permissionObserver = NotificationCenter.default.addObserver(
             forName: .permissionStateChanged, object: nil, queue: .main) { [weak self] _ in
             self?.refreshPermissionRow()
         }
 
+        let resetBtn = NSButton(title: "Reset to Defaults…", target: self,
+                                action: #selector(resetToDefaultsTapped))
+        resetBtn.bezelStyle  = .rounded
+        resetBtn.controlSize = .small
+        let resetPad = padded(resetBtn, top: 20, bottom: 4)
+        root.addArrangedSubview(resetPad)
+        resetPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
         let div = NSBox(); div.boxType = .separator
         div.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(div)
         div.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        let ver = NSTextField(labelWithString: "Axe v\(appVersion)  ·  emerytech/homebrew-axe")
+        let ver = NSTextField(labelWithString: "Axe v\(appVersion)  ·  axe-app.com")
         ver.font = .systemFont(ofSize: 11); ver.textColor = .quaternaryLabelColor
         ver.alignment = .center
         let verPad = padded(ver, top: 10, bottom: 12)
@@ -1503,56 +1622,377 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         return scroll
     }
 
+    // ── Sidebar + detail (NotchSpace-style) ───────────────────────
     private func buildUI(in w: NSWindow) {
-        sectionAnchors.removeAll()
         let cv = w.contentView!
+        cv.subviews.forEach { $0.removeFromSuperview() }
+        rowViews.removeAll(); currentDetail = nil
+        entries = buildEntries()
 
-        // ── Category tab bar ──────────────────────────────────────
-        let tabs = NSSegmentedControl(
-            labels: ["General", "Behaviour", "Sessions", "Advanced"],
-            trackingMode: .selectOne, target: self,
-            action: #selector(standaloneTabChanged(_:)))
-        tabs.selectedSegment  = 0
-        tabs.controlSize      = .regular
-        tabs.translatesAutoresizingMaskIntoConstraints = false
-        cv.addSubview(tabs)
-        standaloneTabs = tabs
+        let side = NSVisualEffectView()
+        side.material = .sidebar; side.blendingMode = .behindWindow
+        side.state = .followsWindowActiveState
+        side.translatesAutoresizingMaskIntoConstraints = false
+        let list = FlippedStackView()
+        list.orientation = .vertical; list.spacing = 2; list.alignment = .leading
+        list.edgeInsets = NSEdgeInsets(top: 12, left: 10, bottom: 12, right: 10)
+        list.translatesAutoresizingMaskIntoConstraints = false
+        side.addSubview(list); sidebarStack = list
 
-        let scroll = buildSettingsScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        cv.addSubview(scroll)
-        standaloneScroll = scroll
+        let detail = NSView()
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        detailContainer = detail
 
+        cv.addSubview(side); cv.addSubview(detail)
         NSLayoutConstraint.activate([
-            tabs.topAnchor.constraint(equalTo: cv.topAnchor, constant: 14),
-            tabs.centerXAnchor.constraint(equalTo: cv.centerXAnchor),
-            tabs.widthAnchor.constraint(equalToConstant: 360),
-            scroll.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 4),
-            scroll.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            side.topAnchor.constraint(equalTo: cv.topAnchor),
+            side.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            side.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            side.widthAnchor.constraint(equalToConstant: 216),
+            list.topAnchor.constraint(equalTo: side.topAnchor),
+            list.leadingAnchor.constraint(equalTo: side.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: side.trailingAnchor),
+            detail.topAnchor.constraint(equalTo: cv.topAnchor),
+            detail.leadingAnchor.constraint(equalTo: side.trailingAnchor),
+            detail.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            detail.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
         ])
-
-        cv.layoutSubtreeIfNeeded()
-        guard let root = scroll.documentView as? FlippedStackView else { return }
-        let screenH = (w.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
-        let target  = min(root.fittingSize.height + 28 + 50, screenH * 0.85)
-        var f = w.frame; f.size.height = target
-        f.origin.y -= (target - w.frame.height) / 2
-        w.setFrame(f, display: false); w.center()
+        populateSidebar()
+        select(id: selectedID)
     }
 
-    @objc private func standaloneTabChanged(_ sender: NSSegmentedControl) {
-        guard let scroll = standaloneScroll,
-              let anchor = sectionAnchors[sender.selectedSegment],
-              let docView = scroll.documentView else { return }
-        let pt = anchor.convert(anchor.bounds.origin, to: docView)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.25
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            scroll.contentView.animator().setBoundsOrigin(NSPoint(x: 0, y: pt.y))
+    private func populateSidebar() {
+        guard let list = sidebarStack else { return }
+        list.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        rowViews.removeAll()
+        func addRow(_ e: SettingsEntry) {
+            let badge = makeRowIcon(e.symbol, color: e.tint)
+            let r = SidebarRowView(entry: e, iconBadge: badge)
+            r.onSelect = { [weak self] in self?.select(id: e.id) }
+            if e.setOn != nil {
+                r.onToggle = { [weak self] on in e.setOn?(on); self?.refreshModuleRows() }
+            }
+            list.addArrangedSubview(r)
+            r.widthAnchor.constraint(equalTo: list.widthAnchor, constant: -20).isActive = true
+            rowViews[e.id] = r
         }
-        scroll.reflectScrolledClipView(scroll.contentView)
+        entries.filter { $0.group == .module }.forEach(addRow)
+        let hdr = NSTextField(labelWithString: "APP")
+        hdr.font = .systemFont(ofSize: 10, weight: .semibold); hdr.textColor = .tertiaryLabelColor
+        let hPad = padded(hdr, top: 16, left: 12, bottom: 4)
+        list.addArrangedSubview(hPad)
+        hPad.widthAnchor.constraint(equalTo: list.widthAnchor, constant: -20).isActive = true
+        entries.filter { $0.group == .app }.forEach(addRow)
+    }
+
+    private func select(id: String) {
+        selectedID = id
+        rowViews.forEach { $0.value.setSelected($0.key == id) }
+        guard let e = entries.first(where: { $0.id == id }), let container = detailContainer else { return }
+        currentDetail?.removeFromSuperview()
+        let page = e.makeDetail(self)
+        page.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(page)
+        NSLayoutConstraint.activate([
+            page.topAnchor.constraint(equalTo: container.topAnchor),
+            page.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            page.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            page.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        currentDetail = page
+    }
+
+    private func refreshModuleRows() { rowViews.values.forEach { $0.refreshFromSettings() } }
+
+    private func pageScroll(_ build: (_ root: NSStackView) -> Void) -> NSScrollView {
+        let root = FlippedStackView()
+        root.orientation = .vertical; root.spacing = 0; root.alignment = .leading
+        root.translatesAutoresizingMaskIntoConstraints = false
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = root
+        root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
+        build(root)
+        return scroll
+    }
+
+    private func buildEntries() -> [SettingsEntry] {
+        [
+            SettingsEntry(id: "notchHub", group: .module, title: "Notch Hub", symbol: "macwindow", tint: .systemIndigo,
+                          isOn: { AppSettings.notchHubEnabled },
+                          setOn: { AppSettings.notchHubEnabled = $0; (NSApp.delegate as? AppDelegate)?.resetNotchHub() },
+                          makeDetail: { $0.buildNotchHubDetail() }),
+            SettingsEntry(id: "clipboard", group: .module, title: "Clipboard", symbol: "doc.on.clipboard", tint: .systemTeal,
+                          isOn: { AppSettings.clipboardHotkeyEnabled },
+                          setOn: { AppSettings.clipboardHotkeyEnabled = $0; (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey() },
+                          makeDetail: { $0.buildClipboardDetail() }),
+            SettingsEntry(id: "badge", group: .module, title: "Menu-bar badge", symbol: "number.circle.fill", tint: .systemRed,
+                          isOn: { AppSettings.menuBarBadgeEnabled },
+                          setOn: { AppSettings.menuBarBadgeEnabled = $0; (NSApp.delegate as? AppDelegate)?.updateMenuBarIcon() },
+                          makeDetail: { $0.buildBadgeDetail() }),
+            SettingsEntry(id: "general", group: .app, title: "General", symbol: "gearshape", tint: .systemGray,
+                          makeDetail: { $0.buildGeneralPage() }),
+            SettingsEntry(id: "appearance", group: .app, title: "Appearance", symbol: "paintbrush", tint: .systemPink,
+                          makeDetail: { $0.buildAppearancePage() }),
+            SettingsEntry(id: "behaviour", group: .app, title: "Behaviour", symbol: "bolt.circle", tint: .systemOrange,
+                          makeDetail: { $0.buildBehaviourPage() }),
+            SettingsEntry(id: "workflows", group: .app, title: "Workflows", symbol: "square.stack.3d.up", tint: .systemBlue,
+                          makeDetail: { $0.buildWorkflowsPage() }),
+            SettingsEntry(id: "shortcuts", group: .app, title: "Shortcuts", symbol: "keyboard", tint: .systemGray,
+                          makeDetail: { $0.buildShortcutsPage() }),
+            SettingsEntry(id: "permissions", group: .app, title: "Permissions", symbol: "lock.shield", tint: .systemGreen,
+                          makeDetail: { $0.buildPermissionsPage() }),
+            SettingsEntry(id: "about", group: .app, title: "About", symbol: "info.circle", tint: .systemGray,
+                          makeDetail: { $0.buildAboutPage() }),
+        ]
+    }
+
+    // ── Detail pages ──────────────────────────────────────────────
+    func buildGeneralPage() -> NSScrollView {
+        pageScroll { root in
+            addSection("Startup", to: root, rows: [
+                toggleRow("Launch at login", icon: "arrow.circlepath", iconColor: .systemGreen,
+                          on: AppSettings.launchAtLogin) { AppSettings.setLaunchAtLogin($0) },
+                toggleRow("Automatically install updates", icon: "arrow.down.circle.fill", iconColor: .systemGreen,
+                          on: AppSettings.autoUpdate) { AppSettings.autoUpdate = $0 },
+                toggleRow("Close overlay when last app quits", icon: "xmark.circle.fill", iconColor: .systemOrange,
+                          on: AppSettings.autoClose) { AppSettings.autoClose = $0 },
+            ])
+            addSection("Interface", to: root, rows: [
+                popupRow("Interface style", icon: "macwindow.on.rectangle", iconColor: .systemBlue,
+                         options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
+                         selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
+                             AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
+                         },
+            ])
+        }
+    }
+
+    func buildAppearancePage() -> NSScrollView {
+        pageScroll { root in
+            let header = NSTextField(labelWithString: "NOTCH SKIN")
+            header.font = .systemFont(ofSize: 11, weight: .semibold); header.textColor = .secondaryLabelColor
+            let hPad = padded(header, top: 22, left: 20, bottom: 10)
+            root.addArrangedSubview(hPad); hPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+            let grid = NSStackView()
+            grid.orientation = .horizontal; grid.alignment = .top; grid.spacing = 12
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.setHuggingPriority(.defaultLow, for: .horizontal)
+            var cards: [SkinCardView] = []
+            for skin in NotchSkin.allCases {
+                let card = SkinCardView(skin: skin, selected: AppSettings.notchSkin == skin)
+                card.onSelect = { chosen in
+                    AppSettings.notchSkin = chosen
+                    cards.forEach { $0.isSelected = ($0.skin == chosen) }
+                    let d = NSApp.delegate as? AppDelegate
+                    d?.resetNotchHub()
+                    d?.resetNotchIndicator()   // pill rebuilds with the new skin
+                    d?.teardownOverlay()       // drop-overlay rebuilds with the new skin on next open
+                }
+                cards.append(card)
+                grid.addArrangedSubview(card)
+            }
+            let gridWrap = NSStackView(views: [grid])
+            gridWrap.orientation = .vertical
+            gridWrap.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
+            gridWrap.translatesAutoresizingMaskIntoConstraints = false
+            root.addArrangedSubview(gridWrap)
+            gridWrap.leadingAnchor.constraint(equalTo: root.leadingAnchor).isActive = true
+
+            let note = NSTextField(wrappingLabelWithString: "Skins apply to the notch hub. Liquid Glass frosts over your desktop; more skins are coming.")
+            note.font = .systemFont(ofSize: 11); note.textColor = .tertiaryLabelColor
+            let nPad = padded(note, top: 0, left: 20, bottom: 20, right: 20)
+            root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+    }
+
+    func buildBehaviourPage() -> NSScrollView {
+        pageScroll { root in
+            addSection(pun("Axe Behaviour", "Behaviour"), to: root, rows: [
+                popupRow("Default mode", icon: "bolt.fill", iconColor: .systemRed,
+                         options: ["Graceful (asks apps to quit)", "Force (kills instantly)"],
+                         selected: AppSettings.killMode == .force ? 1 : 0) { AppSettings.killMode = $0 == 1 ? .force : .graceful },
+                popupRow("Grace period", icon: "timer", iconColor: .systemOrange,
+                         options: ["Instant", "2 seconds", "5 seconds"],
+                         selected: [0.0, 2.0, 5.0].firstIndex(of: AppSettings.gracePeriod) ?? 1) {
+                             AppSettings.gracePeriod = [0.0, 2.0, 5.0][safe: $0] ?? 2.0
+                         },
+                toggleRow("Confirm before axing", icon: "checkmark.shield.fill", iconColor: .systemGreen,
+                          on: AppSettings.confirmKill) { AppSettings.confirmKill = $0 },
+                toggleRow("Play chop sound when axing", icon: "speaker.wave.2.fill", iconColor: .systemPurple,
+                          on: AppSettings.soundEnabled) { AppSettings.soundEnabled = $0; if $0 { ChopSound.shared.play() } },
+            ])
+            addSection("Animation", to: root, rows: [
+                animationDemoRow(),
+                popupRow("Destruction animation", icon: "sparkles", iconColor: .systemYellow,
+                         options: KillAnimation.allCases.map { $0.label },
+                         selected: AppSettings.killAnimation.rawValue) {
+                             AppSettings.killAnimation = KillAnimation(rawValue: $0) ?? .shatter
+                         },
+            ])
+            addSection(pun("Battle Phrases", "Phrases"), to: root, rows: [ phraseRow() ])
+            addSection("Personality", to: root, rows: [
+                toggleRow("Punny mode  ·  go crazy on the puns", icon: "face.smiling.fill", iconColor: .systemYellow,
+                          on: AppSettings.punnyMode) { AppSettings.punnyMode = $0 },
+            ])
+        }
+    }
+
+    func buildWorkflowsPage() -> NSScrollView {
+        pageScroll { root in
+            addSection("Workflows", to: root, rows: [
+                popupRow("Max saved workflows", icon: "tray.full.fill", iconColor: .systemBlue,
+                         options: ["5", "10", "20", "50"],
+                         selected: [5, 10, 20, 50].firstIndex(of: AppSettings.maxSessions) ?? 1) {
+                             AppSettings.maxSessions = [5, 10, 20, 50][safe: $0] ?? 10 },
+                toggleRow("Ignore system apps when saving", icon: "square.stack.fill", iconColor: .systemGray,
+                          on: AppSettings.ignoreSystemOnSave) { AppSettings.ignoreSystemOnSave = $0 },
+                toggleRow("Close others when switching workflows", icon: "rectangle.on.rectangle.slash.fill", iconColor: .systemOrange,
+                          on: AppSettings.closeOthersOnRestore) { AppSettings.closeOthersOnRestore = $0 },
+                popupRow("Pause & reopen delay", icon: "timer", iconColor: .systemPurple,
+                         options: ["5 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours"],
+                         selected: [5, 15, 30, 60, 120].firstIndex(of: AppSettings.scheduledReopenMinutes) ?? 1) {
+                             AppSettings.scheduledReopenMinutes = [5, 15, 30, 60, 120][safe: $0] ?? 15
+                         },
+            ])
+            addSection("App List", to: root, rows: [
+                toggleRow("Show background agents and helpers", icon: "eye.fill", iconColor: .systemBlue,
+                          on: AppSettings.showBackground) { AppSettings.showBackground = $0 },
+            ])
+        }
+    }
+
+    func buildShortcutsPage() -> NSScrollView {
+        pageScroll { root in
+            addSection("Keyboard Shortcut", to: root, rows: [ shortcutRow() ])
+            addSection("Clipboard", to: root, rows: [
+                toggleRow("Clipboard hotkey  ·  ⌥⌘V", icon: "doc.on.clipboard", iconColor: .systemTeal,
+                          on: AppSettings.clipboardHotkeyEnabled) { on in
+                              AppSettings.clipboardHotkeyEnabled = on
+                              (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey()
+                          },
+            ])
+        }
+    }
+
+    func buildPermissionsPage() -> NSScrollView {
+        if let obs = permissionObserver { NotificationCenter.default.removeObserver(obs) }
+        permissionObserver = NotificationCenter.default.addObserver(
+            forName: .permissionStateChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshPermissionRow()
+        }
+        return pageScroll { root in
+            addSection("Permissions", to: root, rows: [
+                permissionRow(in: window ?? NSApp.keyWindow ?? NSWindow()),
+            ])
+        }
+    }
+
+    func buildAboutPage() -> NSScrollView {
+        pageScroll { root in
+            addSection("About", to: root, rows: [
+                { let l = NSTextField(labelWithString: "Axe v\(appVersion)  ·  axe-app.com")
+                  l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
+                  return padded(l, top: 12, left: 16, bottom: 12) }(),
+            ])
+            let resetBtn = NSButton(title: "Reset to Defaults…", target: self, action: #selector(resetToDefaultsTapped))
+            resetBtn.bezelStyle = .rounded; resetBtn.controlSize = .regular
+            let rPad = padded(resetBtn, top: 20, left: 20, bottom: 12)
+            root.addArrangedSubview(rPad)
+        }
+    }
+
+    // ── Module detail pages ───────────────────────────────────────
+    func buildNotchHubDetail() -> NSScrollView {
+        pageScroll { root in
+            addSection("Notch Hub", to: root, rows: [
+                toggleRow("Show notch indicator (pill)", icon: "oval.tophalf.filled", iconColor: .systemGray,
+                          on: AppSettings.notchIndicatorEnabled) { on in
+                              AppSettings.notchIndicatorEnabled = on
+                              (NSApp.delegate as? AppDelegate)?.syncNotchIndicator()
+                          },
+                popupRow("Notch indicator side", icon: "sidebar.left", iconColor: .systemGray,
+                         options: ["Left of notch", "Right of notch"],
+                         selected: AppSettings.notchIndicatorOnRight ? 1 : 0) { idx in
+                             AppSettings.notchIndicatorOnRight = (idx == 1)
+                             (NSApp.delegate as? AppDelegate)?.resetNotchIndicator()
+                         },
+            ])
+            let note = NSTextField(wrappingLabelWithString: "The hub hover-expands from the notch with a live clock, quick actions, a file shelf, and clipboard. Pick a skin in Appearance.")
+            note.font = .systemFont(ofSize: 11); note.textColor = .tertiaryLabelColor
+            let nPad = padded(note, top: 0, left: 20, bottom: 20, right: 20)
+            root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+    }
+
+    func buildClipboardDetail() -> NSScrollView {
+        pageScroll { root in
+            addSection("Clipboard", to: root, rows: [
+                toggleRow("Auto-paste clipboard items", icon: "arrow.down.doc.fill", iconColor: .systemTeal,
+                          on: AppSettings.autoPasteEnabled) { on in
+                              AppSettings.autoPasteEnabled = on
+                              if on && !AXIsProcessTrusted() { PermissionManager.shared.requestAccessibility() }
+                          },
+            ])
+            let note = NSTextField(wrappingLabelWithString: "Open the clipboard with ⌥⌘V. Click a clip to copy it back. Auto-paste (needs Accessibility) also presses ⌘V in your last app. Password-manager clips are skipped.")
+            note.font = .systemFont(ofSize: 11); note.textColor = .tertiaryLabelColor
+            let nPad = padded(note, top: 0, left: 20, bottom: 20, right: 20)
+            root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+    }
+
+    func buildBadgeDetail() -> NSScrollView {
+        pageScroll { root in
+            let note = NSTextField(wrappingLabelWithString: "Shows the count of running regular apps as a small badge on the menu-bar axe icon.")
+            note.font = .systemFont(ofSize: 12); note.textColor = .secondaryLabelColor
+            let nPad = padded(note, top: 22, left: 20, bottom: 20, right: 20)
+            root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+    }
+
+    @objc private func resetToDefaultsTapped() {
+        let alert = NSAlert()
+        alert.alertStyle      = .warning
+        alert.messageText     = "Reset all settings to defaults?"
+        alert.informativeText = "Kill mode, animations, the hotkey, interface style and other preferences return to their defaults. Your saved Workflows, license, and permissions are not affected."
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Preference keys ONLY — deliberately excludes license (isLicensed,
+        // licenseInstanceID), saved Workflows (savedSessions), and first-run /
+        // nudge / update state (firstLaunchDate, hasSeenOnboarding, hasMadeFirstKill,
+        // lastNudgeDate, activeWorkflowID, dismissedUpdateVersion, lastAutoUpdateCheck).
+        let keys = [
+            "killMode", "killAnimation", "gracePeriod", "showBackground", "autoClose",
+            "uiStyle", "confirmKill", "soundEnabled", "punnyMode",
+            "hotKeyCode", "hotKeyMods", "hotKeyChar",
+            "maxSessions", "autoRestoreLastSession", "closeOthersOnRestore",
+            "ignoreSystemOnSave", "scheduledReopenMinutes", "sessionsSortOrder",
+            "disabledKillPhrases", "disabledSparePhrases",
+            "notchIndicatorEnabled", "notchIndicatorOnRight", "notchExtraHeight",
+            "menuBarBadgeEnabled", "autoUpdate",
+        ]
+        let d = UserDefaults.standard
+        keys.forEach { d.removeObject(forKey: $0) }
+
+        (NSApp.delegate as? AppDelegate)?.didResetSettings()
+
+        // Refresh the visible settings surface so controls show the restored values.
+        if let w = window, w.isVisible {
+            rebuildContent()
+        } else {
+            (NSApp.delegate as? AppDelegate)?.hideOverlay()
+        }
+    }
+
+    /// Rebuild the standalone settings window's content in place (after a reset).
+    func rebuildContent() {
+        guard let w = window else { return }
+        w.contentView?.subviews.forEach { $0.removeFromSuperview() }
+        buildUI(in: w)
     }
 
     // ── Section builders ─────────────────────────────────────────
@@ -1728,7 +2168,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let bg = NSView(); bg.wantsLayer = true
         bg.layer?.backgroundColor = color.withAlphaComponent(0.15).cgColor
         bg.layer?.cornerRadius    = 6
-        if #available(macOS 13.0, *) { bg.layer?.cornerCurve = .continuous }
+        bg.layer?.cornerCurve     = .continuous
         let iv = NSImageView()
         if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 13, weight: .medium)) {
@@ -1866,11 +2306,35 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let labelStack = NSStackView(views: [lbl, sub])
         labelStack.orientation = .vertical; labelStack.spacing = 2; labelStack.alignment = .leading
         let recorder = HotKeyRecorder()
-        recorder.onChange = { code, mods, char in
+        recorder.onChange = { [weak recorder] code, mods, char in
+            let flash: (String) -> Void = { msg in
+                recorder?.errorMessage = msg; recorder?.needsDisplay = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak recorder] in
+                    recorder?.errorMessage = nil; recorder?.needsDisplay = true
+                }
+            }
+            // Reject a combo already claimed by a saved Workflow hotkey — otherwise
+            // RegisterEventHotKey fails silently and the main open-hotkey dies.
+            if SessionManager.shared.all.contains(where: {
+                $0.hotkey?.keyCode == code && $0.hotkey?.modifiers == mods
+            }) {
+                flash("⚠ In use"); return
+            }
+            let (oldCode, oldMods, oldChar) =
+                (AppSettings.hotKeyCode, AppSettings.hotKeyMods, AppSettings.hotKeyChar)
             AppSettings.hotKeyCode = code
             AppSettings.hotKeyMods = mods
             AppSettings.hotKeyChar = char
-            (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+            let ok = (NSApp.delegate as? AppDelegate)?.reregisterHotKey() ?? false
+            if !ok {
+                // Registration failed (e.g. OS-reserved). Roll back so the recorder,
+                // stored value, and the actually-registered hotkey stay in sync.
+                AppSettings.hotKeyCode = oldCode
+                AppSettings.hotKeyMods = oldMods
+                AppSettings.hotKeyChar = oldChar
+                (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+                flash("⚠ Unavailable")
+            }
         }
         recorder.translatesAutoresizingMaskIntoConstraints = false
         recorder.widthAnchor.constraint(equalToConstant: 120).isActive = true
@@ -2031,6 +2495,218 @@ private final class PopupBox: NSView {
 
 private extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+// MARK: - Settings sidebar model + views (NotchSpace-style)
+
+enum SettingsGroup { case module, app }
+
+struct SettingsEntry {
+    let id: String
+    let group: SettingsGroup
+    let title: String
+    let symbol: String
+    let tint: NSColor
+    var beta: Bool = false
+    var isOn:  (() -> Bool)?      = nil     // module toggle binding; nil for app pages
+    var setOn: ((Bool) -> Void)? = nil
+    let makeDetail: (_ owner: SettingsWindow) -> NSView
+}
+
+/// A small "🧪 BETA" capsule for experimental features.
+func makeBetaPill() -> NSView {
+    let l = NSTextField(labelWithString: "BETA")
+    l.font = .systemFont(ofSize: 8, weight: .bold); l.textColor = .white; l.alignment = .center
+    l.wantsLayer = true
+    l.layer?.backgroundColor = NSColor.systemOrange.cgColor
+    l.layer?.cornerRadius = 4; l.layer?.cornerCurve = .continuous
+    l.translatesAutoresizingMaskIntoConstraints = false
+    let wrap = NSView(); wrap.translatesAutoresizingMaskIntoConstraints = false
+    wrap.addSubview(l)
+    NSLayoutConstraint.activate([
+        l.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 1),
+        l.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -1),
+        l.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 4),
+        l.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -4),
+    ])
+    return wrap
+}
+
+/// A sidebar row: icon + title + optional beta pill + optional toggle switch, with
+/// a rounded selection highlight and grayed-when-off state.
+final class SidebarRowView: NSView {
+    let entry: SettingsEntry
+    private let highlight = CALayer()
+    private let titleLbl = NSTextField(labelWithString: "")
+    private let iconBadge: NSView
+    private var toggle: NSSwitch?
+    var onSelect: (() -> Void)?
+    var onToggle: ((Bool) -> Void)?
+
+    init(entry: SettingsEntry, iconBadge: NSView) {
+        self.entry = entry; self.iconBadge = iconBadge
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        highlight.cornerRadius = 6; highlight.cornerCurve = .continuous
+        highlight.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
+        highlight.opacity = 0
+        layer?.addSublayer(highlight)
+
+        titleLbl.stringValue = entry.title
+        titleLbl.font = .systemFont(ofSize: 13)
+        titleLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        iconBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView(views: [iconBadge, titleLbl])
+        row.orientation = .horizontal; row.spacing = 9; row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        if entry.beta { row.addArrangedSubview(makeBetaPill()) }
+        if let isOn = entry.isOn {
+            let sw = NSSwitch(); sw.controlSize = .mini
+            sw.state = isOn() ? .on : .off
+            sw.target = self; sw.action = #selector(switchChanged)
+            toggle = sw; row.addArrangedSubview(sw)
+        }
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 34),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        applyGray()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() { super.layout(); highlight.frame = bounds.insetBy(dx: 2, dy: 1) }
+    func setSelected(_ on: Bool) { highlight.opacity = on ? 1 : 0 }
+    func refreshFromSettings() { toggle?.state = (entry.isOn?() ?? false) ? .on : .off; applyGray() }
+
+    private func applyGray() {
+        let off = (entry.isOn?() == false)
+        titleLbl.textColor = off ? .tertiaryLabelColor : .labelColor
+        iconBadge.alphaValue = off ? 0.4 : 1.0
+    }
+    @objc private func switchChanged() { onToggle?(toggle?.state == .on); applyGray() }
+    override func mouseDown(with e: NSEvent) {
+        if let sw = toggle {
+            let p = sw.convert(e.locationInWindow, from: nil)
+            if sw.bounds.contains(p) { super.mouseDown(with: e); return }
+        }
+        onSelect?()
+    }
+}
+
+/// A selectable skin card for the Appearance page's Skin Gallery.
+final class SkinCardView: NSView {
+    let skin: NotchSkin
+    var onSelect: ((NotchSkin) -> Void)?
+    private let checkBadge = NSImageView()
+    var isSelected = false { didSet { refreshSelection() } }
+
+    init(skin: NotchSkin, selected: Bool) {
+        self.skin = skin
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 12; layer?.cornerCurve = .continuous; layer?.borderWidth = 2
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 160).isActive = true
+
+        let swatch = SkinCardView.makeSwatch(for: skin)
+        let title = NSTextField(labelWithString: skin.label)
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        let sub = NSTextField(wrappingLabelWithString: skin.detail)
+        sub.font = .systemFont(ofSize: 11); sub.textColor = .secondaryLabelColor
+        let stack = NSStackView(views: [swatch, title, sub])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        checkBadge.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
+        checkBadge.contentTintColor = .controlAccentColor
+        checkBadge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(checkBadge)
+        NSLayoutConstraint.activate([
+            checkBadge.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            checkBadge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            checkBadge.widthAnchor.constraint(equalToConstant: 18),
+            checkBadge.heightAnchor.constraint(equalToConstant: 18),
+        ])
+        if !skin.isImplemented {
+            let soon = NSTextField(labelWithString: "SOON")
+            soon.font = .systemFont(ofSize: 9, weight: .bold); soon.textColor = .secondaryLabelColor
+            soon.wantsLayer = true; soon.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+            soon.layer?.cornerRadius = 4; soon.alignment = .center
+            soon.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(soon)
+            NSLayoutConstraint.activate([
+                soon.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+                soon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+                soon.widthAnchor.constraint(equalToConstant: 38),
+                soon.heightAnchor.constraint(equalToConstant: 15),
+            ])
+        }
+        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clicked)))
+        self.isSelected = selected
+        refreshSelection()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func clicked() { if skin.isImplemented { onSelect?(skin) } }
+    private func refreshSelection() {
+        layer?.borderColor = (isSelected ? NSColor.controlAccentColor
+                                         : NSColor.separatorColor.withAlphaComponent(0.6)).cgColor
+        layer?.backgroundColor = (isSelected ? NSColor.controlAccentColor.withAlphaComponent(0.08)
+                                             : NSColor.clear).cgColor
+        checkBadge.isHidden = !isSelected
+        alphaValue = skin.isImplemented ? 1.0 : 0.55
+    }
+    private static func makeSwatch(for skin: NotchSkin) -> NSView {
+        let host = NSView(); host.wantsLayer = true
+        host.layer?.cornerRadius = 7; host.layer?.masksToBounds = true
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.heightAnchor.constraint(equalToConstant: 62).isActive = true
+        host.widthAnchor.constraint(equalToConstant: 138).isActive = true
+        switch skin {
+        case .liquidGlass:
+            let fx = NSVisualEffectView(); fx.material = .hudWindow; fx.state = .active
+            fx.appearance = NSAppearance(named: .darkAqua)
+            fx.translatesAutoresizingMaskIntoConstraints = false
+            host.addSubview(fx); pin(fx, to: host)
+        default:
+            host.layer?.backgroundColor = NSColor.black.cgColor
+        }
+        // A small "notch" nub at the top-center for realism.
+        let nub = NSView(); nub.wantsLayer = true
+        nub.layer?.backgroundColor = NSColor.black.cgColor
+        nub.layer?.cornerRadius = 4
+        nub.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        nub.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(nub)
+        NSLayoutConstraint.activate([
+            nub.topAnchor.constraint(equalTo: host.topAnchor),
+            nub.centerXAnchor.constraint(equalTo: host.centerXAnchor),
+            nub.widthAnchor.constraint(equalToConstant: 48),
+            nub.heightAnchor.constraint(equalToConstant: 14),
+        ])
+        return host
+    }
+    private static func pin(_ v: NSView, to c: NSView) {
+        NSLayoutConstraint.activate([
+            v.leadingAnchor.constraint(equalTo: c.leadingAnchor),
+            v.trailingAnchor.constraint(equalTo: c.trailingAnchor),
+            v.topAnchor.constraint(equalTo: c.topAnchor),
+            v.bottomAnchor.constraint(equalTo: c.bottomAnchor),
+        ])
+    }
 }
 
 // MARK: - HotKeyRecorder
@@ -2432,8 +3108,14 @@ final class SessionManager {
                 AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minRef)
                 AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString,    &titleRef)
                 var pos  = CGPoint.zero; var size = CGSize.zero
-                if let p = posRef  { AXValueGetValue(p  as! AXValue, .cgPoint, &pos)  }
-                if let s = sizeRef { AXValueGetValue(s  as! AXValue, .cgSize,  &size) }
+                // Type-check before casting: a quirky app's AX impl can return a
+                // non-AXValue here, and a force-cast would crash the whole app.
+                if let p = posRef,  CFGetTypeID(p) == AXValueGetTypeID() {
+                    AXValueGetValue(p as! AXValue, .cgPoint, &pos)
+                }
+                if let s = sizeRef, CFGetTypeID(s) == AXValueGetTypeID() {
+                    AXValueGetValue(s as! AXValue, .cgSize, &size)
+                }
                 let minimized = (minRef as? Bool) ?? false
                 let title     = titleRef as? String
                 states.append(WindowState(frame: CGRect(origin: pos, size: size),
@@ -3053,7 +3735,8 @@ final class AboutWindow: NSObject, NSWindowDelegate {
         tagline.textColor = .secondaryLabelColor
 
         // Copyright
-        let copy = NSTextField(labelWithString: "© 2025 Taylor Emery. All rights reserved.")
+        let copyYear = Calendar.current.component(.year, from: Date())
+        let copy = NSTextField(labelWithString: "© 2025–\(copyYear) Taylor Emery. All rights reserved.")
         copy.font      = .systemFont(ofSize: 10)
         copy.textColor = .tertiaryLabelColor
 
@@ -3117,7 +3800,7 @@ final class AboutWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func openWebsite() {
-        NSWorkspace.shared.open(URL(string: "https://emerytech.github.io/homebrew-axe/")!)
+        NSWorkspace.shared.open(URL(string: "https://axe-app.com")!)
     }
 }
 
@@ -3179,12 +3862,25 @@ final class SelfUpdater: NSObject, NSWindowDelegate {
         let newApp = tmp.appendingPathComponent("Axe.app")
         guard fm.fileExists(atPath: newApp.path) else { return false }
 
-        // Shell script: wait for app to quit, swap bundle, relaunch
-        let cur    = Bundle.main.bundlePath
+        // Shell script: wait for app to quit, atomically swap bundle, relaunch.
+        // NB: never `cp -R` into the live bundle path — cp copies INTO an existing
+        // directory, nesting Axe.app inside Axe.app so the update never applies.
+        // Instead ditto a clean clone onto the SAME volume (/Applications), move the
+        // old bundle aside, then atomic-rename the new one in. Restore on failure so
+        // a botched swap never leaves the user with no app installed.
+        let cur     = Bundle.main.bundlePath
+        let parent  = (cur as NSString).deletingLastPathComponent
+        let staging = parent + "/.Axe-update-new"
+        let backup  = parent + "/.Axe-update-old"
         let script = """
         #!/bin/bash
+        set -e
         sleep 1.5
-        cp -rf \(newApp.path.shellQuoted) \(cur.shellQuoted)
+        rm -rf \(staging.shellQuoted) \(backup.shellQuoted)
+        /usr/bin/ditto \(newApp.path.shellQuoted) \(staging.shellQuoted)
+        mv \(cur.shellQuoted) \(backup.shellQuoted)
+        mv \(staging.shellQuoted) \(cur.shellQuoted) || { mv \(backup.shellQuoted) \(cur.shellQuoted); open \(cur.shellQuoted); exit 1; }
+        rm -rf \(backup.shellQuoted)
         open \(cur.shellQuoted)
         rm -rf \(tmp.path.shellQuoted)
         """
@@ -3348,9 +4044,8 @@ final class UpdateWindow: NSObject, NSWindowDelegate {
         tv.textContainer?.lineFragmentPadding = 0
         tv.textContainerInset = NSSize(width: 0, height: 2)
 
-        // Render GitHub Markdown on macOS 12+, else strip symbols
-        if #available(macOS 12.0, *),
-           let attrStr = try? AttributedString(
+        // Render GitHub Markdown; fall back to stripped symbols if parsing fails
+        if let attrStr = try? AttributedString(
                markdown: releaseNotes,
                options: AttributedString.MarkdownParsingOptions(
                    interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
@@ -3393,7 +4088,7 @@ final class UpdateWindow: NSObject, NSWindowDelegate {
         let installBtn = NSButton(title: "Install Update", target: self, action: #selector(installTapped))
         installBtn.bezelStyle    = .rounded
         installBtn.keyEquivalent = "\r"
-        if #available(macOS 11.0, *) { installBtn.controlSize = .large }
+        installBtn.controlSize   = .large
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -3765,10 +4460,11 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
         // ── Feature rows ────────────────────────────────────────────
         let features: [(String, String, String)] = [
-            ("⌘Z",                       "Open Axe from anywhere — no Accessibility needed",       ""),
+            (AppSettings.shortcutLabel(), "Open Axe from anywhere — no Accessibility needed",       ""),
             ("magnifyingglass",           "Type to instantly filter your running apps",              "sf"),
             ("cursorarrow.click.2",       "Double-click a row to quit  ·  ⌘-double-click to force kill", "sf"),
             ("checkmark.square",          "Tick checkboxes to build a batch list, then confirm",    "sf"),
+            ("square.stack.3d.up",        "Save apps as a Workflow — restore later, or Save & Axe All at once", "sf"),
             ("keyboard",                  "↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill",              "sf"),
             ("escape",                    "Esc to close the overlay",                               "sf"),
         ]
@@ -3880,6 +4576,13 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         sep3.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(sep3)
         sep3.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── Escape hatch: tell users this is all changeable later ────
+        let tip = label("Change the \(AppSettings.shortcutLabel()) hotkey or overlay style anytime in Settings",
+                        size: 11, weight: .regular, color: .tertiaryLabelColor)
+        let tipPad = padded(tip, top: 12, left: 20, bottom: 0)
+        root.addArrangedSubview(tipPad)
+        tipPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
         // ── Get Started button ──────────────────────────────────────
         let btn = NSButton(title: "Get Started", target: self, action: #selector(dismiss))
@@ -4147,7 +4850,7 @@ final class NotchIndicatorPanel: NSPanel {
         let f: NSRect
         if onRight {
             let area: NSRect
-            if #available(macOS 12.0, *), let a = screen.auxiliaryTopRightArea {
+            if let a = screen.auxiliaryTopRightArea {
                 area = a
             } else {
                 area = NSRect(x: screen.frame.midX + 85, y: screen.frame.maxY - 24,
@@ -4162,7 +4865,7 @@ final class NotchIndicatorPanel: NSPanel {
                        height: area.height)
         } else {
             let area: NSRect
-            if #available(macOS 12.0, *), let a = screen.auxiliaryTopLeftArea {
+            if let a = screen.auxiliaryTopLeftArea {
                 area = a
             } else {
                 area = NSRect(x: screen.frame.minX,
@@ -4201,7 +4904,7 @@ final class NotchIndicatorPanel: NSPanel {
 
         let pillView = NSView()
         pillView.wantsLayer = true
-        pillView.layer?.backgroundColor = NSColor.black.cgColor
+        pillView.layer?.backgroundColor = NSColor.clear.cgColor   // skin fill provides the look; the mask shapes it
         pillView.translatesAutoresizingMaskIntoConstraints = false
         self.pillView = pillView
         cv.addSubview(pillView)
@@ -4211,6 +4914,16 @@ final class NotchIndicatorPanel: NSPanel {
             pillView.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
             pillView.topAnchor.constraint(equalTo: cv.topAnchor),
             pillView.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+
+        let skinFill = AppSettings.notchSkin.makeHubBackground(cornerRadius: 0, corners: [])
+        skinFill.translatesAutoresizingMaskIntoConstraints = false
+        pillView.addSubview(skinFill)
+        NSLayoutConstraint.activate([
+            skinFill.leadingAnchor.constraint(equalTo: pillView.leadingAnchor),
+            skinFill.trailingAnchor.constraint(equalTo: pillView.trailingAnchor),
+            skinFill.topAnchor.constraint(equalTo: pillView.topAnchor),
+            skinFill.bottomAnchor.constraint(equalTo: pillView.bottomAnchor),
         ])
 
         let bolt = NSImageView()
@@ -4358,6 +5071,1351 @@ final class NotchIndicatorPanel: NSPanel {
     @objc private func indicatorTapped() { onOpen?() }
 }
 
+// MARK: - Notch shelf (drag-and-drop staging tray)
+
+/// Persistent list of staged file paths for the notch shelf. Drop files onto the
+/// notch to stage them here; drag them out anywhere later. Public APIs only.
+final class ShelfStore {
+    static let shared = ShelfStore()
+    private init() {}
+    private let key = "notchShelfPaths"
+    private let d = UserDefaults.standard
+    var onChange: (() -> Void)?
+
+    private(set) var paths: [String] {
+        get { d.stringArray(forKey: key) ?? [] }
+        set { d.set(newValue, forKey: key); onChange?() }
+    }
+    func urls() -> [URL] { paths.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) } }
+
+    func add(_ url: URL) {
+        var p = paths
+        p.removeAll { $0 == url.path }
+        p.insert(url.path, at: 0)
+        if p.count > 24 { p = Array(p.prefix(24)) }
+        paths = p
+    }
+    func remove(_ path: String) { paths = paths.filter { $0 != path } }
+    func clear() { paths = [] }
+}
+
+/// A draggable chip for one staged file: shows its icon + truncated name, drags
+/// OUT to Finder/apps (provides the file URL), and removes on ✕ / right-click.
+final class ShelfChipView: NSView, NSDraggingSource {
+    let url: URL
+    var onRemove: (() -> Void)?
+    private var iconImage: NSImage?
+
+    init(url: URL) {
+        self.url = url
+        super.init(frame: NSRect(x: 0, y: 0, width: 58, height: 62))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 58).isActive = true
+        heightAnchor.constraint(equalToConstant: 62).isActive = true
+
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 34, height: 34)
+        iconImage = icon
+        let iv = NSImageView(image: icon)
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: url.lastPathComponent)
+        name.font = .systemFont(ofSize: 9); name.textColor = NSColor.white.withAlphaComponent(0.85)
+        name.alignment = .center; name.lineBreakMode = .byTruncatingMiddle
+        name.maximumNumberOfLines = 1
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.toolTip = url.lastPathComponent
+        addSubview(iv); addSubview(name)
+        NSLayoutConstraint.activate([
+            iv.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            iv.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iv.widthAnchor.constraint(equalToConstant: 34),
+            iv.heightAnchor.constraint(equalToConstant: 34),
+            name.topAnchor.constraint(equalTo: iv.bottomAnchor, constant: 2),
+            name.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            name.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDragged(with event: NSEvent) {
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        let img = iconImage ?? NSImage()
+        item.setDraggingFrame(NSRect(x: 12, y: 24, width: 34, height: 34), contents: img)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+    override func rightMouseDown(with event: NSEvent) { onRemove?() }
+
+    func draggingSession(_ session: NSDraggingSession,
+                         sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        [.copy, .link, .generic]
+    }
+}
+
+/// The hub's black background, doubling as a drag DESTINATION: dragging files over
+/// it requests expansion, and dropping stages them in the ShelfStore.
+final class HubDropView: NSView {
+    var onDragEnter: (() -> Void)?
+    var onDrop: (([URL]) -> Void)?
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragEnter?()
+        return sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self]) ? .copy : []
+    }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                        options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        guard !urls.isEmpty else { return false }
+        onDrop?(urls)
+        return true
+    }
+}
+
+// MARK: - Notch hub
+//
+// A centered, notch-hugging hub that hover-expands into a glanceable panel.
+// First cut: a live clock + running-app count at rest; on hover it grows down
+// into a hub with the date and quick actions (Open Axe / Displays). Foundation
+// for later modules (now-playing media, file shelf, clipboard). Built on the same
+// borderless, top-anchored, behind-the-bezel panel trick as NotchIndicatorPanel;
+// uses a simple frame+alpha spring rather than the parametric mask morph.
+final class NotchHubPanel: NSPanel {
+    var onOpenAxe:       (() -> Void)?
+    var onOpenDisplays:  (() -> Void)?
+    var onOpenClipboard: (() -> Void)?
+
+    private var bezelH: CGFloat = 32
+    private let expandedH: CGFloat = 220
+    private var expanded = false
+    private var collapseWork: DispatchWorkItem?
+
+    private weak var bg: NSView?
+    private weak var clockLabel: NSTextField?
+    private weak var dateLabel:  NSTextField?
+    private weak var countLabel: NSTextField?
+    private weak var expandedView: NSView?
+    private weak var shelfStack: NSStackView?
+    private var clockTimer: Timer?
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+
+    convenience init(screen: NSScreen) {
+        let bez = max(screen.safeAreaInsets.top, 24)
+        let w: CGFloat = 360
+        let f = NSRect(x: (screen.frame.midX - w / 2).rounded(),
+                       y: screen.frame.maxY - bez, width: w, height: bez)
+        self.init(contentRect: f, styleMask: [.borderless, .nonactivatingPanel],
+                  backing: .buffered, defer: false)
+        bezelH = bez
+        level                = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
+        isReleasedWhenClosed = false
+        backgroundColor      = .clear
+        isOpaque             = false
+        hasShadow            = false
+        isMovable            = false
+        collectionBehavior   = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        buildContent()
+        startClock()
+    }
+
+    private func buildContent() {
+        guard let cv = contentView else { return }
+        cv.wantsLayer = true
+
+        // HubDropView stays the content container + drag target, but no longer paints
+        // its own fill — it clips its subtree to the rounded-bottom shape; the skin
+        // view below provides the actual background (Classic black / Liquid Glass / …).
+        let corners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        let bgv = HubDropView(); bgv.wantsLayer = true
+        bgv.layer?.cornerRadius  = 14
+        bgv.layer?.cornerCurve   = .continuous
+        bgv.layer?.maskedCorners = corners
+        bgv.layer?.masksToBounds = true
+        bgv.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(bgv); bg = bgv
+        NSLayoutConstraint.activate([
+            bgv.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            bgv.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            bgv.topAnchor.constraint(equalTo: cv.topAnchor),
+            bgv.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+        let skinBG = AppSettings.notchSkin.makeHubBackground(cornerRadius: 14, corners: corners)
+        skinBG.translatesAutoresizingMaskIntoConstraints = false
+        bgv.addSubview(skinBG, positioned: .below, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            skinBG.leadingAnchor.constraint(equalTo: bgv.leadingAnchor),
+            skinBG.trailingAnchor.constraint(equalTo: bgv.trailingAnchor),
+            skinBG.topAnchor.constraint(equalTo: bgv.topAnchor),
+            skinBG.bottomAnchor.constraint(equalTo: bgv.bottomAnchor),
+        ])
+        // Dragging files onto the notch expands the hub and stages them in the shelf.
+        bgv.registerForDraggedTypes([.fileURL])
+        bgv.onDragEnter = { [weak self] in self?.collapseWork?.cancel(); self?.setExpanded(true) }
+        bgv.onDrop = { [weak self] urls in
+            urls.forEach { ShelfStore.shared.add($0) }
+            self?.collapseWork?.cancel(); self?.setExpanded(true)
+        }
+
+        // Top band (menu-bar row): app count on the left flank, clock on the right,
+        // the physical notch sits between them.
+        let bolt = NSImageView()
+        bolt.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+        bolt.contentTintColor = NSColor(red: 1, green: 0.28, blue: 0.28, alpha: 1)
+        bolt.translatesAutoresizingMaskIntoConstraints = false
+        let count = NSTextField(labelWithString: "0")
+        count.font = .systemFont(ofSize: 11, weight: .semibold); count.textColor = .white
+        count.translatesAutoresizingMaskIntoConstraints = false; countLabel = count
+        let clock = NSTextField(labelWithString: "")
+        clock.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium); clock.textColor = .white
+        clock.translatesAutoresizingMaskIntoConstraints = false; clockLabel = clock
+        bgv.addSubview(bolt); bgv.addSubview(count); bgv.addSubview(clock)
+        NSLayoutConstraint.activate([
+            bolt.leadingAnchor.constraint(equalTo: bgv.leadingAnchor, constant: 16),
+            bolt.topAnchor.constraint(equalTo: bgv.topAnchor, constant: (bezelH - 12) / 2),
+            bolt.widthAnchor.constraint(equalToConstant: 10),
+            bolt.heightAnchor.constraint(equalToConstant: 12),
+            count.leadingAnchor.constraint(equalTo: bolt.trailingAnchor, constant: 3),
+            count.centerYAnchor.constraint(equalTo: bolt.centerYAnchor),
+            clock.trailingAnchor.constraint(equalTo: bgv.trailingAnchor, constant: -16),
+            clock.centerYAnchor.constraint(equalTo: bolt.centerYAnchor),
+        ])
+
+        // Expanded content — hidden until hover-expand.
+        let ev = NSView(); ev.alphaValue = 0
+        ev.translatesAutoresizingMaskIntoConstraints = false
+        bgv.addSubview(ev); expandedView = ev
+        NSLayoutConstraint.activate([
+            ev.leadingAnchor.constraint(equalTo: bgv.leadingAnchor),
+            ev.trailingAnchor.constraint(equalTo: bgv.trailingAnchor),
+            ev.topAnchor.constraint(equalTo: bgv.topAnchor, constant: bezelH),
+            ev.bottomAnchor.constraint(equalTo: bgv.bottomAnchor),
+        ])
+
+        let date = NSTextField(labelWithString: "")
+        date.font = .systemFont(ofSize: 12); date.textColor = NSColor.white.withAlphaComponent(0.7)
+        date.alignment = .center; date.translatesAutoresizingMaskIntoConstraints = false; dateLabel = date
+
+        let openBtn = hubButton("Axe", "bolt.fill", #selector(openAxeTapped))
+        let dispBtn = hubButton("Displays", "sun.max", #selector(openDisplaysTapped))
+        let clipBtn = hubButton("Clipboard", "doc.on.clipboard", #selector(openClipboardTapped))
+        let row = NSStackView(views: [openBtn, dispBtn, clipBtn])
+        row.orientation = .horizontal; row.spacing = 8; row.distribution = .fillEqually
+        row.translatesAutoresizingMaskIntoConstraints = false
+        // Shelf: staged files (drag out anywhere), or a drop hint when empty.
+        let shelfLabel = NSTextField(labelWithString: "SHELF")
+        shelfLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        shelfLabel.textColor = NSColor.white.withAlphaComponent(0.4)
+        shelfLabel.translatesAutoresizingMaskIntoConstraints = false
+        let shelf = NSStackView()
+        shelf.orientation = .horizontal; shelf.spacing = 8; shelf.alignment = .top
+        shelf.translatesAutoresizingMaskIntoConstraints = false
+        shelfStack = shelf
+
+        ev.addSubview(date); ev.addSubview(row); ev.addSubview(shelfLabel); ev.addSubview(shelf)
+        NSLayoutConstraint.activate([
+            date.topAnchor.constraint(equalTo: ev.topAnchor, constant: 16),
+            date.centerXAnchor.constraint(equalTo: ev.centerXAnchor),
+            row.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
+            row.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -18),
+            row.topAnchor.constraint(equalTo: date.bottomAnchor, constant: 14),
+            shelfLabel.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
+            shelfLabel.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 14),
+            shelf.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
+            shelf.trailingAnchor.constraint(lessThanOrEqualTo: ev.trailingAnchor, constant: -18),
+            shelf.topAnchor.constraint(equalTo: shelfLabel.bottomAnchor, constant: 6),
+        ])
+        reloadShelf()
+        ShelfStore.shared.onChange = { [weak self] in self?.reloadShelf() }
+
+        let track = NSTrackingArea(rect: .zero,
+                                   options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+                                   owner: self, userInfo: nil)
+        cv.addTrackingArea(track)
+    }
+
+    private func reloadShelf() {
+        guard let shelf = shelfStack else { return }
+        shelf.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let urls = ShelfStore.shared.urls()
+        if urls.isEmpty {
+            let hint = NSTextField(labelWithString: "Drop files onto the notch to stage them")
+            hint.font = .systemFont(ofSize: 11); hint.textColor = NSColor.white.withAlphaComponent(0.35)
+            shelf.addArrangedSubview(hint)
+        } else {
+            for url in urls {
+                let chip = ShelfChipView(url: url)
+                chip.onRemove = { ShelfStore.shared.remove(url.path) }
+                shelf.addArrangedSubview(chip)
+            }
+        }
+    }
+
+    private func hubButton(_ title: String, _ symbol: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        b.imagePosition = .imageLeading
+        b.controlSize = .regular
+        return b
+    }
+
+    // ── Live clock ───────────────────────────────────────────────────
+    private func startClock() {
+        updateClock()
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updateClock() }
+        RunLoop.main.add(t, forMode: .common)
+        clockTimer = t
+    }
+    private func updateClock() {
+        let now = Date()
+        let tf = DateFormatter(); tf.dateFormat = "h:mm"
+        clockLabel?.stringValue = tf.string(from: now)
+        let df = DateFormatter(); df.dateFormat = "EEEE, MMM d"
+        dateLabel?.stringValue = df.string(from: now)
+    }
+
+    func update(appCount: Int) { countLabel?.stringValue = "\(appCount)" }
+
+    // ── Hover expand / collapse ──────────────────────────────────────
+    override func mouseEntered(with event: NSEvent) { collapseWork?.cancel(); setExpanded(true) }
+    override func mouseExited(with event: NSEvent) {
+        let work = DispatchWorkItem { [weak self] in self?.setExpanded(false) }
+        collapseWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+    }
+
+    private func setExpanded(_ on: Bool) {
+        guard on != expanded else { return }
+        expanded = on
+        let top = frame.maxY                       // top edge stays pinned behind the bezel
+        let h   = on ? expandedH : bezelH
+        var f   = frame; f.origin.y = top - h; f.size.height = h
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = on ? 0.30 : 0.22
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.94, 0.6, 1.0)
+            animator().setFrame(f, display: true)
+            expandedView?.animator().alphaValue = on ? 1 : 0
+        }
+    }
+
+    @objc private func openAxeTapped()      { setExpanded(false); onOpenAxe?() }
+    @objc private func openDisplaysTapped() { setExpanded(false); onOpenDisplays?() }
+    @objc private func openClipboardTapped() { setExpanded(false); onOpenClipboard?() }
+
+    deinit { clockTimer?.invalidate() }
+}
+
+// MARK: - Clipboard history (Supaste-style)
+
+struct ClipItem: Codable, Equatable {
+    let id: String
+    let text: String
+    var pinned: Bool
+    let date: Double
+}
+
+/// Polls the general pasteboard for new text clips, keeps a searchable history,
+/// supports pinned snippets and copy-back. Skips password-manager / transient
+/// clips. Public APIs only (NSPasteboard).
+final class ClipboardStore {
+    static let shared = ClipboardStore()
+    private init() {}
+    private let d = UserDefaults.standard
+    private let key = "clipboardHistory"
+    private let maxUnpinned = 100
+    private var lastChangeCount = NSPasteboard.general.changeCount
+    private var ignoreNext = false
+    private var timer: Timer?
+    var onChange: (() -> Void)?
+
+    private(set) var items: [ClipItem] {
+        get { (try? JSONDecoder().decode([ClipItem].self, from: d.data(forKey: key) ?? Data())) ?? [] }
+        set { d.set(try? JSONEncoder().encode(newValue), forKey: key); onChange?() }
+    }
+
+    func start() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func poll() {
+        let pb = NSPasteboard.general
+        guard pb.changeCount != lastChangeCount else { return }
+        lastChangeCount = pb.changeCount
+        if ignoreNext { ignoreNext = false; return }
+        // Respect the nspasteboard.com convention: skip password-manager/transient clips.
+        let types = pb.types?.map { $0.rawValue } ?? []
+        if types.contains("org.nspasteboard.ConcealedType")
+            || types.contains("org.nspasteboard.TransientType") { return }
+        guard let s = pb.string(forType: .string),
+              !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        capture(s)
+    }
+
+    private func capture(_ s: String) {
+        var arr = items
+        let wasPinned = arr.first(where: { $0.text == s })?.pinned ?? false
+        arr.removeAll { $0.text == s }
+        arr.insert(ClipItem(id: UUID().uuidString, text: s, pinned: wasPinned,
+                            date: Date().timeIntervalSince1970), at: 0)
+        // Trim oldest unpinned beyond the cap; pinned snippets are always kept.
+        var unpinnedSeen = 0
+        arr = arr.filter { item in
+            if item.pinned { return true }
+            unpinnedSeen += 1
+            return unpinnedSeen <= maxUnpinned
+        }
+        items = arr
+    }
+
+    /// Ordered for display: pinned first (newest-first), then recent.
+    func display(filter q: String) -> [ClipItem] {
+        let ql = q.trimmingCharacters(in: .whitespaces).lowercased()
+        let filtered = ql.isEmpty ? items : items.filter { $0.text.lowercased().contains(ql) }
+        return filtered.sorted { a, b in
+            if a.pinned != b.pinned { return a.pinned }
+            return a.date > b.date
+        }
+    }
+
+    func copyBack(_ item: ClipItem) {
+        ignoreNext = true
+        let pb = NSPasteboard.general
+        pb.clearContents(); pb.setString(item.text, forType: .string)
+        lastChangeCount = pb.changeCount
+    }
+    func togglePin(_ id: String) {
+        var arr = items
+        if let i = arr.firstIndex(where: { $0.id == id }) { arr[i].pinned.toggle(); items = arr }
+    }
+    func delete(_ id: String) { items = items.filter { $0.id != id } }
+    func clearUnpinned() { items = items.filter { $0.pinned } }
+}
+
+/// A clipboard-history panel that drops from the notch: search field + a
+/// scrollable list of clips (click to copy back, 📌 pin, ✕ delete).
+final class ClipboardPanel: NSPanel, NSSearchFieldDelegate {
+    private weak var listStack: NSStackView?
+    private weak var searchField: NSSearchField?
+    private var query = ""
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+
+    convenience init(screen: NSScreen) {
+        let bez = max(screen.safeAreaInsets.top, 24)
+        let w: CGFloat = 440, h: CGFloat = 460
+        let f = NSRect(x: (screen.frame.midX - w / 2).rounded(),
+                       y: screen.frame.maxY - h, width: w, height: h)
+        self.init(contentRect: f, styleMask: [.borderless, .nonactivatingPanel],
+                  backing: .buffered, defer: false)
+        level                = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
+        isReleasedWhenClosed = false
+        backgroundColor      = .clear
+        isOpaque             = false
+        hasShadow            = true
+        isMovable            = false
+        collectionBehavior   = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        buildUI(bezelH: bez)
+        ClipboardStore.shared.onChange = { [weak self] in self?.reload() }
+    }
+
+    private func buildUI(bezelH: CGFloat) {
+        guard let cv = contentView else { return }
+        cv.wantsLayer = true
+        let bgv = NSVisualEffectView()
+        bgv.material = .hudWindow; bgv.blendingMode = .behindWindow; bgv.state = .active
+        bgv.wantsLayer = true
+        bgv.layer?.cornerRadius = 16; bgv.layer?.cornerCurve = .continuous
+        bgv.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        bgv.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(bgv)
+
+        let title = NSTextField(labelWithString: "Clipboard")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        let search = NSSearchField()
+        search.placeholderString = "Search clips…"
+        search.delegate = self
+        search.translatesAutoresizingMaskIntoConstraints = false
+        searchField = search
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false; scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false; scroll.autohidesScrollers = true
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 12, right: 12)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let doc = FlippedStackView(); doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack); scroll.documentView = doc
+        listStack = stack
+
+        bgv.addSubview(title); bgv.addSubview(search); bgv.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            bgv.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            bgv.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            bgv.topAnchor.constraint(equalTo: cv.topAnchor),
+            bgv.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            title.topAnchor.constraint(equalTo: bgv.topAnchor, constant: bezelH + 8),
+            title.leadingAnchor.constraint(equalTo: bgv.leadingAnchor, constant: 14),
+            search.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            search.leadingAnchor.constraint(equalTo: bgv.leadingAnchor, constant: 12),
+            search.trailingAnchor.constraint(equalTo: bgv.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: bgv.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: bgv.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bgv.bottomAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: doc.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+        ])
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        query = searchField?.stringValue ?? ""
+        reload()
+    }
+
+    private func reload() {
+        guard let stack = listStack else { return }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let clips = ClipboardStore.shared.display(filter: query)
+        if clips.isEmpty {
+            let empty = NSTextField(labelWithString: query.isEmpty ? "No clips yet — copy something." : "No matches.")
+            empty.font = .systemFont(ofSize: 12); empty.textColor = .secondaryLabelColor
+            stack.addArrangedSubview(empty)
+            return
+        }
+        for clip in clips {
+            let row = ClipRowView(clip: clip,
+                onCopy:   { [weak self] in ClipboardStore.shared.copyBack(clip); self?.dismissPanel(); self?.onPaste?() },
+                onPin:    { ClipboardStore.shared.togglePin(clip.id) },
+                onDelete: { ClipboardStore.shared.delete(clip.id) })
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+        }
+    }
+
+    var onClose: (() -> Void)?
+    var onPaste: (() -> Void)?
+    private var globalMon: Any?
+    private var localMon: Any?
+
+    func toggle(on screen: NSScreen?) {
+        if isVisible { dismissPanel(); return }
+        reload()
+        makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self] in self?.makeFirstResponder(self?.searchField) }
+        installDismissMonitors()
+    }
+
+    /// Dismiss on Escape or any click outside the panel (this app or another).
+    func dismissPanel() {
+        removeDismissMonitors()
+        orderOut(nil)
+        onClose?()
+    }
+
+    private func installDismissMonitors() {
+        removeDismissMonitors()
+        globalMon = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.dismissPanel()
+        }
+        localMon = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] e in
+            guard let self else { return e }
+            if e.type == .keyDown {
+                if e.keyCode == 53 { self.dismissPanel(); return nil }   // Escape
+                return e
+            }
+            if e.window !== self { self.dismissPanel() }                 // click in another window → dismiss
+            return e
+        }
+    }
+    private func removeDismissMonitors() {
+        if let g = globalMon { NSEvent.removeMonitor(g); globalMon = nil }
+        if let l = localMon  { NSEvent.removeMonitor(l);  localMon = nil }
+    }
+}
+
+/// One clipboard row: preview text (click to copy back) + pin/delete on hover.
+final class ClipRowView: NSView {
+    private let onCopy: () -> Void
+    private let onPin: () -> Void
+    private let onDelete: () -> Void
+    private let pinBtn = NSButton()
+    private let delBtn = NSButton()
+
+    init(clip: ClipItem, onCopy: @escaping () -> Void, onPin: @escaping () -> Void, onDelete: @escaping () -> Void) {
+        self.onCopy = onCopy; self.onPin = onPin; self.onDelete = onDelete
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
+        layer?.cornerRadius = 7
+
+        let preview = clip.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ")
+        let label = NSTextField(labelWithString: String(preview.prefix(140)))
+        label.font = .systemFont(ofSize: 12); label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 2
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        pinBtn.isBordered = false; pinBtn.title = clip.pinned ? "📌" : "📍"
+        pinBtn.font = .systemFont(ofSize: 12)
+        pinBtn.target = self; pinBtn.action = #selector(pinTapped)
+        pinBtn.alphaValue = clip.pinned ? 1 : 0.35
+        pinBtn.translatesAutoresizingMaskIntoConstraints = false
+        delBtn.isBordered = false; delBtn.title = "✕"
+        delBtn.font = .systemFont(ofSize: 11); delBtn.contentTintColor = .secondaryLabelColor
+        delBtn.target = self; delBtn.action = #selector(delTapped)
+        delBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(label); addSubview(pinBtn); addSubview(delBtn)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: pinBtn.leadingAnchor, constant: -6),
+            pinBtn.trailingAnchor.constraint(equalTo: delBtn.leadingAnchor, constant: -2),
+            pinBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
+            pinBtn.widthAnchor.constraint(equalToConstant: 22),
+            delBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            delBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
+            delBtn.widthAnchor.constraint(equalToConstant: 18),
+        ])
+        let click = NSClickGestureRecognizer(target: self, action: #selector(rowClicked))
+        addGestureRecognizer(click)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func rowClicked() { onCopy() }
+    @objc private func pinTapped()  { onPin() }
+    @objc private func delTapped()  { onDelete() }
+}
+
+// MARK: - Display management
+//
+// Phase 1 (this file): software brightness via the PUBLIC gamma-table API — dims
+// ANY display (built-in, or a cheap external with no DDC) with no permission and
+// no private API. Later phases layer on DDC/CI hardware brightness (private
+// IOAVService), display arrangement, presets (unified with Workflows), and HiDPI.
+// All display code is clean-room from the VESA DDC/CI spec + public references,
+// never copied from another project's source.
+
+struct ManagedDisplay: Equatable {
+    let id: CGDirectDisplayID
+    let uuid: String          // stable across reconnects; used as the persistence key
+    let name: String
+    let isBuiltin: Bool
+}
+
+/// A saved display layout: per-display position, resolution, and mirror state,
+/// keyed by stable UUID so it re-applies to the same physical monitors.
+struct DisplayLayout: Codable {
+    let name: String
+    let entries: [Entry]
+    struct Entry: Codable {
+        let uuid: String
+        let originX: Double
+        let originY: Double
+        let modeID: Int32?
+        let mirroredToMain: Bool
+    }
+}
+
+/// Per-display image adjustments. Neutral defaults (0.5 = no change) except
+/// brightness (1.0 = full). Applied as a single per-channel gamma LUT.
+struct DisplayAdjustments: Codable, Equatable {
+    var brightness:  Double = 1.0    // 0.15…1.0
+    var contrast:    Double = 0.5    // 0 low … 0.5 neutral … 1 high
+    var temperature: Double = 0.5    // 0 warm … 0.5 neutral … 1 cool
+    var gamma:       Double = 0.5    // 0 dark mids … 0.5 neutral … 1 bright mids
+    var invert:      Bool   = false
+}
+
+/// DDC/CI hardware brightness (and other VCP features) for EXTERNAL monitors.
+///
+/// Clean-room from the VESA DDC/CI spec + public write-ups (BetterDummy /
+/// MonitorControl / alinpanaitiu "DDC on M1"). On Apple Silicon the only working
+/// transport is Apple's private `IOAVService` (no public header ships, and the
+/// public IOFramebuffer I2C path is a silent no-op on M-series). Those three C
+/// symbols are bound at runtime via dlsym — no bridging header, and if a future
+/// macOS drops them the whole feature degrades cleanly (callers fall back to the
+/// gamma dimmer). Private-API use bars the Mac App Store, which Axe is not on.
+final class DDCController {
+
+    // ── Runtime binding of the private IOAVService C functions ───────
+    private typealias CreateFn = @convention(c) (CFAllocator?, io_service_t) -> Unmanaged<CFTypeRef>?
+    private typealias RWFn     = @convention(c) (CFTypeRef, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> IOReturn
+
+    private static let handle = dlopen(nil, RTLD_NOW)   // IOKit is already loaded via AppKit
+    private static func bind<T>(_ name: String, _ t: T.Type) -> T? {
+        guard let p = dlsym(handle, name) else { return nil }
+        return unsafeBitCast(p, to: T.self)
+    }
+    private static let createAV: CreateFn? = bind("IOAVServiceCreateWithService", CreateFn.self)
+    private static let readAV:   RWFn?     = bind("IOAVServiceReadI2C",  RWFn.self)
+    private static let writeAV:  RWFn?     = bind("IOAVServiceWriteI2C", RWFn.self)
+
+    /// True only if the private transport resolved on this OS.
+    static var isAvailable: Bool { createAV != nil && readAV != nil && writeAV != nil }
+
+    private let brightnessVCP: UInt8 = 0x10
+    private let contrastVCP:   UInt8 = 0x12
+    private let ddcAddr:  UInt32 = 0x37   // DDC/CI I2C device address
+    private let ddcOffset: UInt32 = 0x51  // sub-address IOAVService writes at
+
+    private var serviceCache: [CGDirectDisplayID: CFTypeRef] = [:]
+    private var maxCache:     [CGDirectDisplayID: UInt16] = [:]
+
+    func invalidateCache() { serviceCache.removeAll(); maxCache.removeAll() }
+
+    // ── IOAVService ↔ display matching ───────────────────────────────
+    private func avService(for displayID: CGDirectDisplayID) -> CFTypeRef? {
+        if let cached = serviceCache[displayID] { return cached }
+        guard DDCController.isAvailable, let create = DDCController.createAV else { return nil }
+
+        let externals = activeExternalDisplayIDs()
+        guard !externals.isEmpty else { return nil }
+
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                                           IOServiceMatching("DCPAVServiceProxy"),
+                                           &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+
+        var mapped = Set<CGDirectDisplayID>()
+        var firstExternalService: CFTypeRef?
+        var result: CFTypeRef?
+
+        var node = IOIteratorNext(iterator)
+        while node != IO_OBJECT_NULL {
+            defer { IOObjectRelease(node); node = IOIteratorNext(iterator) }
+
+            // Skip nodes explicitly marked non-External (some drivers omit the key).
+            if let loc = IORegistryEntryCreateCFProperty(node, "Location" as CFString,
+                                                         kCFAllocatorDefault, 0)?
+                            .takeRetainedValue() as? String, loc != "External" {
+                continue
+            }
+            guard let unmanaged = create(kCFAllocatorDefault, node) else { continue }
+            let service = unmanaged.takeRetainedValue()
+            if firstExternalService == nil { firstExternalService = service }
+
+            // Preferred: walk the IORegistry parent chain for DisplayVendorID/ProductID
+            // and match against a CoreGraphics external display.
+            if let matched = matchByVendorProduct(node: node, candidates: externals, exclude: mapped) {
+                mapped.insert(matched)
+                serviceCache[matched] = service
+                if matched == displayID { result = service }
+            }
+        }
+
+        // Fallback: exactly one external display → pair it with the first external
+        // AVService found (single-monitor is the common case).
+        if result == nil, externals.count == 1, externals.first == displayID,
+           let only = firstExternalService {
+            serviceCache[displayID] = only
+            result = only
+        }
+        return result
+    }
+
+    private func activeExternalDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 }
+    }
+
+    private func matchByVendorProduct(node: io_service_t,
+                                      candidates: [CGDirectDisplayID],
+                                      exclude: Set<CGDirectDisplayID>) -> CGDirectDisplayID? {
+        var chain: [io_service_t] = []
+        var current = node
+        IOObjectRetain(current); chain.append(current)
+        for _ in 0..<7 {
+            var parent: io_service_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS,
+                  parent != IO_OBJECT_NULL else { break }
+            chain.append(parent); current = parent
+        }
+        defer { chain.forEach { IOObjectRelease($0) } }
+
+        for n in chain {
+            var propsRef: Unmanaged<CFMutableDictionary>?
+            guard IORegistryEntryCreateCFProperties(n, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+                  let props = propsRef?.takeRetainedValue() as? [String: Any] else { continue }
+            func u32(_ any: Any?) -> UInt32? {
+                if let v = any as? UInt32 { return v }
+                if let v = any as? Int { return UInt32(truncatingIfNeeded: v) }
+                return nil
+            }
+            guard let vendor = u32(props["DisplayVendorID"]),
+                  let product = u32(props["DisplayProductID"]) else { continue }
+            for id in candidates where !exclude.contains(id) {
+                if CGDisplayVendorNumber(id) == vendor && CGDisplayModelNumber(id) == product { return id }
+            }
+        }
+        return nil
+    }
+
+    // ── VCP read / write (DDC/CI packet framing) ─────────────────────
+    @discardableResult
+    private func writeVCP(_ vcp: UInt8, value: UInt16, service: CFTypeRef) -> Bool {
+        guard let write = DDCController.writeAV else { return false }
+        let hi = UInt8((value >> 8) & 0xFF), lo = UInt8(value & 0xFF)
+        var checksum = UInt8(0x6E ^ 0x51)
+        let payload: [UInt8] = [0x84, 0x03, vcp, hi, lo]
+        for b in payload { checksum ^= b }
+        var buf = payload + [checksum]
+        let ret = buf.withUnsafeMutableBytes { raw in
+            write(service, ddcAddr, ddcOffset, raw.baseAddress!, UInt32(raw.count))
+        }
+        return ret == kIOReturnSuccess
+    }
+
+    private func readVCP(_ vcp: UInt8, service: CFTypeRef) -> (current: UInt16, max: UInt16)? {
+        guard let write = DDCController.writeAV, let read = DDCController.readAV else { return nil }
+        var checksum = UInt8(0x6E ^ 0x51)
+        let payload: [UInt8] = [0x82, 0x01, vcp]
+        for b in payload { checksum ^= b }
+        var req = payload + [checksum]
+        let wret = req.withUnsafeMutableBytes { raw in
+            write(service, ddcAddr, ddcOffset, raw.baseAddress!, UInt32(raw.count))
+        }
+        guard wret == kIOReturnSuccess else { return nil }
+        Thread.sleep(forTimeInterval: 0.04)   // per DDC/CI spec, let the display prepare its reply
+        var reply = [UInt8](repeating: 0, count: 12)
+        let rret = reply.withUnsafeMutableBytes { raw in
+            read(service, ddcAddr, ddcOffset, raw.baseAddress!, UInt32(raw.count))
+        }
+        guard rret == kIOReturnSuccess, reply.count >= 10 else { return nil }
+        let maxV = (UInt16(reply[6]) << 8) | UInt16(reply[7])
+        let curV = (UInt16(reply[8]) << 8) | UInt16(reply[9])
+        // A garbage/echoed reply (max 0) means the monitor doesn't really speak DDC here.
+        guard maxV > 0 else { return nil }
+        return (curV, maxV)
+    }
+
+    // ── Public API (call OFF the main thread — reads sleep ~40ms) ─────
+    /// Returns true if this display responds to a DDC brightness read.
+    func supportsBrightness(_ displayID: CGDirectDisplayID) -> Bool {
+        guard let svc = avService(for: displayID) else { return false }
+        if let r = readVCP(brightnessVCP, service: svc) { maxCache[displayID] = r.max; return true }
+        return false
+    }
+
+    /// Current hardware brightness as 0…1, or nil if unavailable.
+    func brightness(_ displayID: CGDirectDisplayID) -> Double? {
+        guard let svc = avService(for: displayID), let r = readVCP(brightnessVCP, service: svc),
+              r.max > 0 else { return nil }
+        maxCache[displayID] = r.max
+        return Double(r.current) / Double(r.max)
+    }
+
+    /// Set hardware brightness (0…1). Returns false if DDC isn't available.
+    @discardableResult
+    func setBrightness(_ level: Double, for displayID: CGDirectDisplayID) -> Bool {
+        guard let svc = avService(for: displayID) else { return false }
+        let maxV = maxCache[displayID] ?? readVCP(brightnessVCP, service: svc)?.max ?? 100
+        maxCache[displayID] = maxV
+        let v = UInt16((max(0, min(1, level)) * Double(maxV)).rounded())
+        return writeVCP(brightnessVCP, value: v, service: svc)
+    }
+}
+
+final class DisplayManager {
+    static let shared = DisplayManager()
+    private init() {}
+
+    private let d = UserDefaults.standard
+    private let adjustmentsKey = "displayAdjustments"          // [uuid: DisplayAdjustments]
+    private let legacyBrightnessKey = "displaySoftwareBrightness"  // [uuid: Double] (migrated)
+    /// Never let the user drive a screen fully black.
+    static let minBrightness: Double = 0.15
+
+    // ── DDC/CI hardware brightness (external monitors) ───────────────
+    let ddc = DDCController()
+    private let ddcQueue = DispatchQueue(label: "com.emerytech.axe.ddc")   // serial; DDC I2C is slow
+    private var ddcSupported: [String: Bool] = [:]   // uuid → responds to DDC brightness (main-thread only)
+    private var ddcWriteItem: [CGDirectDisplayID: DispatchWorkItem] = [:]  // debounce coalescing
+
+    // ── Enumeration ──────────────────────────────────────────────
+    func currentDisplays() -> [ManagedDisplay] {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count)).map { id in
+            ManagedDisplay(id: id, uuid: DisplayManager.uuid(for: id),
+                           name: DisplayManager.name(for: id),
+                           isBuiltin: CGDisplayIsBuiltin(id) != 0)
+        }
+    }
+
+    /// Stable per-display key (survives reconnect / display-ID reshuffles).
+    static func uuid(for id: CGDirectDisplayID) -> String {
+        guard let ref = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else {
+            return "display-\(id)"
+        }
+        return CFUUIDCreateString(nil, ref) as String
+    }
+
+    /// Localized display name via the matching NSScreen (CGDirectDisplayID ↔ NSScreenNumber).
+    static func name(for id: CGDirectDisplayID) -> String {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        for s in NSScreen.screens where (s.deviceDescription[key] as? NSNumber)?.uint32Value == id {
+            return s.localizedName
+        }
+        return CGDisplayIsBuiltin(id) != 0 ? "Built-in Display" : "Display \(id)"
+    }
+
+    // ── Image adjustments (public per-channel gamma LUT) ─────────────
+    private var adjustmentsMap: [String: DisplayAdjustments] {
+        get {
+            if let data = d.data(forKey: adjustmentsKey),
+               let m = try? JSONDecoder().decode([String: DisplayAdjustments].self, from: data) {
+                return m
+            }
+            // Migrate legacy per-uuid brightness (pre-adjustments builds).
+            if let old = d.dictionary(forKey: legacyBrightnessKey) as? [String: Double] {
+                return old.mapValues { DisplayAdjustments(brightness: $0) }
+            }
+            return [:]
+        }
+        set { d.set(try? JSONEncoder().encode(newValue), forKey: adjustmentsKey) }
+    }
+
+    func adjustments(forUUID uuid: String) -> DisplayAdjustments { adjustmentsMap[uuid] ?? DisplayAdjustments() }
+    func softwareBrightness(forUUID uuid: String) -> Double { adjustments(forUUID: uuid).brightness }
+
+    /// Persist a display's adjustments and apply them: DDC backlight for hardware
+    /// displays (debounced), plus a per-channel gamma LUT for temperature/contrast/
+    /// gamma/invert (and for software brightness).
+    func setAdjustments(_ adj: DisplayAdjustments, for display: ManagedDisplay) {
+        var m = adjustmentsMap; m[display.uuid] = adj; adjustmentsMap = m
+        let hw = usesHardwareBrightness(display)
+        if hw {
+            let level = max(0, min(1, adj.brightness))
+            ddcWriteItem[display.id]?.cancel()
+            let item = DispatchWorkItem { [weak self] in self?.ddc.setBrightness(level, for: display.id) }
+            ddcWriteItem[display.id] = item
+            ddcQueue.asyncAfter(deadline: .now() + 0.02, execute: item)
+        }
+        applyLUT(adj, to: display.id, includeBrightness: !hw)
+    }
+
+    /// Mutate one display's adjustments in place and re-apply.
+    func updateAdjustment(for display: ManagedDisplay, _ mutate: (inout DisplayAdjustments) -> Void) {
+        var adj = adjustments(forUUID: display.uuid)
+        mutate(&adj)
+        setAdjustments(adj, for: display)
+    }
+
+    private func applyLUT(_ adj: DisplayAdjustments, to id: CGDirectDisplayID, includeBrightness: Bool) {
+        let n = 256
+        let bright   = includeBrightness ? max(DisplayManager.minBrightness, adj.brightness) : 1.0
+        let gammaExp = pow(2.0, (0.5 - adj.gamma) * 2.0)   // 0.5 → 1.0
+        let contrast = 0.5 + adj.contrast                  // 0.5 → 1.0
+        // Temperature: warm (<0.5) trims blue, cool (>0.5) trims red.
+        let rScale = adj.temperature > 0.5 ? (1.5 - adj.temperature) : 1.0
+        let bScale = adj.temperature < 0.5 ? (0.5 + adj.temperature) : 1.0
+        var r = [CGGammaValue](repeating: 0, count: n)
+        var g = [CGGammaValue](repeating: 0, count: n)
+        var b = [CGGammaValue](repeating: 0, count: n)
+        for i in 0..<n {
+            var v = Double(i) / Double(n - 1)
+            v = pow(v, gammaExp)
+            v = (v - 0.5) * contrast + 0.5
+            v = min(1, max(0, v))
+            if adj.invert { v = 1 - v }
+            r[i] = CGGammaValue(v * bright * rScale)
+            g[i] = CGGammaValue(v * bright)
+            b[i] = CGGammaValue(v * bright * bScale)
+        }
+        CGSetDisplayTransferByTable(id, UInt32(n), r, g, b)
+    }
+
+    // ── Hardware / software routing ──────────────────────────────────
+    /// Whether a display should use hardware (DDC) brightness: external + probed OK.
+    func usesHardwareBrightness(_ display: ManagedDisplay) -> Bool {
+        !display.isBuiltin && (ddcSupported[display.uuid] ?? false)
+    }
+
+    /// True once we know a display's DDC status (built-ins are known immediately).
+    func isProbed(_ display: ManagedDisplay) -> Bool {
+        display.isBuiltin || ddcSupported[display.uuid] != nil
+    }
+
+    /// Probe DDC support for not-yet-probed external displays off the main thread,
+    /// then call `completion` on main. Immediate no-op when nothing needs probing.
+    func probeDDC(_ displays: [ManagedDisplay], completion: @escaping () -> Void) {
+        let todo = displays.filter { !$0.isBuiltin && ddcSupported[$0.uuid] == nil }
+        guard DDCController.isAvailable, !todo.isEmpty else { completion(); return }
+        ddcQueue.async { [weak self] in
+            guard let self else { return }
+            let results = todo.map { ($0.uuid, self.ddc.supportsBrightness($0.id)) }
+            DispatchQueue.main.async {
+                for (uuid, ok) in results { self.ddcSupported[uuid] = ok }
+                completion()
+            }
+        }
+    }
+
+    /// Read a display's current brightness (0…1) for the UI. Hardware read is async.
+    func readBrightness(for display: ManagedDisplay, completion: @escaping (Double) -> Void) {
+        if usesHardwareBrightness(display) {
+            ddcQueue.async { [weak self] in
+                let v = self?.ddc.brightness(display.id) ?? 1.0
+                DispatchQueue.main.async { completion(v) }
+            }
+        } else {
+            completion(softwareBrightness(forUUID: display.uuid))
+        }
+    }
+
+    /// Unified brightness setter for the UI — updates just the brightness field of
+    /// the display's adjustments (DDC for supported externals, gamma otherwise).
+    func setBrightness(_ v: Double, for display: ManagedDisplay) {
+        updateAdjustment(for: display) { $0.brightness = max(0, min(1, v)) }
+    }
+
+    // ── Resolution / display modes (public CoreGraphics) ─────────────
+    struct ModeOption { let mode: CGDisplayMode; let label: String; let isHiDPI: Bool }
+
+    /// All usable resolutions for a display, incl. hidden/HiDPI modes, de-duplicated
+    /// by point size + HiDPI and sorted largest-first (HiDPI preferred within a size).
+    func availableModes(for id: CGDirectDisplayID) -> [ModeOption] {
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        guard let modes = CGDisplayCopyAllDisplayModes(id, opts) as? [CGDisplayMode] else { return [] }
+        var seen = Set<String>()
+        var out: [ModeOption] = []
+        for m in modes where m.isUsableForDesktopGUI() {
+            let hidpi = m.pixelWidth > m.width
+            let key = "\(m.width)x\(m.height)-\(hidpi)"
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            out.append(ModeOption(mode: m,
+                                  label: "\(m.width) × \(m.height)" + (hidpi ? "  · HiDPI" : ""),
+                                  isHiDPI: hidpi))
+        }
+        out.sort { a, b in
+            let aa = a.mode.width * a.mode.height, bb = b.mode.width * b.mode.height
+            if aa != bb { return aa > bb }
+            return a.isHiDPI && !b.isHiDPI
+        }
+        return out
+    }
+
+    func currentModeID(for id: CGDirectDisplayID) -> Int32? { CGDisplayCopyDisplayMode(id)?.ioDisplayModeID }
+
+    /// Switch a display to a mode inside a config transaction. Applied permanently.
+    @discardableResult
+    func setMode(_ mode: CGDisplayMode, for id: CGDirectDisplayID) -> Bool {
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return false }
+        guard CGConfigureDisplayWithDisplayMode(cfg, id, mode, nil) == .success else {
+            CGCancelDisplayConfiguration(cfg); return false
+        }
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    // ── Arrangement (public CoreGraphics) ────────────────────────────
+    func isMain(_ id: CGDirectDisplayID) -> Bool { CGDisplayIsMain(id) != 0 }
+
+    /// Make a display the main one by shifting every display so this one lands at
+    /// the (0,0) global origin (which macOS treats as the main display).
+    @discardableResult
+    func setAsMain(_ id: CGDirectDisplayID) -> Bool {
+        let b = CGDisplayBounds(id)
+        guard b.origin.x != 0 || b.origin.y != 0 else { return true }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return false }
+        for disp in currentDisplays() {
+            let db = CGDisplayBounds(disp.id)
+            CGConfigureDisplayOrigin(cfg, disp.id,
+                                     Int32(db.origin.x - b.origin.x),
+                                     Int32(db.origin.y - b.origin.y))
+        }
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    func isMirroring() -> Bool {
+        let main = CGMainDisplayID()
+        return currentDisplays().contains { $0.id != main && CGDisplayIsInMirrorSet($0.id) != 0 }
+    }
+
+    /// Mirror all secondary displays onto the main display, or stop mirroring.
+    @discardableResult
+    func setMirroring(_ on: Bool) -> Bool {
+        let displays = currentDisplays()
+        guard displays.count >= 2 else { return false }
+        let main = CGMainDisplayID()
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return false }
+        for disp in displays where disp.id != main {
+            CGConfigureDisplayMirrorOfDisplay(cfg, disp.id, on ? main : kCGNullDirectDisplay)
+        }
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    // ── Layout presets ───────────────────────────────────────────────
+    private let layoutsKey = "displayLayouts"
+    var layouts: [DisplayLayout] {
+        get {
+            guard let data = d.data(forKey: layoutsKey),
+                  let arr = try? JSONDecoder().decode([DisplayLayout].self, from: data) else { return [] }
+            return arr
+        }
+        set { d.set(try? JSONEncoder().encode(newValue), forKey: layoutsKey) }
+    }
+
+    func captureLayout(name: String) -> DisplayLayout {
+        let main = CGMainDisplayID()
+        let entries = currentDisplays().map { disp -> DisplayLayout.Entry in
+            let b = CGDisplayBounds(disp.id)
+            return DisplayLayout.Entry(uuid: disp.uuid,
+                                       originX: Double(b.origin.x), originY: Double(b.origin.y),
+                                       modeID: currentModeID(for: disp.id),
+                                       mirroredToMain: disp.id != main && CGDisplayIsInMirrorSet(disp.id) != 0)
+        }
+        return DisplayLayout(name: name, entries: entries)
+    }
+
+    func saveCurrentLayout(name: String) {
+        var all = layouts
+        all.removeAll { $0.name == name }   // overwrite same-named
+        all.append(captureLayout(name: name))
+        layouts = all
+    }
+
+    func deleteLayout(name: String) { layouts = layouts.filter { $0.name != name } }
+
+    /// Re-apply a saved layout to the currently-connected displays (matched by UUID).
+    @discardableResult
+    func applyLayout(_ layout: DisplayLayout) -> Bool {
+        let byUUID = Dictionary(currentDisplays().map { ($0.uuid, $0) }, uniquingKeysWith: { a, _ in a })
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return false }
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        for e in layout.entries {
+            guard let disp = byUUID[e.uuid] else { continue }
+            if let modeID = e.modeID,
+               let modes = CGDisplayCopyAllDisplayModes(disp.id, opts) as? [CGDisplayMode],
+               let m = modes.first(where: { $0.ioDisplayModeID == modeID }) {
+                CGConfigureDisplayWithDisplayMode(cfg, disp.id, m, nil)
+            }
+            CGConfigureDisplayMirrorOfDisplay(cfg, disp.id,
+                e.mirroredToMain ? CGMainDisplayID() : kCGNullDirectDisplay)
+            CGConfigureDisplayOrigin(cfg, disp.id, Int32(e.originX), Int32(e.originY))
+        }
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    /// Re-apply every persisted adjustment. macOS silently drops gamma tables on
+    /// wake, display reconfiguration, and when another app touches the LUT.
+    func reapplyAll() {
+        let map = adjustmentsMap
+        guard !map.isEmpty else { return }
+        for disp in currentDisplays() {
+            guard let adj = map[disp.uuid], adj != DisplayAdjustments() else { continue }
+            applyLUT(adj, to: disp.id, includeBrightness: !usesHardwareBrightness(disp))
+        }
+    }
+
+    /// Restore hardware color/gamma on all displays — called on quit and on
+    /// "Reset to Defaults" so a dim screen never outlives Axe managing it.
+    func restoreAll() { CGDisplayRestoreColorSyncSettings() }
+
+    /// Clear every persisted adjustment and restore full brightness/color
+    /// (used by Reset to Defaults).
+    func resetSoftwareBrightness() {
+        d.removeObject(forKey: adjustmentsKey)
+        d.removeObject(forKey: legacyBrightnessKey)
+        restoreAll()
+    }
+}
+
+/// A per-display brightness slider row (icon + name + slider). Auto-layout
+/// complete so it drops into the overlay's Displays panel stack. `labelColor`
+/// lets the caller tint text for the dark notch background.
+final class DisplayBrightnessRow: NSView {
+    private let slider = NSSlider()
+    private let display: ManagedDisplay
+
+    init(display: ManagedDisplay, labelColor: NSColor = .labelColor) {
+        self.display = display
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 48))
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: display.isBuiltin ? "laptopcomputer" : "display",
+                             accessibilityDescription: nil)
+        icon.contentTintColor = labelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let name = NSTextField(labelWithString: display.name)
+        name.font = .systemFont(ofSize: 12, weight: .medium)
+        name.textColor = labelColor
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let sun = NSImageView()
+        sun.image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+        sun.contentTintColor = labelColor.withAlphaComponent(0.6)
+        sun.translatesAutoresizingMaskIntoConstraints = false
+
+        slider.minValue = DisplayManager.minBrightness
+        slider.maxValue = 1.0
+        slider.doubleValue = DisplayManager.shared.softwareBrightness(forUUID: display.uuid)
+        slider.target = self
+        slider.action = #selector(changed)
+        slider.isContinuous = true
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.setAccessibilityLabel("\(display.name) brightness")
+        // The true current level (a DDC hardware read is async) — update when it lands.
+        DisplayManager.shared.readBrightness(for: display) { [weak slider] v in
+            slider?.doubleValue = max(DisplayManager.minBrightness, min(1.0, v))
+        }
+
+        addSubview(icon); addSubview(name); addSubview(sun); addSubview(slider)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor),
+            icon.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            name.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            sun.leadingAnchor.constraint(equalTo: leadingAnchor),
+            sun.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            sun.widthAnchor.constraint(equalToConstant: 14),
+            slider.leadingAnchor.constraint(equalTo: sun.trailingAnchor, constant: 7),
+            slider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            slider.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 7),
+            slider.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func changed() {
+        DisplayManager.shared.setBrightness(slider.doubleValue, for: display)
+    }
+}
+
+/// A resolution picker row (label + popup) for one display, listing usable modes
+/// incl. hidden HiDPI ones. Selecting a row switches the display's resolution.
+final class DisplayResolutionRow: NSView {
+    private let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let displayID: CGDirectDisplayID
+    private var options: [DisplayManager.ModeOption] = []
+
+    init(display: ManagedDisplay, labelColor: NSColor) {
+        self.displayID = display.id
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 26))
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: "Resolution")
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = labelColor.withAlphaComponent(0.7)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        popup.controlSize = .small
+        popup.font = .systemFont(ofSize: 11)
+        popup.target = self
+        popup.action = #selector(changed)
+        popup.setAccessibilityLabel("\(display.name) resolution")
+
+        options = DisplayManager.shared.availableModes(for: display.id)
+        let currentID = DisplayManager.shared.currentModeID(for: display.id)
+        popup.addItems(withTitles: options.map { $0.label })
+        if let idx = options.firstIndex(where: { $0.mode.ioDisplayModeID == currentID }) {
+            popup.selectItem(at: idx)
+        }
+        popup.isEnabled = options.count > 1
+
+        addSubview(label); addSubview(popup)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            popup.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+            popup.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            popup.centerYAnchor.constraint(equalTo: centerYAnchor),
+            topAnchor.constraint(equalTo: popup.topAnchor, constant: -3),
+            bottomAnchor.constraint(equalTo: popup.bottomAnchor, constant: 3),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func changed() {
+        let idx = popup.indexOfSelectedItem
+        guard idx >= 0, idx < options.count else { return }
+        DisplayManager.shared.setMode(options[idx].mode, for: displayID)
+    }
+}
+
+/// A compact labeled slider (icon + caption + slider) that reports live changes
+/// via a stored closure. Used for the per-display image adjustments.
+final class LabeledSliderRow: NSView {
+    private let slider = NSSlider()
+    private let onChange: (Double) -> Void
+
+    init(title: String, symbol: String, value: Double, minV: Double, maxV: Double,
+         labelColor: NSColor, onChange: @escaping (Double) -> Void) {
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 22))
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+        icon.contentTintColor = labelColor.withAlphaComponent(0.7)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let caption = NSTextField(labelWithString: title)
+        caption.font = .systemFont(ofSize: 11)
+        caption.textColor = labelColor.withAlphaComponent(0.75)
+        caption.translatesAutoresizingMaskIntoConstraints = false
+
+        slider.minValue = minV; slider.maxValue = maxV
+        slider.doubleValue = value
+        slider.isContinuous = true
+        slider.target = self; slider.action = #selector(changed)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.setAccessibilityLabel(title)
+
+        addSubview(icon); addSubview(caption); addSubview(slider)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            caption.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            caption.centerYAnchor.constraint(equalTo: centerYAnchor),
+            caption.widthAnchor.constraint(equalToConstant: 74),
+            slider.leadingAnchor.constraint(equalTo: caption.trailingAnchor, constant: 6),
+            slider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            slider.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: 22),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc private func changed() { onChange(slider.doubleValue) }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate,
@@ -4385,7 +6443,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // ── Sessions panel (shown inside the overlay on demand) ────────
     var isShowingSessions  = false
-    var overlayTabStrip:   NSSegmentedControl?  // "Axe | Sessions" tab strip
+    var isShowingDisplays  = false             // "Displays" tab active in the overlay
+    var overlayTabStrip:   NSSegmentedControl?  // "Axe | Workflows | Displays" tab strip
     private let choppingBlockNames = [
         "Chopping Block", "The Gallows", "Death Row", "The Guillotine",
         "The Firing Squad", "Last Rites", "The Axe", "The Noose",
@@ -4397,6 +6456,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     var appListContainer:  NSView?         // the NSScrollView holding the app table
     var sessionsPanelView: NSView?         // replaces the table area in sessions mode
     var sessionsListStack: NSStackView?    // inner stack rebuilt on each show
+    var displaysPanelView: NSView?         // replaces the table area in displays mode
+    var displaysListStack: NSStackView?    // inner stack rebuilt on each show
+    var displayActionBoxes: [ActionBox] = []   // retains closure targets for display buttons
 
     // Data
     var allApps:          [AppEntry]  = []
@@ -4433,12 +6495,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     /// materials) become hard to read. Slightly brighten them there — but
     /// kept subdued so the chrome stays subordinate to the app list itself.
     private var dimIconColor: NSColor {
-        AppSettings.uiStyle == .notch
+        effectiveUIStyle == .notch
             ? NSColor.white.withAlphaComponent(0.55)
             : .tertiaryLabelColor
     }
     private var dimHintColor: NSColor {
-        AppSettings.uiStyle == .notch
+        effectiveUIStyle == .notch
             ? NSColor.white.withAlphaComponent(0.40)
             : .quaternaryLabelColor
     }
@@ -4452,6 +6514,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // Notch indicator — persistent mini-panel shown when the overlay is closed
     private var notchIndicator: NotchIndicatorPanel?
+    private var notchHub: NotchHubPanel?
+    private var clipboardPanel: ClipboardPanel?
     private var notchHoverMonitor: Any?
 
     // New-Space restore — set when user taps "Restore on New Space"; cleared on space change
@@ -4573,6 +6637,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     // Carbon hot key
     var hotKeyRef: EventHotKeyRef?
+    var clipboardHotKeyRef: EventHotKeyRef?
+    private weak var clipboardPrevApp: NSRunningApplication?   // app to auto-paste back into
 
     // Settings / Onboarding / Nudge
     let settingsWindow   = SettingsWindow()
@@ -4596,7 +6662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.informativeText = prompt.body
         alert.addButton(withTitle: prompt.cancel)           // .alertFirstButtonReturn  (default — Return)
         let quitBtn = alert.addButton(withTitle: prompt.quit) // .alertSecondButtonReturn
-        if #available(macOS 11.0, *) { quitBtn.hasDestructiveAction = true }
+        quitBtn.hasDestructiveAction = true
         return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
     }
 
@@ -4651,6 +6717,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         startScheduleTimer()
 
+        // Re-apply any persisted per-display software brightness (gamma) on launch.
+        DisplayManager.shared.reapplyAll()
+
+        // Begin capturing clipboard history for the notch hub's clipboard module.
+        ClipboardStore.shared.start()
+
         // Notch indicator hardening: re-anchor after display changes, sleep/wake
         NotificationCenter.default.addObserver(
             self, selector: #selector(screenParametersChanged),
@@ -4669,6 +6741,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2) {
             self.checkForUpdates(userInitiated: false)
         }
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        // Don't leave a screen dimmed by a gamma table once Axe is gone — restore
+        // hardware color on quit. Persisted values are re-applied on next launch.
+        DisplayManager.shared.restoreAll()
     }
 
     // MARK: Status item
@@ -4737,7 +6815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             menu.addItem(.separator())
         }
 
-        addItem(menu, "Show Axe", key: "", tip: "⌘Z", action: #selector(toggleOverlay))
+        addItem(menu, "Show Axe", key: "", tip: AppSettings.shortcutLabel(), action: #selector(toggleOverlay))
         menu.addItem(.separator())
 
         let ramTitle: String
@@ -4784,10 +6862,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         menu.addItem(.separator())
 
         // Sessions submenu (all sessions)
-        let sessionsItem = NSMenuItem(title: "All Sessions", action: nil, keyEquivalent: "")
+        let sessionsItem = NSMenuItem(title: "All Workflows", action: nil, keyEquivalent: "")
         let sessionsSub  = NSMenu()
         if saved.isEmpty {
-            let empty = NSMenuItem(title: "No saved sessions", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No saved workflows", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             sessionsSub.addItem(empty)
         } else {
@@ -4888,6 +6966,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Settings / Onboarding
 
     @objc func openSettings()   { settingsWindow.show() }
+    /// Overlay gear → dismiss the overlay and open the standalone Settings window
+    /// (the sidebar+detail settings replace the old inline panel).
+    @objc func openStandaloneSettings() {
+        if isShowingSettings { toggleSettingsPanel() }
+        hideOverlay()
+        settingsWindow.show()
+    }
     @objc func showOnboarding() { onboardingWindow.show() }
     @objc func quitAxe()        { NSApp.terminate(nil) }
     @objc func showAbout()      { aboutWindow.show() }
@@ -5419,10 +7504,233 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // the in-overlay selectAll: fire instead of toggling.
         RegisterEventHotKey(AppSettings.hotKeyCode, AppSettings.hotKeyMods,
                             id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        refreshClipboardHotkey()
+    }
+
+    /// (Re)register or tear down the global clipboard hotkey (⌥⌘V).
+    func refreshClipboardHotkey() {
+        if let ref = clipboardHotKeyRef { UnregisterEventHotKey(ref); clipboardHotKeyRef = nil }
+        guard AppSettings.clipboardHotkeyEnabled else { return }
+        let cid = EventHotKeyID(signature: fourCC("axe!"), id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(cmdKey | optionKey),
+                            cid, GetApplicationEventTarget(), 0, &clipboardHotKeyRef)
     }
 
     /// Unregisters the current hot key and registers a fresh one from AppSettings.
     /// Call after the user changes the shortcut in Settings.
+    // MARK: Displays panel
+
+    /// Builds the Displays overlay panel (initially hidden). Populated on show by
+    /// refreshDisplaysPanel(), which tints text for the current overlay style.
+    private func buildDisplaysPanel() -> NSView {
+        let container = NSView()
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 16
+        stack.edgeInsets  = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let doc = FlippedStackView(); doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
+        scroll.documentView = doc
+        container.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: doc.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+        ])
+        displaysListStack = stack
+        return container
+    }
+
+    /// Rebuilds the Displays panel rows from the currently-connected displays.
+    func refreshDisplaysPanel() {
+        guard let stack = displaysListStack else { return }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        displayActionBoxes.removeAll()
+        let labelColor: NSColor = effectiveUIStyle == .notch ? .white : .labelColor
+        let displays = DisplayManager.shared.currentDisplays()
+
+        let header = NSTextField(labelWithString: "DISPLAYS")
+        header.font = .systemFont(ofSize: 10, weight: .semibold)
+        header.textColor = dimHintColor
+        stack.addArrangedSubview(header)
+
+        if displays.isEmpty {
+            let empty = NSTextField(labelWithString: "No displays detected.")
+            empty.font = .systemFont(ofSize: 12); empty.textColor = dimHintColor
+            stack.addArrangedSubview(empty)
+            return
+        }
+        for disp in displays {
+            // One group per display: brightness (with name) on top, then indented
+            // controls — resolution, warmth/contrast/gamma sliders, invert toggle.
+            let group = NSStackView()
+            group.orientation = .vertical
+            group.alignment = .leading
+            group.spacing = 8
+            group.translatesAutoresizingMaskIntoConstraints = false
+
+            let brow = DisplayBrightnessRow(display: disp, labelColor: labelColor)
+            let adj  = DisplayManager.shared.adjustments(forUUID: disp.uuid)
+            let rrow = DisplayResolutionRow(display: disp, labelColor: labelColor)
+
+            let tempRow = LabeledSliderRow(title: "Warmth", symbol: "thermometer.medium",
+                                           value: 1 - adj.temperature, minV: 0, maxV: 1,
+                                           labelColor: labelColor) { v in
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.temperature = 1 - v }
+            }
+            let contrastRow = LabeledSliderRow(title: "Contrast", symbol: "circle.lefthalf.filled",
+                                               value: adj.contrast, minV: 0, maxV: 1,
+                                               labelColor: labelColor) { v in
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.contrast = v }
+            }
+            let gammaRow = LabeledSliderRow(title: "Gamma", symbol: "dial.medium",
+                                            value: adj.gamma, minV: 0, maxV: 1,
+                                            labelColor: labelColor) { v in
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.gamma = v }
+            }
+
+            let invert = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+            invert.attributedTitle = NSAttributedString(string: "Invert colors",
+                attributes: [.foregroundColor: labelColor.withAlphaComponent(0.75),
+                             .font: NSFont.systemFont(ofSize: 11)])
+            invert.state = adj.invert ? .on : .off
+            let ibox = ActionBox { [weak invert] in
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.invert = (invert?.state == .on) }
+            }
+            displayActionBoxes.append(ibox)
+            invert.target = ibox; invert.action = #selector(ActionBox.invoke)
+
+            let controls = NSStackView()
+            controls.orientation = .vertical; controls.alignment = .leading; controls.spacing = 7
+            controls.translatesAutoresizingMaskIntoConstraints = false
+            [rrow, tempRow, contrastRow, gammaRow].forEach { controls.addArrangedSubview($0) }
+            controls.addArrangedSubview(invert)
+
+            group.addArrangedSubview(brow)
+            group.addArrangedSubview(controls)
+
+            stack.addArrangedSubview(group)
+            group.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+            brow.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            controls.leadingAnchor.constraint(equalTo: group.leadingAnchor, constant: 23).isActive = true
+            controls.trailingAnchor.constraint(equalTo: group.trailingAnchor).isActive = true
+            [rrow, tempRow, contrastRow, gammaRow].forEach {
+                $0.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
+            }
+        }
+        let note = NSTextField(wrappingLabelWithString:
+            "External monitors use hardware brightness (DDC) when supported; everything else dims in software.")
+        note.font = .systemFont(ofSize: 10)
+        note.textColor = dimHintColor
+        note.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(note)
+        note.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+
+        // Local helpers: a section header, and a small button whose closure target
+        // is retained in displayActionBoxes (cleared at the top of this method).
+        func sectionHeader(_ text: String) -> NSTextField {
+            let h = NSTextField(labelWithString: text)
+            h.font = .systemFont(ofSize: 10, weight: .semibold); h.textColor = dimHintColor
+            return h
+        }
+        func actionButton(_ title: String, _ handler: @escaping () -> Void) -> NSButton {
+            let b = NSButton(title: title, target: nil, action: nil)
+            b.bezelStyle = .rounded; b.controlSize = .small; b.font = .systemFont(ofSize: 11)
+            let box = ActionBox(handler)
+            displayActionBoxes.append(box)
+            b.target = box; b.action = #selector(ActionBox.invoke)
+            return b
+        }
+
+        // ── Arrangement (multi-display only) ──
+        if displays.count >= 2 {
+            stack.addArrangedSubview(sectionHeader("ARRANGEMENT"))
+
+            let mirror = NSButton(checkboxWithTitle: "Mirror displays", target: nil, action: nil)
+            mirror.attributedTitle = NSAttributedString(string: "Mirror displays",
+                attributes: [.foregroundColor: labelColor, .font: NSFont.systemFont(ofSize: 12)])
+            mirror.state = DisplayManager.shared.isMirroring() ? .on : .off
+            let mBox = ActionBox { [weak self, weak mirror] in
+                DisplayManager.shared.setMirroring(mirror?.state == .on)
+                self?.refreshDisplaysPanel()
+            }
+            displayActionBoxes.append(mBox)
+            mirror.target = mBox; mirror.action = #selector(ActionBox.invoke)
+            stack.addArrangedSubview(mirror)
+
+            for disp in displays where !DisplayManager.shared.isMain(disp.id) {
+                let id = disp.id
+                stack.addArrangedSubview(actionButton("Make “\(disp.name)” main") { [weak self] in
+                    DisplayManager.shared.setAsMain(id); self?.refreshDisplaysPanel()
+                })
+            }
+        }
+
+        // ── Layouts / presets ──
+        stack.addArrangedSubview(sectionHeader("LAYOUTS"))
+        let saved = DisplayManager.shared.layouts
+        if saved.isEmpty {
+            let empty = NSTextField(labelWithString: "No saved layouts yet.")
+            empty.font = .systemFont(ofSize: 11); empty.textColor = dimHintColor
+            stack.addArrangedSubview(empty)
+        } else {
+            for layout in saved {
+                let row = NSStackView(); row.orientation = .horizontal; row.spacing = 8
+                row.addArrangedSubview(actionButton("↺  \(layout.name)") { [weak self] in
+                    DisplayManager.shared.applyLayout(layout); self?.refreshDisplaysPanel()
+                })
+                row.addArrangedSubview(actionButton("✕") { [weak self] in
+                    DisplayManager.shared.deleteLayout(name: layout.name); self?.refreshDisplaysPanel()
+                })
+                stack.addArrangedSubview(row)
+            }
+        }
+        stack.addArrangedSubview(actionButton("Save current layout…") { [weak self] in
+            self?.saveLayoutTapped()
+        })
+
+        // Probe external displays for DDC once (off-main); rebuild if it changes a
+        // display's mode. Guarded so this can't loop: after probing, isProbed is true.
+        if displays.contains(where: { !DisplayManager.shared.isProbed($0) }) {
+            DisplayManager.shared.probeDDC(displays) { [weak self] in
+                guard let self, self.isShowingDisplays else { return }
+                self.refreshDisplaysPanel()
+            }
+        }
+    }
+
+    @objc func saveLayoutTapped() {
+        let alert = NSAlert()
+        alert.messageText = "Save display layout"
+        alert.informativeText = "Capture the current display positions, resolutions, and mirroring so you can restore them in one tap."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = "Layout \(DisplayManager.shared.layouts.count + 1)"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        DisplayManager.shared.saveCurrentLayout(name: name)
+        refreshDisplaysPanel()
+    }
+
     // MARK: Sessions panel
 
     /// Builds the sessions overlay panel view (initially hidden).
@@ -5452,13 +7760,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let saveBtn = NSButton()
         saveBtn.isBordered = false
-        if let sym = NSImage(systemSymbolName: "plus.circle", accessibilityDescription: "Save Session") {
+        if let sym = NSImage(systemSymbolName: "plus.circle", accessibilityDescription: "Save Workflow") {
             saveBtn.image = sym.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
         }
         saveBtn.contentTintColor = .controlAccentColor
         saveBtn.target = self; saveBtn.action = #selector(saveSessionFromPanel)
-        saveBtn.toolTip = "Save current session"
+        saveBtn.toolTip = "Save current workflow"
         saveBtn.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(saveBtn)
 
@@ -5470,7 +7778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
         }
         sortBtn.contentTintColor = AppSettings.sessionsSortOrder == 0 ? .tertiaryLabelColor : .controlAccentColor
-        sortBtn.toolTip = "Sort sessions"
+        sortBtn.toolTip = "Sort workflows"
         sortBtn.target = self; sortBtn.action = #selector(showSessionsSortMenu(_:))
         sortBtn.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(sortBtn)
@@ -5510,7 +7818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         container.addSubview(searchBar)
 
         let sf = NSSearchField()
-        sf.placeholderString = "Filter sessions…"
+        sf.placeholderString = "Filter workflows…"
         sf.font = .systemFont(ofSize: 12)
         sf.focusRingType = .none
         sf.controlSize = .small
@@ -5578,7 +7886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func buildQuickSaveBar() -> NSView {
         let bar = NSView(); bar.translatesAutoresizingMaskIntoConstraints = false
         let tf = NSTextField()
-        tf.placeholderString = "Name this session…"
+        tf.placeholderString = "Name this workflow…"
         tf.font = .systemFont(ofSize: 13)
         tf.isBordered = false; tf.drawsBackground = false; tf.focusRingType = .none
         tf.translatesAutoresizingMaskIntoConstraints = false
@@ -5842,7 +8150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let recents   = all.filter { !$0.isFavorite }
 
         if allSessions.isEmpty {
-            let empty = NSTextField(labelWithString: "No sessions yet.\nType a name above and tap \"Save & Close All\".")
+            let empty = NSTextField(labelWithString: "No workflows yet.\nType a name above and tap \"Save & Close All\".")
             empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
             empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
             empty.translatesAutoresizingMaskIntoConstraints = false
@@ -5860,7 +8168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         }
 
         if isFiltering && all.isEmpty {
-            let empty = NSTextField(labelWithString: "No sessions match \"\(query)\".")
+            let empty = NSTextField(labelWithString: "No workflows match \"\(query)\".")
             empty.font = .systemFont(ofSize: 12); empty.textColor = .tertiaryLabelColor
             empty.alignment = .center; empty.lineBreakMode = .byWordWrapping
             empty.translatesAutoresizingMaskIntoConstraints = false
@@ -6236,13 +8544,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc func toggleSettingsPanel() {
-        // Close sessions first if open — only one panel at a time.
+        // Close sessions/displays first if open — only one panel at a time.
         if isShowingSessions { toggleSessionsPanel() }
+        if isShowingDisplays { isShowingDisplays = false; overlayTabStrip?.selectedSegment = 0 }
         isShowingSettings.toggle()
         let showList = !isShowingSettings
         appListContainer?.isHidden  = !showList
         colHeaderView?.isHidden     = !showList
         sessionsPanelView?.isHidden = true           // never shown alongside settings
+        displaysPanelView?.isHidden = true
         settingsPanelView?.isHidden = !isShowingSettings
         overlaySettingsBtn?.contentTintColor = isShowingSettings ? .controlAccentColor : dimIconColor
         if isShowingSettings {
@@ -6255,7 +8565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func expandOverlayForSettings() {
-        let style = AppSettings.uiStyle
+        let style = effectiveUIStyle
 
         if style == .popover {
             popoverBGView?.layoutSubtreeIfNeeded()
@@ -6308,7 +8618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func collapseOverlayFromSettings() {
-        let style = AppSettings.uiStyle
+        let style = effectiveUIStyle
 
         if style == .popover {
             popoverBGView?.layoutSubtreeIfNeeded()
@@ -6364,8 +8674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
               let cv = p.contentView,
               let mask = cv.layer?.mask as? CAShapeLayer,
               let screen = NSScreen.main else { return }
-        var bezelH: CGFloat = 24
-        if #available(macOS 12.0, *) { bezelH = max(screen.safeAreaInsets.top, 24) }
+        let bezelH = max(screen.safeAreaInsets.top, 24)
         let baseContentH: CGFloat = 445
         let maxExtra = max(0, notchPanelTopY - baseContentH - bezelH - screen.frame.minY - 20)
         let clamped  = max(0, min(newExtra, maxExtra))
@@ -6390,25 +8699,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
 
-    @objc func toggleSessionsPanel() {
+    /// Switch the overlay content area to tab `index`: 0 = apps, 1 = Workflows,
+    /// 2 = Displays. Generalises the old binary sessions toggle to N panels while
+    /// preserving the cross-fade.
+    func switchToOverlayTab(_ index: Int) {
         // Close settings first if open.
         if isShowingSettings { toggleSettingsPanel() }
-        isShowingSessions.toggle()
-        overlayTabStrip?.selectedSegment = isShowingSessions ? 1 : 0
 
-        let incoming: NSView? = isShowingSessions ? sessionsPanelView : appListContainer
-        let outgoing: [NSView?] = isShowingSessions
-            ? [appListContainer, colHeaderView]
-            : [sessionsPanelView]
+        let panels: [NSView?] = [appListContainer, sessionsPanelView, displaysPanelView]
+        let idx = max(0, min(panels.count - 1, index))
+        isShowingSessions = (idx == 1)
+        isShowingDisplays = (idx == 2)
+        overlayTabStrip?.selectedSegment = idx
 
-        if isShowingSessions { refreshSessionsPanel() }
+        if idx == 1 { refreshSessionsPanel() }
+        if idx == 2 { refreshDisplaysPanel() }
+
+        let incoming = panels[idx]
+        var outgoing: [NSView?] = []
+        for (i, v) in panels.enumerated() where i != idx { outgoing.append(v) }
+        if idx != 0 { outgoing.append(colHeaderView) }   // column header belongs to the apps tab
 
         if AnimationConstants.reduceMotion {
             outgoing.forEach { $0?.isHidden = true }
             incoming?.isHidden = false
-            colHeaderView?.isHidden = isShowingSessions
+            colHeaderView?.isHidden = (idx != 0)
         } else {
-            // Fade out the leaving panel, then swap and fade the arriving one in.
+            // Fade out the leaving panels, then swap and fade the arriving one in.
             let dur: TimeInterval = 0.13
             outgoing.forEach { v in
                 guard let v, !v.isHidden else { return }
@@ -6427,7 +8744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                 incoming?.alphaValue = 0
                 incoming?.isHidden   = false
                 incoming?.wantsLayer = true
-                colHeaderView?.isHidden = isShowingSessions
+                colHeaderView?.isHidden = (idx != 0)
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = dur
                     ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -6436,19 +8753,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             }
         }
 
-        if isShowingSessions {
-            searchField?.window?.makeFirstResponder(nil)
-        } else {
+        if idx == 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
                 self?.searchField?.window?.makeFirstResponder(self?.searchField)
             }
+        } else {
+            searchField?.window?.makeFirstResponder(nil)
         }
         updateHint()
     }
 
+    /// Back-compat: toggles between the apps list and the Workflows panel. Only
+    /// ever called from reset paths guarded by `isShowingSessions`.
+    @objc func toggleSessionsPanel() {
+        switchToOverlayTab(isShowingSessions ? 0 : 1)
+    }
+
     @objc func overlayTabChanged(_ sender: NSSegmentedControl) {
-        let wantSessions = sender.selectedSegment == 1
-        if wantSessions != isShowingSessions { toggleSessionsPanel() }
+        switchToOverlayTab(sender.selectedSegment)
     }
 
     @objc func sessionsSearchChanged(_ sender: NSSearchField) {
@@ -6567,20 +8889,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
-    func reregisterHotKey() {
+    /// Re-register the global open-hotkey to the current AppSettings values.
+    /// Returns false if registration failed (e.g. an OS-reserved combo), in which
+    /// case there is no live hotkey — the caller should roll back and restore.
+    @discardableResult
+    func reregisterHotKey() -> Bool {
         if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
         let id = EventHotKeyID(signature: fourCC("axe!"), id: 1)
-        RegisterEventHotKey(AppSettings.hotKeyCode, AppSettings.hotKeyMods,
-                            id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        let status = RegisterEventHotKey(AppSettings.hotKeyCode, AppSettings.hotKeyMods,
+                                         id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        return status == noErr && hotKeyRef != nil
+    }
+
+    /// Apply side-effects after Settings → "Reset to Defaults" cleared the prefs,
+    /// so the live app reflects the restored values immediately.
+    func didResetSettings() {
+        reregisterHotKey()               // back to the default ⌘Z
+        AppSettings.setLaunchAtLogin(false)
+        resetNotchIndicator()            // reflect notch-indicator default (off)
+        updateMenuBarIcon()              // reflect badge default
+        DisplayManager.shared.resetSoftwareBrightness()   // clear per-display dims
     }
 
     // Called by the Carbon hot key. In spotlight mode, skip the toggle when
     // the panel is already key so ⌘A fires "select all" inside the search field.
-    func hotkeyPressed() {
+    func hotkeyPressed(id: UInt32 = 1) {
+        if id == 2 {                                   // clipboard hotkey (default ⌥⌘V)
+            captureClipboardPrevApp()
+            toggleClipboard()
+            return
+        }
         // Only suppress the toggle when the hotkey is ⌘A and spotlight is focused —
         // that lets NSTextField fire "select all" instead of closing the overlay.
         // For any other shortcut, always toggle so pressing the hotkey closes the overlay.
-        if AppSettings.uiStyle == .spotlight,
+        if effectiveUIStyle == .spotlight,
            AppSettings.hotKeyCode == UInt32(kVK_ANSI_A),
            AppSettings.hotKeyMods == UInt32(cmdKey),
            let p = panel, p.isVisible, p.isKeyWindow { return }
@@ -6602,6 +8944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc func workspaceChanged() {
         updateMenuBarIcon()
         updateNotchIndicator()   // always refresh count, even when overlay is hidden
+        updateNotchHub()
         guard let p = panel, p.isVisible else { return }
         updateTabStripCount()
         NSObject.cancelPreviousPerformRequests(withTarget: self,
@@ -6619,6 +8962,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         ind.update(appCount: count, lastSessionName: SessionManager.shared.all.first?.name)
     }
 
+    /// The connected display that has a hardware notch, if any. Deterministic:
+    /// current Mac hardware never has two notched displays. Prefers the main
+    /// screen when it is itself notched, otherwise scans all screens — so the
+    /// notch is still found when the built-in display isn't the primary one
+    /// (external set as main, clamshell, dragged menu bar).
+    func notchScreen() -> NSScreen? {
+        if let m = NSScreen.main, m.auxiliaryTopLeftArea != nil { return m }
+        return NSScreen.screens.first { $0.auxiliaryTopLeftArea != nil }
+    }
+
+    /// The UI style to actually render. Notch mode needs a notched display; on
+    /// non-notch / external / clamshell setups it would drop a black bar over
+    /// the menu bar, so it transparently degrades to the centered spotlight
+    /// overlay. This also makes the `.notch` first-run default safe on any Mac.
+    var effectiveUIStyle: UIStyle {
+        let s = AppSettings.uiStyle
+        return (s == .notch && notchScreen() == nil) ? .spotlight : s
+    }
+
     func resetNotchIndicator() {
         notchIndicator?.orderOut(nil)
         notchIndicator = nil
@@ -6626,11 +8988,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func syncNotchIndicator() {
-        if AppSettings.notchIndicatorEnabled {
+        // The centered hub supersedes the offset pill when both are enabled on a
+        // notched display — otherwise you'd get two ⚡ indicators flanking the notch.
+        let hubActive = AppSettings.notchHubEnabled && notchScreen() != nil
+        if AppSettings.notchIndicatorEnabled && !hubActive {
             if notchIndicator == nil {
-                guard let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main else { return }
-                // Only create on a notch screen
-                guard #available(macOS 12.0, *), screen.auxiliaryTopLeftArea != nil else { return }
+                // Anchor to whichever connected display actually has the notch,
+                // not just the primary — so the pill still shows when the built-in
+                // notched display isn't the main one.
+                guard let screen = notchScreen() else { return }
                 let ind = NotchIndicatorPanel(screen: screen, onRight: AppSettings.notchIndicatorOnRight)
                 ind.onOpen = { [weak self] in self?.openOverlayFromIndicator() }
                 notchIndicator = ind
@@ -6641,13 +9007,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             notchIndicator?.orderOut(nil)
             notchIndicator = nil
         }
+        syncNotchHub()
+    }
+
+    /// Create/tear down the centered notch hub (needs a notched display).
+    func syncNotchHub() {
+        if AppSettings.notchHubEnabled, let screen = notchScreen() {
+            if notchHub == nil {
+                let hub = NotchHubPanel(screen: screen)
+                hub.onOpenAxe      = { [weak self] in self?.showOverlay() }
+                hub.onOpenDisplays = { [weak self] in
+                    self?.showOverlay()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.switchToOverlayTab(2) }
+                }
+                hub.onOpenClipboard = { [weak self] in self?.toggleClipboard() }
+                notchHub = hub
+                updateNotchHub()
+            }
+            // Hide the hub while a full-screen app has hidden the menu bar.
+            if isMenuBarHidden { notchHub?.orderOut(nil) } else { notchHub?.orderFront(nil) }
+        } else {
+            notchHub?.orderOut(nil)
+            notchHub = nil
+        }
+    }
+
+    func resetNotchHub() {
+        notchHub?.orderOut(nil)
+        notchHub = nil
+        syncNotchHub()
+    }
+
+    private func updateNotchHub() {
+        guard let hub = notchHub else { return }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let count = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPID }.count
+        hub.update(appCount: count)
+    }
+
+    /// Show/hide the clipboard-history panel dropping from the notch.
+    func toggleClipboard() {
+        if clipboardPanel == nil {
+            guard let screen = notchScreen() ?? NSScreen.main else { return }
+            let p = ClipboardPanel(screen: screen)
+            p.onClose = { [weak self] in self?.refreshNotchHub() }
+            p.onPaste = { [weak self] in self?.performAutoPaste() }
+            clipboardPanel = p
+        }
+        if !(clipboardPanel?.isVisible ?? false) { captureClipboardPrevApp() }
+        notchHub?.orderOut(nil)                 // only one notch surface at a time
+        clipboardPanel?.toggle(on: notchScreen())
+    }
+
+    /// Remember the app that was frontmost so auto-paste can return focus to it.
+    private func captureClipboardPrevApp() {
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.bundleIdentifier != Bundle.main.bundleIdentifier { clipboardPrevApp = front }
+    }
+
+    /// Opt-in: after copy-back, return to the previous app and press ⌘V for the user.
+    /// Requires Accessibility (posting keystrokes to another app); no-op otherwise.
+    func performAutoPaste() {
+        guard AppSettings.autoPasteEnabled, AXIsProcessTrusted(), let app = clipboardPrevApp else { return }
+        if #available(macOS 14.0, *) { app.activate() }
+        else { app.activate(options: [.activateIgnoringOtherApps]) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            let src = CGEventSource(stateID: .combinedSessionState)
+            let v = CGKeyCode(kVK_ANSI_V)
+            let down = CGEvent(keyboardEventSource: src, virtualKey: v, keyDown: true); down?.flags = .maskCommand
+            let up   = CGEvent(keyboardEventSource: src, virtualKey: v, keyDown: false); up?.flags = .maskCommand
+            down?.post(tap: .cghidEventTap)
+            up?.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Show the notch hub only when no other notch surface (overlay / clipboard) is up.
+    func refreshNotchHub() {
+        guard AppSettings.notchHubEnabled, let hub = notchHub else { return }
+        let busy = (panel?.isVisible ?? false) || (clipboardPanel?.isVisible ?? false) || isMenuBarHidden
+        busy ? hub.orderOut(nil) : hub.orderFront(nil)
     }
 
     // MARK: Notch indicator visibility helpers
 
     /// True when the active Space has a full-screen app (menu bar is hidden).
     private var isMenuBarHidden: Bool {
-        guard let screen = NSScreen.main else { return false }
+        // Decide from the display the pill actually lives on (the notch screen),
+        // not NSScreen.main (the keyboard-focus screen) — otherwise a full-screen
+        // app on a *different* display would wrongly hide/show the pill.
+        guard let screen = notchScreen() ?? NSScreen.main else { return false }
         // When a full-screen app hides the menu bar, visibleFrame extends all
         // the way to frame.maxY with no reserved space at the top.
         return screen.visibleFrame.maxY >= screen.frame.maxY - 2
@@ -6656,43 +9105,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Show or hide the indicator based on overlay state and full-screen state.
     /// Call whenever space, frontmost app, or screen geometry changes.
     func updateNotchIndicatorVisibility() {
-        guard let ind = notchIndicator else { return }
         let overlayOpen = panel?.isVisible ?? false
         if overlayOpen { return }   // showNotch/hideOverlay own this when overlay is live
-        if isMenuBarHidden {
-            ind.orderOut(nil)
-        } else {
-            ind.orderFront(nil)
-        }
+        let hidden = isMenuBarHidden
+        if let ind = notchIndicator { hidden ? ind.orderOut(nil) : ind.orderFront(nil) }
+        if let hub = notchHub       { hidden ? hub.orderOut(nil) : hub.orderFront(nil) }
     }
 
     // MARK: Screen / sleep observers
 
     @objc func screenParametersChanged() {
         // Display was added, removed, or reconfigured. Tear down the indicator
-        // and rebuild after a short settle delay so it re-anchors to the notch
-        // on whatever screen is now primary. If the new primary screen has no
+        // and rebuild after a short settle delay so it re-anchors to the notched
+        // display (notchScreen scans all screens). If no connected display has a
         // notch, syncNotchIndicator's guard will refuse to create one.
-        notchIndicator?.orderOut(nil)
-        notchIndicator = nil
+        notchIndicator?.orderOut(nil); notchIndicator = nil
+        notchHub?.orderOut(nil); notchHub = nil      // re-anchor to the new notch geometry
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, !(self.panel?.isVisible ?? false) else { return }
-            self.syncNotchIndicator()
+            // Rebuild even if the overlay is open: syncNotchIndicator's visibility
+            // pass keeps the new pill hidden until the overlay closes, so a display
+            // change mid-overlay no longer strands the indicator at nil.
+            self?.syncNotchIndicator()
+            DisplayManager.shared.reapplyAll()   // macOS drops gamma on display reconfig
         }
     }
 
     @objc func screensDidSleep() {
         notchIndicator?.orderOut(nil)
+        notchHub?.orderOut(nil)
     }
 
     @objc func screensDidWake() {
         // Give the display driver time to settle before re-anchoring.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self else { return }
-            self.notchIndicator?.orderOut(nil)
-            self.notchIndicator = nil
-            guard !(self.panel?.isVisible ?? false) else { return }
-            self.syncNotchIndicator()
+            self.notchIndicator?.orderOut(nil); self.notchIndicator = nil
+            self.notchHub?.orderOut(nil); self.notchHub = nil
+            self.syncNotchIndicator()   // rebuild even if the overlay is open (see above)
+            DisplayManager.shared.reapplyAll()   // macOS drops gamma on wake
         }
     }
 
@@ -6711,14 +9161,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let now = Date()
         var sessions = SessionManager.shared.all
         var changed = false
+        // The Space-switch path routes through a single pendingSpaceRestoreSession
+        // slot that activeSpaceChanged consumes asynchronously, so only one can be
+        // in flight per tick. If several are due at once, handle one and leave the
+        // rest untouched so they fire on the next tick — never silently dropped.
+        var didSpaceSwitch = false
         for i in sessions.indices {
             guard var sched = sessions[i].scheduledRestore else { continue }
             let reference = sched.lastFiredDate ?? Date.distantPast
             guard let next = sched.nextFireDate(after: reference), next <= now else { continue }
+            if didSpaceSwitch { continue }   // defer to next tick; don't advance its schedule
 
             // Restore on a new Space without showing the confirmation alert
             pendingSpaceRestoreSession = sessions[i]
-            if !createAndSwitchToNewSpace() {
+            if createAndSwitchToNewSpace() {
+                didSpaceSwitch = true
+            } else {
                 // CGS API unavailable — fall back to restoring on current space
                 pendingSpaceRestoreSession = nil
                 SessionManager.shared.restore(sessions[i])
@@ -6818,7 +9276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     var isOverlayVisible: Bool {
-        switch AppSettings.uiStyle {
+        switch effectiveUIStyle {
         case .spotlight: return panel?.isVisible ?? false
         case .popover:   return popover?.isShown  ?? false
         case .notch:     return panel?.isVisible ?? false   // shares the spotlight panel
@@ -6834,26 +9292,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         overlayTabStrip = nil; appListContainer = nil
         sessionsPanelView = nil; sessionsListStack = nil; sessionsSearchField = nil
         sessionsFilterQuery = ""
+        displaysPanelView = nil; displaysListStack = nil
         settingsPanelView = nil; overlaySettingsBtn = nil; colHeaderView = nil
         listScrollHeightConstraint = nil; baseListScrollHeight = 0
         panelInnerHeightConstraint = nil; basePanelInnerHeight = 0
         notchPanelTopY = 0
-        isShowingSessions = false; isShowingSettings = false
+        isShowingSessions = false; isShowingSettings = false; isShowingDisplays = false
         lastBuiltStyle = nil
         // Hide indicator when leaving notch mode (it only lives in notch mode)
         notchIndicator?.orderOut(nil); notchIndicator = nil
     }
 
     func showOverlay() {
-        // Rebuild if the user switched styles since last open
-        if let built = lastBuiltStyle, built != AppSettings.uiStyle { teardownOverlay() }
+        // Only one notch surface at a time — tuck the hub/clipboard away while the
+        // main overlay is up (avoids two overlapping dropdowns at the notch).
+        notchHub?.orderOut(nil)
+        clipboardPanel?.dismissPanel()
+        // Rebuild if the user switched styles since last open (compare against the
+        // effective style so a notch→spotlight downgrade on non-notch hardware
+        // doesn't force a teardown on every open).
+        if let built = lastBuiltStyle, built != effectiveUIStyle { teardownOverlay() }
 
         checkedPIDs.removeAll()
+        // Drop any kill PIDs left pending from a previous session (e.g. an app that
+        // refused to quit) so a stale entry can't permanently block click-outside
+        // auto-dismiss on this fresh open.
+        pendingKillPIDs.removeAll()
         stopPhraseCycling()
         currentKillPhrase = ""
-        isShowingSessions = false; isShowingSettings = false
+        isShowingSessions = false; isShowingSettings = false; isShowingDisplays = false
         condemningLabel = choppingBlockNames.randomElement() ?? "Axe"
         overlayTabStrip?.setLabel(condemningLabel, forSegment: 0)
+        overlayTabStrip?.selectedSegment = 0
         updateTabStripCount()
         // Sync view visibility to match the reset state — overlay may have been
         // dismissed while sessions or settings was open, leaving views in the
@@ -6862,6 +9332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         colHeaderView?.isHidden      = false
         appListContainer?.isHidden   = false
         sessionsPanelView?.isHidden  = true
+        displaysPanelView?.isHidden  = true
         // Reset any settings-expansion from previous session before showing.
         listScrollHeightConstraint?.constant = baseListScrollHeight
         panelInnerHeightConstraint?.constant = basePanelInnerHeight
@@ -6880,7 +9351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             self?.refreshCPUInPlace()
         }
 
-        switch AppSettings.uiStyle {
+        switch effectiveUIStyle {
         case .spotlight: showSpotlight()
         case .popover:   showPopover()
         case .notch:     showNotch()
@@ -7029,8 +9500,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Notch mode  (drops from the notch / top of screen, slides back up)
 
     private func showNotch() {
+        // Only reached when effectiveUIStyle == .notch, i.e. a notched display
+        // exists; anchor to it (not NSScreen.main) so the pill and the overlay
+        // always land on the same screen.
         if panel == nil { buildPanel(); lastBuiltStyle = .notch }
-        guard let screen = NSScreen.main, let p = panel else { return }
+        guard let screen = notchScreen() ?? NSScreen.main, let p = panel else { return }
 
         // Create or tear down the persistent indicator based on current setting
         if AppSettings.notchIndicatorEnabled, notchIndicator == nil {
@@ -7114,7 +9588,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func hideOverlay() {
         cpuRefreshTimer?.invalidate()
         cpuRefreshTimer = nil
-        switch lastBuiltStyle ?? AppSettings.uiStyle {
+        // Bring the notch hub back once the overlay has faded out.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.refreshNotchHub() }
+        switch lastBuiltStyle ?? effectiveUIStyle {
         case .spotlight:
             NotificationCenter.default.removeObserver(self,
                 name: NSWindow.didResignKeyNotification, object: panel)
@@ -7207,10 +9683,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // bar; the lower `contentH` holds the search bar / list / buttons.
         let W_inner: CGFloat = 560
         let contentH: CGFloat = 445 + AppSettings.notchExtraHeight
-        var bezelH: CGFloat = 24
-        if #available(macOS 12.0, *) {
-            bezelH = max((NSScreen.main?.safeAreaInsets.top) ?? 24, 24)
-        }
+        // Read the bezel inset from the notched display the panel anchors to, not
+        // NSScreen.main (which may be an external, non-notch display).
+        let bezelH = max((notchScreen()?.safeAreaInsets.top) ?? 24, 24)
         return NotchGeometry(
             W: W_inner,
             H: contentH + bezelH,    // taller, so the top region covers the menu bar
@@ -7267,7 +9742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     func buildPanel() {
-        let isNotch = AppSettings.uiStyle == .notch
+        let isNotch = effectiveUIStyle == .notch
         let searchH: CGFloat = 54
         let rowH: CGFloat    = 46
         let maxRows: CGFloat = 7
@@ -7297,6 +9772,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // bezel + menu bar + panel read as one continuous black surface.
         // Other styles stay at .floating (below menu bar).
         p.level              = isNotch ? .popUpMenu : .floating
+        // Join every Space (incl. other apps' full-screen Spaces) so ⌘Z opens the
+        // overlay in place instead of yanking the user out of a full-screen app.
+        // Without this, an accessory app's panel forces a Space switch to the desktop.
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.isReleasedWhenClosed = false
         p.backgroundColor    = .clear
 
@@ -7309,13 +9788,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             // notch shape so `showNotch` can animate it expanding outward.
             let outer = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
             outer.wantsLayer = true
-            outer.layer?.backgroundColor = NSColor.black.cgColor
+            outer.layer?.backgroundColor = NSColor.clear.cgColor   // skin fill provides the bg; mask shapes it
             outer.appearance = NSAppearance(named: .darkAqua)
             let mask = CAShapeLayer()
             mask.frame = outer.bounds
             mask.path  = notchPanelPath(t: 0, geometry: geo!)
             outer.layer?.mask = mask
             p.contentView = outer
+
+            // Skin background (Classic black / Liquid Glass frost), clipped by the
+            // notch mask along with everything else, so it morphs on show/collapse.
+            let skinFill = AppSettings.notchSkin.makeHubBackground(cornerRadius: 0, corners: [])
+            skinFill.translatesAutoresizingMaskIntoConstraints = false
+            outer.addSubview(skinFill)
+            NSLayoutConstraint.activate([
+                skinFill.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+                skinFill.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+                skinFill.topAnchor.constraint(equalTo: outer.topAnchor),
+                skinFill.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+            ])
 
             let inner = NSView()
             inner.wantsLayer = true
@@ -7421,7 +9912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         // ── Tab strip (Axe / Sessions) ─────────────────────────────
         let tabStripH: CGFloat = 32   // strip height; tabDiv adds 1 more pt below
-        let tabs = NSSegmentedControl(labels: ["Axe", "Sessions"],
+        let tabs = NSSegmentedControl(labels: ["Axe", "Workflows", "Displays"],
                                       trackingMode: .selectOne,
                                       target: self,
                                       action: #selector(overlayTabChanged(_:)))
@@ -7437,7 +9928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         NSLayoutConstraint.activate([
             tabs.topAnchor.constraint(equalTo: topDiv.bottomAnchor, constant: 5),
             tabs.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
-            tabs.widthAnchor.constraint(equalToConstant: 200),
+            tabs.widthAnchor.constraint(equalToConstant: 280),
             tabDiv.topAnchor.constraint(equalTo: topDiv.bottomAnchor, constant: tabStripH),
             tabDiv.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             tabDiv.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
@@ -7456,7 +9947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.action       = #selector(tableClicked)
         tv.doubleAction = #selector(tableDoubleClicked)
         tv.target       = self
-        if #available(macOS 12.0, *) { tv.style = .sourceList }
+        tv.style = .sourceList
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
         col.minWidth = 100; col.maxWidth = 10_000; col.width = 1   // AutoFitTableView corrects on first layout
         tv.addTableColumn(col)
@@ -7479,6 +9970,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         sp.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sp)
         sessionsPanelView = sp
+
+        // ── Displays panel (hidden until the Displays tab is selected) ─
+        let dp = buildDisplaysPanel()
+        dp.isHidden = true
+        dp.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(dp)
+        displaysPanelView = dp
 
         // ── Empty state ────────────────────────────────────────────
         let ev = EmptyStateView()
@@ -7521,6 +10019,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             sp.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
+            dp.topAnchor.constraint(equalTo: tabDiv.bottomAnchor),
+            dp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            dp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            dp.bottomAnchor.constraint(equalTo: sv.bottomAnchor),
             stp.topAnchor.constraint(equalTo: tabDiv.bottomAnchor),
             stp.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             stp.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
@@ -7558,7 +10060,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Save + Settings + About icon buttons (trailing edge of hint bar)
         let saveBtn     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
         saveBtn.toolTip = "Save current workflow (⌘⇧L)"
-        let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(toggleSettingsPanel))
+        let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(openStandaloneSettings))
         let aboutBtn    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
         // Override the default tertiary tint so the icons stay readable on
         // the pure-black notch background.
@@ -7701,7 +10203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
         // ── Tab strip (Axe / Sessions) ─────────────────────────────
         let tabStripH2: CGFloat = 32
-        let tabs2 = NSSegmentedControl(labels: ["Axe", "Sessions"],
+        let tabs2 = NSSegmentedControl(labels: ["Axe", "Workflows", "Displays"],
                                        trackingMode: .selectOne,
                                        target: self,
                                        action: #selector(overlayTabChanged(_:)))
@@ -7717,7 +10219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         NSLayoutConstraint.activate([
             tabs2.topAnchor.constraint(equalTo: topDiv.bottomAnchor, constant: 5),
             tabs2.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
-            tabs2.widthAnchor.constraint(equalToConstant: 200),
+            tabs2.widthAnchor.constraint(equalToConstant: 280),
             tabDiv2.topAnchor.constraint(equalTo: topDiv.bottomAnchor, constant: tabStripH2),
             tabDiv2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             tabDiv2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
@@ -7732,7 +10234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         tv.allowsMultipleSelection = true
         tv.action = #selector(tableClicked); tv.doubleAction = #selector(tableDoubleClicked)
         tv.target = self
-        if #available(macOS 12.0, *) { tv.style = .sourceList }
+        tv.style = .sourceList
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
         col.minWidth = 100; col.maxWidth = 10_000; col.width = 1   // AutoFitTableView corrects on first layout
         tv.addTableColumn(col)
@@ -7754,6 +10256,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         sp2.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(sp2)
         sessionsPanelView = sp2
+
+        let dp2 = buildDisplaysPanel()
+        dp2.isHidden = true
+        dp2.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(dp2)
+        displaysPanelView = dp2
 
         let ev = EmptyStateView()
         ev.translatesAutoresizingMaskIntoConstraints = false; ev.isHidden = true
@@ -7795,6 +10303,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             sp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             sp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             sp2.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
+            dp2.topAnchor.constraint(equalTo: tabDiv2.bottomAnchor),
+            dp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            dp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            dp2.bottomAnchor.constraint(equalTo: sv2.bottomAnchor),
             stp2.topAnchor.constraint(equalTo: tabDiv2.bottomAnchor),
             stp2.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
             stp2.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
@@ -7823,7 +10335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Save + Settings + About icon buttons (trailing edge of hint bar)
         let saveBtn2     = makeHintIconButton(symbolName: "tray.and.arrow.down", action: #selector(saveSessionMI))
         saveBtn2.toolTip = "Save current workflow (⌘⇧L)"
-        let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(toggleSettingsPanel))
+        let settingsBtn2 = makeHintIconButton(symbolName: "gear", action: #selector(openStandaloneSettings))
         let aboutBtn2    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
         overlaySettingsBtn = settingsBtn2
         bg.addSubview(saveBtn2)
@@ -8029,8 +10541,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func updateEmptyState(query: String) {
         if filtered.isEmpty {
-            let none = pun("Nothing to axe.", "No apps running")
-            emptyView?.show(query.isEmpty ? none : "No matches for \"\(query)\"")
+            if query.isEmpty {
+                emptyView?.show(pun("Nothing to axe.", "No apps running"), symbol: "checkmark.circle")
+            } else {
+                emptyView?.show("No matches for \"\(query)\"", symbol: "magnifyingglass")
+            }
         } else {
             emptyView?.hide()
         }
@@ -8066,7 +10581,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             if sel > 1 {
                 hintLabel?.attributedStringValue = hintAttrStr("\(sel) selected  ·  ↵ quit  ·  ⌘↵ force kill  ·  esc close")
             } else {
-                if isShowingSessions {
+                if isShowingDisplays {
+                    hintLabel?.attributedStringValue = hintAttrStr("drag to dim each display  ·  esc back to apps")
+                } else if isShowingSessions {
                     hintLabel?.attributedStringValue = hintAttrStr("▶ restore  ·  ✕ delete  ·  esc back to apps")
                 } else {
                     // Show active workflow name + age when one is set
@@ -8074,10 +10591,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                        let wf  = SessionManager.shared.all.first(where: { $0.id == aid }),
                        let lu  = wf.lastUsed {
                         hintLabel?.attributedStringValue = hintAttrStr("Active: \(wf.name) · \(ageString(lu))  ·  esc close")
+                    } else if filtered.isEmpty {
+                        // Nothing to act on — don't advertise navigate/quit for
+                        // apps that aren't there. Reduce to what actually works.
+                        let q = searchField?.stringValue ?? ""
+                        hintLabel?.attributedStringValue =
+                            hintAttrStr(q.isEmpty ? "esc close" : "type to search  ·  esc close")
+                    } else if !AppSettings.hasMadeFirstKill {
+                        // First-overlay coachmark (ROADMAP): teach the core action
+                        // in plain language until the first kill, then fall through
+                        // to the expert hint permanently.
+                        hintLabel?.attributedStringValue =
+                            hintAttrStr("Double-click any app to quit it  ·  ⌘-double-click to force kill")
                     } else {
-                        let isDefaultHotkey = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
-                                           && AppSettings.hotKeyMods == UInt32(cmdKey)
-                        let selectHint = isDefaultHotkey ? "  ·  ⌘A select all" : ""
+                        // "⌘A select all" fires only when the open-hotkey ISN'T ⌘A
+                        // (else the global hotkey would swallow it), so advertise it
+                        // to everyone EXCEPT the ⌘A-open-hotkey cohort.
+                        let openHotkeyIsCmdA = AppSettings.hotKeyCode == UInt32(kVK_ANSI_A)
+                                            && AppSettings.hotKeyMods == UInt32(cmdKey)
+                        let selectHint = openHotkeyIsCmdA ? "" : "  ·  ⌘A select all"
                         hintLabel?.attributedStringValue = hintAttrStr("↑↓ navigate  ·  ↵ quit  ·  ⌘↵ force kill\(selectHint)  ·  esc close")
                     }
                 }
@@ -8095,7 +10627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // Renders hint text with two-tier visual weight: key symbols/keywords at
     // higher contrast, label words and separators at lower contrast.
     private func hintAttrStr(_ raw: String) -> NSAttributedString {
-        let isNotch = AppSettings.uiStyle == .notch
+        let isNotch = effectiveUIStyle == .notch
         let keyFont: NSFont   = .systemFont(ofSize: 11, weight: .medium)
         let labFont: NSFont   = .systemFont(ofSize: 11, weight: .light)
         let keyColor: NSColor = isNotch
@@ -8304,6 +10836,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func executeKill(targets: [AppEntry], force: Bool) {
         if AppSettings.soundEnabled { ChopSound.shared.play() }
+        // First real kill retires the first-overlay coachmark (see updateHint).
+        AppSettings.hasMadeFirstKill = true
         targets.forEach { killEntry($0, force: force) }
         if AppSettings.autoClose && targets.count >= filtered.count {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -8761,6 +11295,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             cell.appIcon.image        = e.icon
             cell.statsView.configure(cpu: e.cpuPercent, mem: e.memMB)
             cell.checkBox.state       = checkedPIDs.contains(pid) ? .on : .off
+            // VoiceOver: cells are reused, so (re)label per row. The checkbox gates
+            // a destructive action, so tie its name to this row's app.
+            cell.setAccessibilityLabel(e.name)
+            cell.checkBox.setAccessibilityLabel("Select \(e.name)")
+            let cpuA11y = e.cpuPercent.map { String(format: "%.0f%% CPU", $0) } ?? "CPU unknown"
+            let memA11y = e.memMB.map { "\($0) MB memory" } ?? "memory unknown"
+            cell.statsView.setAccessibilityLabel("\(cpuA11y), \(memA11y)")
             cell.onCheckToggle = { [weak self] checked in
                 guard let self else { return }
                 if checked { self.checkedPIDs.insert(pid) }
@@ -8805,6 +11346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         case #selector(NSResponder.cancelOperation(_:)):
             if isShowingSettings { toggleSettingsPanel() }
             else if isShowingSessions { toggleSessionsPanel() }
+            else if isShowingDisplays { switchToOverlayTab(0) }
             else { hideOverlay() }
             return true
 
@@ -8830,6 +11372,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             tableView?.selectAll(nil)
             updateHint(); return true
 
+        case #selector(NSResponder.scrollToBeginningOfDocument(_:)):   // Home
+            selectEdgeRow(fromStart: true); return true
+
+        case #selector(NSResponder.scrollToEndOfDocument(_:)):         // End
+            selectEdgeRow(fromStart: false); return true
+
         default:
             return false
         }
@@ -8837,10 +11385,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func moveSelection(by delta: Int) {
         guard let tv = tableView, tv.numberOfRows > 0 else { return }
-        let cur  = tv.selectedRow < 0 ? (delta > 0 ? -1 : 0) : tv.selectedRow
-        let next = max(0, min(tv.numberOfRows - 1, cur + delta))
+        let start = tv.selectedRow < 0 ? (delta > 0 ? -1 : tv.numberOfRows) : tv.selectedRow
+        var next = start + delta
+        // selectRowIndexes bypasses shouldSelectRow, so skip non-selectable
+        // section-header rows manually in the direction of travel.
+        while next >= 0, next < tv.numberOfRows, appEntry(atRow: next) == nil { next += delta }
+        // No selectable row that way — keep the current selection, never a header.
+        guard next >= 0, next < tv.numberOfRows else { return }
         tv.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
         tv.scrollRowToVisible(next)
+        updateHint()
+    }
+
+    /// Select the first (or last) selectable app row, skipping section headers.
+    private func selectEdgeRow(fromStart: Bool) {
+        guard let tv = tableView, tv.numberOfRows > 0 else { return }
+        let order = fromStart ? Array(0..<tv.numberOfRows) : Array((0..<tv.numberOfRows).reversed())
+        guard let target = order.first(where: { appEntry(atRow: $0) != nil }) else { return }
+        tv.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
+        tv.scrollRowToVisible(target)
         updateHint()
     }
 }
