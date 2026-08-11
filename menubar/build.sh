@@ -44,6 +44,12 @@ NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"   # keychain profile (alternative t
 # Pull version from main.swift so the bundle plist stays in sync
 VERSION=$(grep '^let appVersion' "$HERE/main.swift" | sed 's/.*"\(.*\)".*/\1/')
 
+# Minimum macOS version Axe supports. main.swift guards every newer API with
+# #available, so this only needs to be as low as the oldest *unguarded* API.
+# Without an explicit -target, swiftc bakes in the build machine's SDK version
+# as the floor (e.g. macOS 26), locking out otherwise-supported Macs.
+DEPLOY_TARGET="13.0"
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 swiftc -O "$HERE/makeicon.swift" -o "$HERE/makeicon" 2>/dev/null
 "$HERE/makeicon"
@@ -52,7 +58,7 @@ rm -f "$HERE/makeicon"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
-swiftc -O "$HERE/main.swift" -o "$MACOS/Axe"
+swiftc -O -target "arm64-apple-macos${DEPLOY_TARGET}" "$HERE/main.swift" -o "$MACOS/Axe"
 cp "$HERE/AppIcon.icns" "$RES/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -68,6 +74,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>Axe</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key><string>${DEPLOY_TARGET}</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
@@ -115,9 +122,30 @@ if $SIGN; then
     xcrun stapler staple "$APP"
 
     echo "→ Creating release artifacts..."
+    # Strip AppleDouble ._ sidecars that materialize if the signed app ever
+    # crossed a non-native filesystem (AirDrop/USB/SMB/cloud). Baked into a
+    # zip they land inside the bundle on extraction and break the code seal —
+    # Gatekeeper then rejects even a notarized app ("Axe is damaged").
+    find "$APP" -name '._*' -delete 2>/dev/null || true
+
     # Homebrew zip
     ditto -c -k --keepParent "$APP" "$HERE/../Axe.zip"
     echo "   Axe.zip  $(du -sh "$HERE/../Axe.zip" | cut -f1)"
+
+    # Verify gate: extract the zip we just wrote and confirm Gatekeeper accepts
+    # it. Refuse to emit a zip that would install as "damaged".
+    VERIFYDIR=$(mktemp -d)
+    ditto -x -k "$HERE/../Axe.zip" "$VERIFYDIR"
+    if ! codesign --verify --deep --strict "$VERIFYDIR/Axe.app" 2>/dev/null; then
+        echo "✗ ABORT: Axe.zip fails codesign --verify (broken seal)." >&2
+        rm -rf "$VERIFYDIR"; exit 1
+    fi
+    if ! spctl -a "$VERIFYDIR/Axe.app" 2>/dev/null; then
+        echo "✗ ABORT: Axe.zip rejected by Gatekeeper (spctl). Not distributable." >&2
+        rm -rf "$VERIFYDIR"; exit 1
+    fi
+    rm -rf "$VERIFYDIR"
+    echo "   ✓ Axe.zip verified — valid seal, Gatekeeper accepts"
 
     # DMG with Applications symlink (for direct download)
     DMGTMP=$(mktemp -d)
