@@ -8,9 +8,11 @@ import AVFoundation
 import Carbon.HIToolbox
 import Darwin
 import IOKit
+import Metal
+import QuartzCore
 import ServiceManagement
 
-let appVersion = "3.0.0"
+let appVersion = "3.1.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -493,6 +495,34 @@ struct AppSettings {
         s += hotKeyChar
         return s
     }
+    // ── Clipboard hotkey (rebindable; defaults to ⌥⌘V) ──
+    static var clipboardHotKeyCode: UInt32 {
+        get { d.object(forKey: "clipboardHotKeyCode") == nil ? UInt32(kVK_ANSI_V) : UInt32(d.integer(forKey: "clipboardHotKeyCode")) }
+        set { d.set(Int(newValue), forKey: "clipboardHotKeyCode") }
+    }
+    static var clipboardHotKeyMods: UInt32 {
+        get { d.object(forKey: "clipboardHotKeyMods") == nil ? UInt32(cmdKey | optionKey) : UInt32(d.integer(forKey: "clipboardHotKeyMods")) }
+        set { d.set(Int(newValue), forKey: "clipboardHotKeyMods") }
+    }
+    static var clipboardHotKeyChar: String {
+        get { d.string(forKey: "clipboardHotKeyChar") ?? "V" }
+        set { d.set(newValue, forKey: "clipboardHotKeyChar") }
+    }
+    static func clipboardShortcutLabel() -> String {
+        var s = ""
+        let m = clipboardHotKeyMods
+        if m & UInt32(controlKey) != 0 { s += "⌃" }
+        if m & UInt32(optionKey)  != 0 { s += "⌥" }
+        if m & UInt32(shiftKey)   != 0 { s += "⇧" }
+        if m & UInt32(cmdKey)     != 0 { s += "⌘" }
+        s += clipboardHotKeyChar
+        return s
+    }
+    /// Clear unpinned clipboard history when Axe quits (privacy).
+    static var clipboardClearOnQuit: Bool {
+        get { d.bool(forKey: "clipboardClearOnQuit") }
+        set { d.set(newValue, forKey: "clipboardClearOnQuit") }
+    }
     /// Whether the user has entered a valid license key — stops nudge reminders.
     static var isLicensed: Bool {
         get { d.bool(forKey: "isLicensed") }
@@ -618,6 +648,17 @@ struct AppSettings {
     static var autoPasteEnabled: Bool {
         get { d.bool(forKey: "autoPasteEnabled") }
         set { d.set(newValue, forKey: "autoPasteEnabled") }
+    }
+    /// Take over the brightness keys so they drive EDR overdrive past 100% (Accessibility).
+    static var brightnessKeysEnabled: Bool {
+        get { d.bool(forKey: "brightnessKeysEnabled") }
+        set { d.set(newValue, forKey: "brightnessKeysEnabled") }
+    }
+    /// Show the menu-bar icon. Off hides it in spotlight/notch modes (the ⌘-hotkey still
+    /// opens Axe); it stays visible in popover mode, which anchors its popover to it.
+    static var showMenuBarIcon: Bool {
+        get { d.object(forKey: "showMenuBarIcon") == nil ? true : d.bool(forKey: "showMenuBarIcon") }
+        set { d.set(newValue, forKey: "showMenuBarIcon") }
     }
     /// Set the first time the user actually axes an app. Drives the one-time
     /// first-overlay coachmark in the hint bar, which auto-dismisses afterward.
@@ -1499,7 +1540,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                           AppSettings.notchHubEnabled = on
                           (NSApp.delegate as? AppDelegate)?.resetNotchHub()
                       },
-            toggleRow("Clipboard hotkey  ·  ⌥⌘V", icon: "doc.on.clipboard", iconColor: .systemTeal,
+            toggleRow("Clipboard hotkey  ·  \(AppSettings.clipboardShortcutLabel())", icon: "doc.on.clipboard", iconColor: .systemTeal,
                       on: AppSettings.clipboardHotkeyEnabled) { on in
                           AppSettings.clipboardHotkeyEnabled = on
                           (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey()
@@ -1764,7 +1805,21 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                          options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
                          selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                              AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
+                             (NSApp.delegate as? AppDelegate)?.updateStatusItemVisibility()
                          },
+                toggleRow("Show menu bar icon", icon: "menubar.rectangle", iconColor: .systemBlue,
+                          on: AppSettings.showMenuBarIcon) { on in
+                              AppSettings.showMenuBarIcon = on
+                              (NSApp.delegate as? AppDelegate)?.updateStatusItemVisibility()
+                          },
+            ])
+            addSection("Display", to: root, rows: [
+                toggleRow("Brightness keys → overdrive  ·  needs Accessibility", icon: "sun.max.fill", iconColor: .systemOrange,
+                          on: AppSettings.brightnessKeysEnabled) { on in
+                              AppSettings.brightnessKeysEnabled = on
+                              if on && !AXIsProcessTrusted() { PermissionManager.shared.requestAccessibility() }
+                              (NSApp.delegate as? AppDelegate)?.refreshBrightnessKeys()
+                          },
             ])
         }
     }
@@ -1868,7 +1923,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         pageScroll { root in
             addSection("Keyboard Shortcut", to: root, rows: [ shortcutRow() ])
             addSection("Clipboard", to: root, rows: [
-                toggleRow("Clipboard hotkey  ·  ⌥⌘V", icon: "doc.on.clipboard", iconColor: .systemTeal,
+                clipboardShortcutRow(),
+                toggleRow("Clipboard hotkey enabled", icon: "doc.on.clipboard", iconColor: .systemTeal,
                           on: AppSettings.clipboardHotkeyEnabled) { on in
                               AppSettings.clipboardHotkeyEnabled = on
                               (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey()
@@ -1935,8 +1991,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                               AppSettings.autoPasteEnabled = on
                               if on && !AXIsProcessTrusted() { PermissionManager.shared.requestAccessibility() }
                           },
+                toggleRow("Clear history when Axe quits", icon: "trash", iconColor: .systemTeal,
+                          on: AppSettings.clipboardClearOnQuit) { on in
+                              AppSettings.clipboardClearOnQuit = on
+                          },
             ])
-            let note = NSTextField(wrappingLabelWithString: "Open the clipboard with ⌥⌘V. Click a clip to copy it back. Auto-paste (needs Accessibility) also presses ⌘V in your last app. Password-manager clips are skipped.")
+            let clearBtn = NSButton(title: "Clear History Now", target: self, action: #selector(clearClipboardHistoryTapped))
+            clearBtn.bezelStyle = .rounded; clearBtn.controlSize = .regular
+            let cPad = padded(clearBtn, top: 12, left: 20, bottom: 4)
+            root.addArrangedSubview(cPad)
+            let note = NSTextField(wrappingLabelWithString: "Open the clipboard with \(AppSettings.clipboardShortcutLabel()). Click a clip to copy it back. Auto-paste (needs Accessibility) also presses ⌘V in your last app. Password-manager clips are skipped; pinned clips are kept when clearing.")
             note.font = .systemFont(ofSize: 11); note.textColor = .tertiaryLabelColor
             let nPad = padded(note, top: 0, left: 20, bottom: 20, right: 20)
             root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
@@ -1950,6 +2014,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             let nPad = padded(note, top: 22, left: 20, bottom: 20, right: 20)
             root.addArrangedSubview(nPad); nPad.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         }
+    }
+
+    @objc private func clearClipboardHistoryTapped() {
+        let alert = NSAlert()
+        alert.alertStyle      = .warning
+        alert.messageText     = "Clear clipboard history?"
+        alert.informativeText = "Removes all unpinned clips. Pinned clips are kept. This can't be undone."
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { ClipboardStore.shared.clearUnpinned() }
     }
 
     @objc private func resetToDefaultsTapped() {
@@ -2320,6 +2394,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             }) {
                 flash("⚠ In use"); return
             }
+            // …or by the clipboard hotkey.
+            if AppSettings.clipboardHotkeyEnabled,
+               code == AppSettings.clipboardHotKeyCode, mods == AppSettings.clipboardHotKeyMods {
+                flash("⚠ In use"); return
+            }
             let (oldCode, oldMods, oldChar) =
                 (AppSettings.hotKeyCode, AppSettings.hotKeyMods, AppSettings.hotKeyChar)
             AppSettings.hotKeyCode = code
@@ -2333,6 +2412,57 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 AppSettings.hotKeyMods = oldMods
                 AppSettings.hotKeyChar = oldChar
                 (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+                flash("⚠ Unavailable")
+            }
+        }
+        recorder.translatesAutoresizingMaskIntoConstraints = false
+        recorder.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        row.addArrangedSubview(labelStack)
+        row.addArrangedSubview(recorder)
+        return row
+    }
+
+    /// A recorder row for the rebindable clipboard hotkey (mirrors shortcutRow()).
+    private func clipboardShortcutRow() -> NSView {
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        let lbl = NSTextField(labelWithString: "Open clipboard")
+        lbl.font = .systemFont(ofSize: 13); lbl.textColor = .labelColor
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let sub = NSTextField(labelWithString: "Click to record a new shortcut")
+        sub.font = .systemFont(ofSize: 11); sub.textColor = .tertiaryLabelColor
+        let labelStack = NSStackView(views: [lbl, sub])
+        labelStack.orientation = .vertical; labelStack.spacing = 2; labelStack.alignment = .leading
+        let recorder = HotKeyRecorder()
+        recorder.capturedBinding = HotkeyBinding(keyCode: AppSettings.clipboardHotKeyCode,
+                                                 modifiers: AppSettings.clipboardHotKeyMods,
+                                                 displayString: AppSettings.clipboardShortcutLabel())
+        recorder.onChange = { [weak recorder] code, mods, char in
+            let flash: (String) -> Void = { msg in
+                recorder?.errorMessage = msg; recorder?.needsDisplay = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak recorder] in
+                    recorder?.errorMessage = nil; recorder?.needsDisplay = true
+                }
+            }
+            // Reject the main open-hotkey or any saved Workflow combo.
+            if code == AppSettings.hotKeyCode, mods == AppSettings.hotKeyMods { flash("⚠ In use"); return }
+            if SessionManager.shared.all.contains(where: {
+                $0.hotkey?.keyCode == code && $0.hotkey?.modifiers == mods
+            }) { flash("⚠ In use"); return }
+            let (oc, om, och) = (AppSettings.clipboardHotKeyCode, AppSettings.clipboardHotKeyMods, AppSettings.clipboardHotKeyChar)
+            AppSettings.clipboardHotKeyCode = code
+            AppSettings.clipboardHotKeyMods = mods
+            AppSettings.clipboardHotKeyChar = char
+            AppSettings.clipboardHotkeyEnabled = true
+            let ok = (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey() ?? false
+            if ok {
+                recorder?.capturedBinding = HotkeyBinding(keyCode: code, modifiers: mods,
+                                                          displayString: AppSettings.clipboardShortcutLabel())
+                recorder?.needsDisplay = true
+            } else {
+                // OS refused the combo — roll back so stored + registered stay in sync.
+                AppSettings.clipboardHotKeyCode = oc; AppSettings.clipboardHotKeyMods = om; AppSettings.clipboardHotKeyChar = och
+                (NSApp.delegate as? AppDelegate)?.refreshClipboardHotkey()
                 flash("⚠ Unavailable")
             }
         }
@@ -5182,6 +5312,7 @@ final class NotchHubPanel: NSPanel {
     var onOpenAxe:       (() -> Void)?
     var onOpenDisplays:  (() -> Void)?
     var onOpenClipboard: (() -> Void)?
+    var onMoreMenu:      (() -> NSMenu?)?   // the full status menu, for when the menu-bar icon is hidden
 
     private var bezelH: CGFloat = 32
     private let expandedH: CGFloat = 220
@@ -5298,7 +5429,8 @@ final class NotchHubPanel: NSPanel {
         let openBtn = hubButton("Axe", "bolt.fill", #selector(openAxeTapped))
         let dispBtn = hubButton("Displays", "sun.max", #selector(openDisplaysTapped))
         let clipBtn = hubButton("Clipboard", "doc.on.clipboard", #selector(openClipboardTapped))
-        let row = NSStackView(views: [openBtn, dispBtn, clipBtn])
+        let moreBtn = hubButton("More", "ellipsis", #selector(moreTapped(_:)))
+        let row = NSStackView(views: [openBtn, dispBtn, clipBtn, moreBtn])
         row.orientation = .horizontal; row.spacing = 8; row.distribution = .fillEqually
         row.translatesAutoresizingMaskIntoConstraints = false
         // Shelf: staged files (drag out anywhere), or a drop hint when empty.
@@ -5311,7 +5443,21 @@ final class NotchHubPanel: NSPanel {
         shelf.translatesAutoresizingMaskIntoConstraints = false
         shelfStack = shelf
 
-        ev.addSubview(date); ev.addSubview(row); ev.addSubview(shelfLabel); ev.addSubview(shelf)
+        // Wrap the shelf in a horizontal scroller so it stays usable past a handful
+        // of chips (they previously overflowed the notch width and became unreachable).
+        let shelfScroll = NSScrollView()
+        shelfScroll.drawsBackground = false
+        shelfScroll.hasHorizontalScroller = false        // scroll by trackpad; no bar in the notch
+        shelfScroll.hasVerticalScroller = false
+        shelfScroll.horizontalScrollElasticity = .allowed
+        shelfScroll.verticalScrollElasticity = .none
+        shelfScroll.translatesAutoresizingMaskIntoConstraints = false
+        let shelfDoc = NSView()
+        shelfDoc.translatesAutoresizingMaskIntoConstraints = false
+        shelfDoc.addSubview(shelf)
+        shelfScroll.documentView = shelfDoc
+
+        ev.addSubview(date); ev.addSubview(row); ev.addSubview(shelfLabel); ev.addSubview(shelfScroll)
         NSLayoutConstraint.activate([
             date.topAnchor.constraint(equalTo: ev.topAnchor, constant: 16),
             date.centerXAnchor.constraint(equalTo: ev.centerXAnchor),
@@ -5320,9 +5466,17 @@ final class NotchHubPanel: NSPanel {
             row.topAnchor.constraint(equalTo: date.bottomAnchor, constant: 14),
             shelfLabel.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
             shelfLabel.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 14),
-            shelf.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
-            shelf.trailingAnchor.constraint(lessThanOrEqualTo: ev.trailingAnchor, constant: -18),
-            shelf.topAnchor.constraint(equalTo: shelfLabel.bottomAnchor, constant: 6),
+            shelfScroll.leadingAnchor.constraint(equalTo: ev.leadingAnchor, constant: 18),
+            shelfScroll.trailingAnchor.constraint(equalTo: ev.trailingAnchor, constant: -18),
+            shelfScroll.topAnchor.constraint(equalTo: shelfLabel.bottomAnchor, constant: 6),
+            shelfScroll.heightAnchor.constraint(equalToConstant: 64),
+            shelfDoc.topAnchor.constraint(equalTo: shelfScroll.contentView.topAnchor),
+            shelfDoc.bottomAnchor.constraint(equalTo: shelfScroll.contentView.bottomAnchor),
+            shelfDoc.heightAnchor.constraint(equalTo: shelfScroll.contentView.heightAnchor),
+            shelf.topAnchor.constraint(equalTo: shelfDoc.topAnchor),
+            shelf.bottomAnchor.constraint(equalTo: shelfDoc.bottomAnchor),
+            shelf.leadingAnchor.constraint(equalTo: shelfDoc.leadingAnchor),
+            shelf.trailingAnchor.constraint(equalTo: shelfDoc.trailingAnchor),
         ])
         reloadShelf()
         ShelfStore.shared.onChange = { [weak self] in self?.reloadShelf() }
@@ -5401,6 +5555,15 @@ final class NotchHubPanel: NSPanel {
     @objc private func openAxeTapped()      { setExpanded(false); onOpenAxe?() }
     @objc private func openDisplaysTapped() { setExpanded(false); onOpenDisplays?() }
     @objc private func openClipboardTapped() { setExpanded(false); onOpenClipboard?() }
+    @objc private func moreTapped(_ sender: NSButton) {
+        onMoreMenu?()?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+    /// Right-click anywhere on the hub → the full status menu (mirrors right-clicking
+    /// the menu-bar icon, so nothing is lost when that icon is hidden).
+    override func rightMouseDown(with event: NSEvent) {
+        guard let m = onMoreMenu?(), let cv = contentView else { return }
+        m.popUp(positioning: nil, at: event.locationInWindow, in: cv)
+    }
 
     deinit { clockTimer?.invalidate() }
 }
@@ -5740,6 +5903,7 @@ struct DisplayAdjustments: Codable, Equatable {
     var temperature: Double = 0.5    // 0 warm … 0.5 neutral … 1 cool
     var gamma:       Double = 0.5    // 0 dark mids … 0.5 neutral … 1 bright mids
     var invert:      Bool   = false
+    var overdrive:   Double = 0.0    // 0 = off … 1 = full usable EDR headroom (>100% brightness)
 }
 
 /// DDC/CI hardware brightness (and other VCP features) for EXTERNAL monitors.
@@ -5935,6 +6099,406 @@ final class DDCController {
     }
 }
 
+// MARK: - EDR brightness overdrive (>100% via Extended Dynamic Range)
+//
+// Drives a headroom-capable panel BRIGHTER than the macOS brightness-slider max.
+// Clean-room from public APIs + WWDC21 "Explore HDR rendering with EDR" — no
+// proprietary source used. Mechanism: a fullscreen, click-through overlay whose
+// CAMetalLayer is EDR-enabled (rgba16Float + extended-linear colorspace,
+// wantsExtendedDynamicRangeContent) and — the load-bearing trick — composited with
+// `compositingFilter = "multiply"`. Multiplying the desktop beneath by a uniform
+// value > 1.0 (in extended-linear light) IS a brightness gain: 0×F stays black,
+// everything else scales up, so real content gets brighter — not a white sheet.
+// The layer's presence makes macOS grant EDR headroom. Public + entitlement-free:
+// no Accessibility / Screen-Recording prompt. Only built-in mini-LED XDR (14"/16"
+// MBP), Pro Display XDR, and some HDR externals have headroom; Air / Studio Display
+// / SDR panels do not (the control hides). Gamma LUTs physically cannot do this
+// (output clamps to [0,1] = reference white) — overdrive is a sibling output path.
+final class EDROverdriveController {
+    static let shared = EDROverdriveController()
+    private init() {}
+
+    private var windows: [String: EDROverlayWindow] = [:]   // uuid → overlay window
+    private var suspended = false                            // hidden while Axe's overlay panel is up
+    private static let device = MTLCreateSystemDefaultDevice()
+
+    /// A display can overdrive only if its panel can exceed reference white.
+    func supports(_ display: ManagedDisplay) -> Bool { potentialHeadroom(for: display) > 1.05 }
+
+    /// The panel's static EDR ceiling (≈1.0 means no headroom at all).
+    func potentialHeadroom(for display: ManagedDisplay) -> Double {
+        Double(screen(for: display)?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0)
+    }
+
+    /// Apply a normalized 0…1 overdrive (fraction of usable headroom); 0 = off.
+    func setFactor(_ normalized: Double, for display: ManagedDisplay) {
+        let n = max(0, min(1, normalized))
+        guard let device = EDROverdriveController.device, n > 0,
+              supports(display), let scr = screen(for: display) else {
+            clear(display); return
+        }
+        let win: EDROverlayWindow
+        if let existing = windows[display.uuid] {
+            win = existing
+        } else {
+            win = EDROverlayWindow(device: device)
+            let uuid = display.uuid
+            win.onIdle = { [weak self] in self?.windows.removeValue(forKey: uuid) }
+            windows[uuid] = win
+        }
+        win.configure(for: scr, normalized: n)
+        if suspended { win.orderOut(nil) } else { win.show() }
+    }
+
+    /// Ramp a display's overlay back to reference white and let it close.
+    func clear(_ display: ManagedDisplay) { windows[display.uuid]?.disable() }
+
+    /// Tear every overlay down immediately (quit / reset).
+    func clearAll() {
+        windows.values.forEach { $0.closeNow() }
+        windows.removeAll()
+    }
+
+    /// Hide overlays while Axe's own overlay panel is open — a full-screen click-through
+    /// window would otherwise block that panel's click-outside dismissal. Restored on close.
+    func suspend() { suspended = true;  windows.values.forEach { $0.orderOut(nil) } }
+    func resume()  { suspended = false; windows.values.forEach { $0.show() } }
+
+    private func screen(for display: ManagedDisplay) -> NSScreen? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return NSScreen.screens.first { ($0.deviceDescription[key] as? NSNumber)?.uint32Value == display.id }
+    }
+}
+
+/// One fullscreen EDR multiply-overlay window covering a single display.
+private final class EDROverlayWindow: NSWindow {
+    private let metalLayer = CAMetalLayer()
+    private let queue: MTLCommandQueue?
+    private var timer: Timer?
+    private var target = 1.0        // desired multiply level (1.0 = off)
+    private var rendered = 1.0      // eased current level
+    var onIdle: (() -> Void)?
+
+    init(device: MTLDevice) {
+        queue = device.makeCommandQueue()
+        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+
+        level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        ignoresMouseEvents = true
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isReleasedWhenClosed = false
+        sharingType = .none                       // keep the overlay out of captures/recordings
+
+        metalLayer.device = device
+        metalLayer.pixelFormat = .rgba16Float     // float format required to carry values > 1.0
+        metalLayer.wantsExtendedDynamicRangeContent = true
+        metalLayer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+        metalLayer.isOpaque = false
+        metalLayer.framebufferOnly = true
+        metalLayer.compositingFilter = "multiply" // ← the whole trick: gain, not a cover
+        metalLayer.drawableSize = CGSize(width: 1, height: 1)   // one EDR pixel, stretched to fill
+
+        let host = NSView()
+        host.layer = metalLayer                   // layer-hosting: set layer, THEN wantsLayer
+        host.wantsLayer = true
+        contentView = host
+    }
+
+    /// Point the overlay at a screen and set the desired overdrive.
+    func configure(for screen: NSScreen, normalized: Double) {
+        setFrame(screen.frame, display: true)
+        metalLayer.frame = CGRect(origin: .zero, size: screen.frame.size)
+        // Panels report a potential ceiling as high as ~16× — that's a theoretical
+        // pipeline max, not a comfortable brightness. Cap the usable range at 2× so the
+        // slider maps to a sane 1.0…2.0× reference white (BrightIntosh defaults to ~1.6×).
+        let potential = Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue)
+        let ceiling = min(2.0, potential)
+        target = 1.0 + normalized * max(0, ceiling - 1.0)
+        render(level: rendered)          // prime a neutral (×1) frame — a multiply layer's
+        startTicking()                   // un-primed first frame would composite the screen black
+    }
+
+    func show() {
+        orderFrontRegardless()
+        render(level: max(1.0, rendered))   // present a neutral frame immediately on appearance
+    }
+    // Never take key/main — a full-screen top window that could would break the
+    // main overlay's click-outside dismissal (which keys off the panel resigning key).
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    /// Ramp back to reference white, then close.
+    func disable() { target = 1.0; startTicking() }
+
+    /// Immediate teardown.
+    func closeNow() { timer?.invalidate(); timer = nil; orderOut(nil) }
+
+    private func startTicking() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 8.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func tick() {
+        // Ease `rendered` toward `target`. Ramping up gives the panel time to enter
+        // EDR mode and grow its headroom in step, so there's no bright flash.
+        rendered += (target - rendered) * 0.28
+        if abs(rendered - target) < 0.002 { rendered = target }
+        render(level: rendered)
+        if target <= 1.0, rendered <= 1.0001 {   // fully off → tear down
+            closeNow()
+            onIdle?()
+        }
+    }
+
+    private func render(level: Double) {
+        guard let drawable = metalLayer.nextDrawable(), let queue,
+              let cmd = queue.makeCommandBuffer() else { return }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        let v = max(1.0, level)                  // uniform EDR white; multiply blend makes it a gain
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: v, green: v, blue: v, alpha: 1.0)
+        cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        cmd.present(drawable)
+        cmd.commit()
+    }
+}
+
+// MARK: - Brightness OSD + brightness-key overdrive
+
+/// Private DisplayServices backlight READ (built-in), resolved at runtime via dlsym.
+/// Used only to detect "at max brightness" so brightness-up can hand off to overdrive.
+/// Read-only; degrades cleanly (the key feature disables) if the symbol isn't present.
+enum DisplayBacklight {
+    private typealias GetFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetFn = @convention(c) (CGDirectDisplayID, Float) -> Int32
+    private static let handle = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW)
+    private static func bind<T>(_ name: String, _ t: T.Type) -> T? {
+        guard let h = handle, let p = dlsym(h, name) else { return nil }
+        return unsafeBitCast(p, to: T.self)
+    }
+    private static let getFn: GetFn? = bind("DisplayServicesGetBrightness", GetFn.self)
+    private static let setFn: SetFn? = bind("DisplayServicesSetBrightness", SetFn.self)
+    static var isAvailable: Bool { getFn != nil }
+    static var canSet: Bool { setFn != nil }        // full-range takeover needs the setter
+    static func level(_ id: CGDirectDisplayID) -> Double? {
+        guard let f = getFn else { return nil }
+        var v: Float = 0
+        return f(id, &v) == 0 ? Double(v) : nil
+    }
+    @discardableResult
+    static func set(_ id: CGDirectDisplayID, _ v: Double) -> Bool {
+        guard let f = setFn else { return false }
+        return f(id, Float(max(0, min(1, v)))) == 0
+    }
+}
+
+/// A macOS-style brightness HUD that extends past 100% into an amber overdrive zone.
+final class BrightnessOSD {
+    static let shared = BrightnessOSD()
+    private init() {}
+    private var panel: OSDPanel?
+    private var hideTimer: Timer?
+
+    /// level 0…2.0 (1.0 = 100%).
+    func show(level: Double, on screen: NSScreen? = nil) {
+        // Always anchor to the notch display so the HUD hangs from the notch itself.
+        let target = NSScreen.screens.first { $0.auxiliaryTopLeftArea != nil } ?? screen ?? NSScreen.main
+        guard let target else { return }
+        let p = panel ?? OSDPanel(); panel = p
+        p.setLevel(level); p.place(on: target)          // size first, then position flush
+        p.alphaValue = 1; p.orderFrontRegardless()
+        hideTimer?.invalidate()
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 1.1, repeats: false) { [weak self] _ in
+            guard let p = self?.panel else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 },
+                                                 completionHandler: { p.orderOut(nil) })
+        }
+    }
+}
+
+private final class OSDPanel: NSPanel {
+    private let bar = BrightnessBarView()
+    private let warning = NSTextField(labelWithString: "May impact battery life")
+    private static let W: CGFloat = 200
+    private static let baseH: CGFloat = 40, warnH: CGFloat = 58   // grows to fit the battery line
+    override var canBecomeKey: Bool { false }
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: OSDPanel.W, height: OSDPanel.warnH),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
+        isReleasedWhenClosed = false; backgroundColor = .clear; isOpaque = false; hasShadow = false
+        ignoresMouseEvents = true
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        // Solid black + bottom-rounded, flush with the menu bar → reads as the notch
+        // itself dropping down, not a separate floating panel.
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: OSDPanel.W, height: OSDPanel.warnH))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor.black.cgColor
+        bg.layer?.cornerRadius = 13; bg.layer?.cornerCurve = .continuous
+        bg.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        bg.autoresizingMask = [.width, .height]
+        let glyph = NSImageView()
+        glyph.image = NSImage(systemSymbolName: "sun.max.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        glyph.contentTintColor = .white
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        warning.font = .systemFont(ofSize: 8.5, weight: .medium)
+        warning.textColor = .systemOrange
+        warning.alignment = .left
+        warning.isHidden = true                          // only shown in the overdrive zone
+        warning.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(glyph); bg.addSubview(bar); bg.addSubview(warning)
+        NSLayoutConstraint.activate([
+            // glyph + bar sit centered in the top 40pt (the always-visible strip).
+            glyph.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
+            glyph.topAnchor.constraint(equalTo: bg.topAnchor, constant: 15),
+            glyph.widthAnchor.constraint(equalToConstant: 15),
+            bar.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 10),
+            bar.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -16),
+            bar.centerYAnchor.constraint(equalTo: glyph.centerYAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 5),
+            warning.leadingAnchor.constraint(equalTo: glyph.leadingAnchor),
+            warning.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            warning.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 7),
+        ])
+        contentView = bg
+    }
+    /// Hang the HUD centered under the notch, flush with the menu-bar bottom.
+    func place(on screen: NSScreen) {
+        let bez = max(screen.safeAreaInsets.top, 24)
+        let h = frame.height
+        setFrameOrigin(NSPoint(x: (screen.frame.midX - OSDPanel.W / 2).rounded(),
+                               y: screen.frame.maxY - bez - h))
+    }
+    func setLevel(_ l: Double) {
+        bar.level = l; bar.needsDisplay = true
+        let over = l > 1.001
+        warning.isHidden = !over
+        // Only reserve the taller frame when the battery line shows.
+        let h = over ? OSDPanel.warnH : OSDPanel.baseH
+        if frame.height != h {
+            var f = frame; f.origin.y += f.height - h; f.size.height = h
+            setFrame(f, display: true)
+        }
+    }
+}
+
+/// OSD progress bar: 0…1 fills the white zone (100% at 68% of the width), 1…2 fills
+/// the remaining amber overdrive zone.
+private final class BrightnessBarView: NSView {
+    var level: Double = 1.0
+    override func draw(_ dirty: NSRect) {
+        let t = bounds; let r = t.height / 2
+        let split: CGFloat = 0.68                       // 100% brightness sits at 68% of the bar
+        NSColor.white.withAlphaComponent(0.22).setFill()
+        NSBezierPath(roundedRect: t, xRadius: r, yRadius: r).fill()
+        let lvl = max(0, min(2, level))
+        let frac: CGFloat = lvl <= 1 ? CGFloat(lvl) * split
+                                     : split + CGFloat(lvl - 1) * (1 - split)
+        if frac > 0 {
+            var f = t; f.size.width = t.width * frac
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: f, xRadius: r, yRadius: r).fill()
+            if lvl > 1 {                                 // overdrive portion in amber
+                var a = t; a.origin.x = t.width * split; a.size.width = t.width * (frac - split)
+                NSColor.systemOrange.setFill()
+                NSBezierPath(rect: a).fill()
+            }
+        }
+        NSColor.white.withAlphaComponent(0.55).setFill() // 100% tick
+        NSBezierPath(rect: NSRect(x: t.width * split - 0.5, y: t.minY - 2, width: 1, height: t.height + 4)).fill()
+    }
+}
+
+/// Intercepts the brightness keys so that, once the panel is at max backlight, further
+/// brightness-up presses drive EDR overdrive (OSD extends past 100%); brightness-down
+/// backs it off. Opt-in + Accessibility-gated, and FULLY fail-safe — it passes the event
+/// through in every uncertain case, so normal brightness control is never broken.
+final class BrightnessKeyController {
+    static let shared = BrightnessKeyController()
+    private init() {}
+    private var tap: CFMachPort?
+    private var src: CFRunLoopSource?
+    private let kUp = 2, kDown = 3                        // NX_KEYTYPE_BRIGHTNESS_UP / _DOWN
+    private let step = 1.0 / 16.0
+
+    static var isSupported: Bool { DisplayBacklight.isAvailable }
+
+    func refresh() {
+        let want = AppSettings.brightnessKeysEnabled && AXIsProcessTrusted() && DisplayBacklight.isAvailable
+        want ? start() : stop()
+    }
+    private func start() {
+        guard tap == nil else { return }
+        let mask = CGEventMask(1) << 14                  // NSSystemDefined (aux media keys)
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                  options: .defaultTap, eventsOfInterest: mask,
+                  callback: { _, type, event, _ in
+                      BrightnessKeyController.shared.handle(type: type, event: event)
+                  }, userInfo: nil) else { return }
+        tap = t
+        let s = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
+        src = s
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), s, .commonModes)
+        CGEvent.tapEnable(tap: t, enable: true)
+    }
+    private func stop() {
+        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+        if let s = src { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), s, .commonModes) }
+        tap = nil; src = nil
+    }
+
+    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let pass = Unmanaged.passUnretained(event)
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            return pass
+        }
+        guard DisplayBacklight.canSet,                   // full-range takeover needs the backlight setter
+              type.rawValue == 14, let ns = NSEvent(cgEvent: event),
+              ns.subtype.rawValue == 8 else { return pass }
+        let data1 = ns.data1
+        let keyCode  = (data1 & 0xFFFF0000) >> 16
+        let keyFlags =  data1 & 0x0000FFFF
+        let keyDown  = ((keyFlags & 0xFF00) >> 8) == 0x0A
+        guard keyCode == kUp || keyCode == kDown else { return pass }
+        guard let disp = DisplayManager.shared.currentDisplays().first(where: { $0.isBuiltin }),
+              DisplayManager.shared.supportsOverdrive(disp),
+              let os = DisplayBacklight.level(disp.id) else { return pass }
+        // We own this brightness key on the built-in for the WHOLE cycle now.
+        if !keyDown { return nil }                       // also swallow the key-up so macOS won't act on it
+        let up = keyCode == kUp
+        let cur = DisplayManager.shared.adjustments(forUUID: disp.uuid).overdrive
+        // Unified level 0…2.0: 0–1 = OS backlight, 1–2 = EDR overdrive.
+        let level = cur > 0 ? 1.0 + cur : os
+        // Floor the backlight a hair above 0 so a run of brightness-down can't black the panel.
+        let newLevel = max(0.05, min(2.0, level + (up ? step : -step)))
+        let id = disp.id
+        DispatchQueue.main.async {
+            if newLevel <= 1.0 {
+                DisplayBacklight.set(id, newLevel)
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.overdrive = 0 }
+            } else {
+                DisplayBacklight.set(id, 1.0)            // pin backlight at max, boost the rest with EDR
+                DisplayManager.shared.updateAdjustment(for: disp) { $0.brightness = 1.0; $0.overdrive = newLevel - 1.0 }
+            }
+            let scr = NSScreen.screens.first {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
+            }
+            BrightnessOSD.shared.show(level: newLevel, on: scr)
+        }
+        return nil                                       // consume — suppress the system OSD
+    }
+}
+
 final class DisplayManager {
     static let shared = DisplayManager()
     private init() {}
@@ -5950,6 +6514,7 @@ final class DisplayManager {
     private let ddcQueue = DispatchQueue(label: "com.emerytech.axe.ddc")   // serial; DDC I2C is slow
     private var ddcSupported: [String: Bool] = [:]   // uuid → responds to DDC brightness (main-thread only)
     private var ddcWriteItem: [CGDirectDisplayID: DispatchWorkItem] = [:]  // debounce coalescing
+    private var lutActive: Set<CGDirectDisplayID> = []   // displays currently holding a non-identity gamma LUT
 
     // ── Enumeration ──────────────────────────────────────────────
     func currentDisplays() -> [ManagedDisplay] {
@@ -6013,7 +6578,18 @@ final class DisplayManager {
             ddcWriteItem[display.id] = item
             ddcQueue.asyncAfter(deadline: .now() + 0.02, execute: item)
         }
-        applyLUT(adj, to: display.id, includeBrightness: !hw)
+        // Skip redundant gamma-table writes when the LUT would be identity (e.g. an
+        // overdrive-only change) — rewriting the table can briefly flash the display.
+        let lutIdentity = adj.gamma == 0.5 && adj.contrast == 0.5 && adj.temperature == 0.5
+            && !adj.invert && (hw || adj.brightness >= 1.0)
+        if lutIdentity {
+            if lutActive.remove(display.id) != nil { applyLUT(adj, to: display.id, includeBrightness: !hw) }
+        } else {
+            applyLUT(adj, to: display.id, includeBrightness: !hw)
+            lutActive.insert(display.id)
+        }
+        // Overdrive is a sibling output path (EDR multiply overlay), never in the LUT.
+        EDROverdriveController.shared.setFactor(adj.overdrive, for: display)
     }
 
     /// Mutate one display's adjustments in place and re-apply.
@@ -6053,6 +6629,11 @@ final class DisplayManager {
         !display.isBuiltin && (ddcSupported[display.uuid] ?? false)
     }
 
+    /// Whether a display can be driven past 100% via EDR overdrive (has EDR headroom).
+    func supportsOverdrive(_ display: ManagedDisplay) -> Bool {
+        EDROverdriveController.shared.supports(display)
+    }
+
     /// True once we know a display's DDC status (built-ins are known immediately).
     func isProbed(_ display: ManagedDisplay) -> Bool {
         display.isBuiltin || ddcSupported[display.uuid] != nil
@@ -6089,6 +6670,29 @@ final class DisplayManager {
     /// the display's adjustments (DDC for supported externals, gamma otherwise).
     func setBrightness(_ v: Double, for display: ManagedDisplay) {
         updateAdjustment(for: display) { $0.brightness = max(0, min(1, v)) }
+    }
+
+    /// One continuous control that flows past 100% into overdrive: values ≤1.0 set
+    /// brightness (gamma/DDC), values >1.0 clamp brightness to full and route the
+    /// remainder into EDR overdrive. With the overdrive ceiling capped at 2.0, the
+    /// slider value above 1.0 maps 1:1 to the overdrive factor (0…1).
+    func setBrightnessOrOverdrive(_ s: Double, for display: ManagedDisplay) {
+        updateAdjustment(for: display) { adj in
+            if s <= 1.0 {
+                adj.brightness = max(DisplayManager.minBrightness, min(1.0, s))
+                adj.overdrive  = 0
+            } else {
+                adj.brightness = 1.0
+                adj.overdrive  = min(1.0, s - 1.0)
+            }
+        }
+    }
+
+    /// The brightness-row slider position for a display: 1.0 + overdrive when boosting,
+    /// otherwise the stored software brightness.
+    func brightnessSliderValue(for display: ManagedDisplay) -> Double {
+        let adj = adjustments(forUUID: display.uuid)
+        return adj.overdrive > 0 ? 1.0 + adj.overdrive : max(DisplayManager.minBrightness, adj.brightness)
     }
 
     // ── Resolution / display modes (public CoreGraphics) ─────────────
@@ -6231,12 +6835,17 @@ final class DisplayManager {
         for disp in currentDisplays() {
             guard let adj = map[disp.uuid], adj != DisplayAdjustments() else { continue }
             applyLUT(adj, to: disp.id, includeBrightness: !usesHardwareBrightness(disp))
+            // Re-establish EDR overlays too (they need re-framing after a reconfig/wake).
+            EDROverdriveController.shared.setFactor(adj.overdrive, for: disp)
         }
     }
 
     /// Restore hardware color/gamma on all displays — called on quit and on
     /// "Reset to Defaults" so a dim screen never outlives Axe managing it.
-    func restoreAll() { CGDisplayRestoreColorSyncSettings() }
+    func restoreAll() {
+        CGDisplayRestoreColorSyncSettings()
+        EDROverdriveController.shared.clearAll()
+    }
 
     /// Clear every persisted adjustment and restore full brightness/color
     /// (used by Reset to Defaults).
@@ -6253,9 +6862,11 @@ final class DisplayManager {
 final class DisplayBrightnessRow: NSView {
     private let slider = NSSlider()
     private let display: ManagedDisplay
+    private let overdriveCapable: Bool
 
     init(display: ManagedDisplay, labelColor: NSColor = .labelColor) {
         self.display = display
+        self.overdriveCapable = DisplayManager.shared.supportsOverdrive(display)
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 48))
         translatesAutoresizingMaskIntoConstraints = false
 
@@ -6279,16 +6890,22 @@ final class DisplayBrightnessRow: NSView {
         sun.translatesAutoresizingMaskIntoConstraints = false
 
         slider.minValue = DisplayManager.minBrightness
-        slider.maxValue = 1.0
-        slider.doubleValue = DisplayManager.shared.softwareBrightness(forUUID: display.uuid)
+        // Overdrive-capable displays extend the SAME slider past 100% (up to 2.0×) —
+        // dragging beyond full brightness flows straight into EDR overdrive.
+        slider.maxValue = overdriveCapable ? 2.0 : 1.0
+        slider.doubleValue = DisplayManager.shared.brightnessSliderValue(for: display)
         slider.target = self
         slider.action = #selector(changed)
         slider.isContinuous = true
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.setAccessibilityLabel("\(display.name) brightness")
-        // The true current level (a DDC hardware read is async) — update when it lands.
-        DisplayManager.shared.readBrightness(for: display) { [weak slider] v in
-            slider?.doubleValue = max(DisplayManager.minBrightness, min(1.0, v))
+        if slider.doubleValue > 1.0 { slider.trackFillColor = .systemOrange }   // in the overdrive zone
+        // DDC externals need an async hardware read; built-in / overdrive displays use the
+        // stored value (an async read would clobber the overdrive slider position).
+        if !overdriveCapable {
+            DisplayManager.shared.readBrightness(for: display) { [weak slider] v in
+                slider?.doubleValue = max(DisplayManager.minBrightness, min(1.0, v))
+            }
         }
 
         addSubview(icon); addSubview(name); addSubview(sun); addSubview(slider)
@@ -6312,7 +6929,12 @@ final class DisplayBrightnessRow: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func changed() {
-        DisplayManager.shared.setBrightness(slider.doubleValue, for: display)
+        if overdriveCapable {
+            DisplayManager.shared.setBrightnessOrOverdrive(slider.doubleValue, for: display)
+            slider.trackFillColor = slider.doubleValue > 1.0 ? .systemOrange : nil
+        } else {
+            DisplayManager.shared.setBrightness(slider.doubleValue, for: display)
+        }
     }
 }
 
@@ -6375,7 +6997,7 @@ final class LabeledSliderRow: NSView {
     private let onChange: (Double) -> Void
 
     init(title: String, symbol: String, value: Double, minV: Double, maxV: Double,
-         labelColor: NSColor, onChange: @escaping (Double) -> Void) {
+         labelColor: NSColor, accent: NSColor? = nil, onChange: @escaping (Double) -> Void) {
         self.onChange = onChange
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 22))
         translatesAutoresizingMaskIntoConstraints = false
@@ -6397,6 +7019,7 @@ final class LabeledSliderRow: NSView {
         slider.target = self; slider.action = #selector(changed)
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.setAccessibilityLabel(title)
+        if let accent { slider.trackFillColor = accent }
 
         addSubview(icon); addSubview(caption); addSubview(slider)
         NSLayoutConstraint.activate([
@@ -6723,6 +7346,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Begin capturing clipboard history for the notch hub's clipboard module.
         ClipboardStore.shared.start()
 
+        // Start the brightness-key → overdrive tap if enabled + permitted (else no-op).
+        refreshBrightnessKeys()
+        // …and (re)start it the moment Accessibility is granted after the fact.
+        NotificationCenter.default.addObserver(forName: .permissionStateChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshBrightnessKeys()
+        }
+
         // Notch indicator hardening: re-anchor after display changes, sleep/wake
         NotificationCenter.default.addObserver(
             self, selector: #selector(screenParametersChanged),
@@ -6747,6 +7377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Don't leave a screen dimmed by a gamma table once Axe is gone — restore
         // hardware color on quit. Persisted values are re-applied on next launch.
         DisplayManager.shared.restoreAll()
+        if AppSettings.clipboardClearOnQuit { ClipboardStore.shared.clearUnpinned() }
     }
 
     // MARK: Status item
@@ -6758,6 +7389,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         btn.target = self
         btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
         updateMenuBarIcon()
+        updateStatusItemVisibility()
+    }
+
+    /// Show/hide the menu-bar item per the setting. Always visible in popover mode,
+    /// whose popover anchors to it (hiding it would strand that mode).
+    func updateStatusItemVisibility() {
+        statusItem?.isVisible = AppSettings.showMenuBarIcon || AppSettings.uiStyle == .popover
     }
 
     func updateTabStripCount() {
@@ -6791,6 +7429,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             existing.cancelTracking()
             return
         }
+        let menu = buildStatusMenu()
+        openStatusMenu  = menu
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+    }
+
+    /// Pop the same status menu at a point in `view` — used from the notch hub and the
+    /// overlay so every menu action stays reachable when the menu-bar icon is hidden.
+    func presentStatusMenu(from view: NSView) {
+        buildStatusMenu().popUp(positioning: nil,
+                                at: NSPoint(x: 0, y: view.bounds.maxY + 4), in: view)
+    }
+
+    /// Builds the full status/right-click menu (favorites, RAM, workflows, settings,
+    /// updates, quit…). Presented from the status item OR the hub/overlay.
+    func buildStatusMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
 
@@ -6941,9 +7595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         addItem(menu, "About Axe",           key: "",  action: #selector(showAbout))
         menu.addItem(.separator())
         addItem(menu, "Quit Axe", key: "q", action: #selector(quitAxe))
-        openStatusMenu  = menu
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
+        return menu
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -6966,6 +7618,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     // MARK: Settings / Onboarding
 
     @objc func openSettings()   { settingsWindow.show() }
+    /// Overlay "•••" → the full status menu (keeps every action reachable when the
+    /// menu-bar icon is hidden and you opened Axe via the hotkey).
+    @objc func showOverlayMenu(_ sender: NSButton) { presentStatusMenu(from: sender) }
     /// Overlay gear → dismiss the overlay and open the standalone Settings window
     /// (the sidebar+detail settings replace the old inline panel).
     @objc func openStandaloneSettings() {
@@ -7508,13 +8163,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// (Re)register or tear down the global clipboard hotkey (⌥⌘V).
-    func refreshClipboardHotkey() {
+    @discardableResult
+    func refreshClipboardHotkey() -> Bool {
         if let ref = clipboardHotKeyRef { UnregisterEventHotKey(ref); clipboardHotKeyRef = nil }
-        guard AppSettings.clipboardHotkeyEnabled else { return }
+        guard AppSettings.clipboardHotkeyEnabled else { return true }
         let cid = EventHotKeyID(signature: fourCC("axe!"), id: 2)
-        RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(cmdKey | optionKey),
+        let status = RegisterEventHotKey(AppSettings.clipboardHotKeyCode, AppSettings.clipboardHotKeyMods,
                             cid, GetApplicationEventTarget(), 0, &clipboardHotKeyRef)
+        return status == noErr && clipboardHotKeyRef != nil
     }
+
+    /// Start/stop the brightness-key overdrive event-tap to match the current setting
+    /// and Accessibility state (no-op / passthrough when unavailable).
+    func refreshBrightnessKeys() { BrightnessKeyController.shared.refresh() }
 
     /// Unregisters the current hot key and registers a fresh one from AppSettings.
     /// Call after the user changes the shortcut in Settings.
@@ -7616,10 +8277,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             displayActionBoxes.append(ibox)
             invert.target = ibox; invert.action = #selector(ActionBox.invoke)
 
+            // Routing badge — tells the user whether this display responds to
+            // hardware (DDC) brightness or is adjusted in software (gamma).
+            let routing: String
+            if disp.isBuiltin { routing = "Software" }
+            else if !DisplayManager.shared.isProbed(disp) { routing = "Checking DDC…" }
+            else if DisplayManager.shared.usesHardwareBrightness(disp) { routing = "Hardware · DDC" }
+            else { routing = "Software" }
+            let badge = NSTextField(labelWithString: routing)
+            badge.font = .systemFont(ofSize: 9, weight: .semibold)
+            badge.textColor = labelColor.withAlphaComponent(0.5)
+            badge.translatesAutoresizingMaskIntoConstraints = false
+
+            // Adjustment rows; overdrive (EDR >100%) only when the panel has headroom.
+            var adjustRows: [NSView] = [rrow, tempRow, contrastRow, gammaRow]
+            if DisplayManager.shared.supportsOverdrive(disp) {
+                let maxMult = min(2.0, EDROverdriveController.shared.potentialHeadroom(for: disp))
+                let odHint = NSTextField(wrappingLabelWithString:
+                    String(format: "Drag brightness past 100%% to overdrive with HDR headroom — up to ~%.1f×. Uses more power.", maxMult))
+                odHint.font = .systemFont(ofSize: 9)
+                odHint.textColor = labelColor.withAlphaComponent(0.45)
+                odHint.translatesAutoresizingMaskIntoConstraints = false
+                adjustRows.append(odHint)
+            }
+
             let controls = NSStackView()
             controls.orientation = .vertical; controls.alignment = .leading; controls.spacing = 7
             controls.translatesAutoresizingMaskIntoConstraints = false
-            [rrow, tempRow, contrastRow, gammaRow].forEach { controls.addArrangedSubview($0) }
+            controls.addArrangedSubview(badge)
+            adjustRows.forEach { controls.addArrangedSubview($0) }
             controls.addArrangedSubview(invert)
 
             group.addArrangedSubview(brow)
@@ -7630,12 +8316,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             brow.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
             controls.leadingAnchor.constraint(equalTo: group.leadingAnchor, constant: 23).isActive = true
             controls.trailingAnchor.constraint(equalTo: group.trailingAnchor).isActive = true
-            [rrow, tempRow, contrastRow, gammaRow].forEach {
+            adjustRows.forEach {
                 $0.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
             }
         }
         let note = NSTextField(wrappingLabelWithString:
-            "External monitors use hardware brightness (DDC) when supported; everything else dims in software.")
+            "External monitors use hardware brightness (DDC) when supported; everything else adjusts in software. Overdrive (>100%) appears only on displays with HDR/XDR headroom — the built-in Pro Display qualifies; most external and non-XDR panels don't.")
         note.font = .systemFont(ofSize: 10)
         note.textColor = dimHintColor
         note.translatesAutoresizingMaskIntoConstraints = false
@@ -8487,13 +9173,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.accessoryView = av; alert.window.initialFirstResponder = nameField
 
         recorder.onChange = { [weak recorder] code, mods, char in
-            if code == AppSettings.hotKeyCode && mods == AppSettings.hotKeyMods {
+            let conflict: () -> Void = {
                 recorder?.errorMessage = "⚠ Conflict"; recorder?.needsDisplay = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak recorder] in
                     recorder?.errorMessage = nil; recorder?.needsDisplay = true
                 }
-                return
             }
+            // Reject the main open-hotkey, the clipboard hotkey, or ANY other workflow's combo —
+            // otherwise RegisterEventHotKey fails silently and one of them just stops working.
+            if code == AppSettings.hotKeyCode && mods == AppSettings.hotKeyMods { conflict(); return }
+            if AppSettings.clipboardHotkeyEnabled,
+               code == AppSettings.clipboardHotKeyCode, mods == AppSettings.clipboardHotKeyMods { conflict(); return }
+            if SessionManager.shared.all.contains(where: {
+                $0.id != session.id && $0.hotkey?.keyCode == code && $0.hotkey?.modifiers == mods
+            }) { conflict(); return }
             recorder?.capturedBinding = HotkeyBinding(keyCode: code, modifiers: mods,
                                                        displayString: char)
         }
@@ -9021,6 +9714,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.switchToOverlayTab(2) }
                 }
                 hub.onOpenClipboard = { [weak self] in self?.toggleClipboard() }
+                hub.onMoreMenu      = { [weak self] in self?.buildStatusMenu() }
                 notchHub = hub
                 updateNotchHub()
             }
@@ -9308,6 +10002,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // main overlay is up (avoids two overlapping dropdowns at the notch).
         notchHub?.orderOut(nil)
         clipboardPanel?.dismissPanel()
+        // Hide EDR overdrive overlays too — a full-screen click-through window blocks
+        // this panel's click-outside dismissal. Restored in hideOverlay().
+        EDROverdriveController.shared.suspend()
         // Rebuild if the user switched styles since last open (compare against the
         // effective style so a notch→spotlight downgrade on non-notch hardware
         // doesn't force a teardown on every open).
@@ -9588,6 +10285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func hideOverlay() {
         cpuRefreshTimer?.invalidate()
         cpuRefreshTimer = nil
+        // Restore EDR overdrive overlays suspended while the panel was open.
+        EDROverdriveController.shared.resume()
         // Bring the notch hub back once the overlay has faded out.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.refreshNotchHub() }
         switch lastBuiltStyle ?? effectiveUIStyle {
@@ -10062,15 +10761,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         saveBtn.toolTip = "Save current workflow (⌘⇧L)"
         let settingsBtn = makeHintIconButton(symbolName: "gear", action: #selector(openStandaloneSettings))
         let aboutBtn    = makeHintIconButton(symbolName: "info.circle", action: #selector(showAbout))
+        let moreBtn     = makeHintIconButton(symbolName: "ellipsis.circle", action: #selector(showOverlayMenu(_:)))
+        moreBtn.toolTip = "Menu — workflows, updates, quit…"
         // Override the default tertiary tint so the icons stay readable on
         // the pure-black notch background.
         saveBtn.contentTintColor     = dimIconColor
         settingsBtn.contentTintColor = dimIconColor
         aboutBtn.contentTintColor    = dimIconColor
+        moreBtn.contentTintColor     = dimIconColor
         overlaySettingsBtn = settingsBtn
         bg.addSubview(saveBtn)
         bg.addSubview(settingsBtn)
         bg.addSubview(aboutBtn)
+        bg.addSubview(moreBtn)
 
         NSLayoutConstraint.activate([
             botDiv.topAnchor.constraint(equalTo: sv.bottomAnchor),
@@ -10099,9 +10802,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             settingsBtn.heightAnchor.constraint(equalToConstant: 24),
             // About button
             aboutBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
-            aboutBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            aboutBtn.trailingAnchor.constraint(equalTo: moreBtn.leadingAnchor, constant: -1),
             aboutBtn.widthAnchor.constraint(equalToConstant: 24),
             aboutBtn.heightAnchor.constraint(equalToConstant: 24),
+            // More (full status menu)
+            moreBtn.centerYAnchor.constraint(equalTo: hint.centerYAnchor),
+            moreBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            moreBtn.widthAnchor.constraint(equalToConstant: 24),
+            moreBtn.heightAnchor.constraint(equalToConstant: 24),
         ])
 
         panel = p
