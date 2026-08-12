@@ -118,19 +118,33 @@ if $SIGN; then
     fi
     rm -f "$TMPZIP"
 
+    # Strip extended attributes from the bundle. These are the real source of
+    # the AppleDouble ._ sidecars: they don't exist as files on disk, so a
+    # `find -name ._\*` finds nothing — but `ditto -c -k` re-encodes each file's
+    # xattrs as a ._ entry INSIDE the zip. `ditto -x` reassembles them on
+    # extract (so a ditto round-trip looks clean), but Homebrew unzips with a
+    # plain unzip, so the ._ files land as literal files in the bundle and
+    # break the install ("Not a directory" on rename / damaged seal). Clearing
+    # xattrs before we staple removes the source; the code signature and the
+    # notarization ticket are files inside the bundle, not xattrs, so this is
+    # safe — the verify gate below re-checks the seal and Gatekeeper.
+    xattr -cr "$APP"
+
     echo "→ Stapling ticket..."
     xcrun stapler staple "$APP"
 
     echo "→ Creating release artifacts..."
-    # Strip AppleDouble ._ sidecars that materialize if the signed app ever
-    # crossed a non-native filesystem (AirDrop/USB/SMB/cloud). Baked into a
-    # zip they land inside the bundle on extraction and break the code seal —
-    # Gatekeeper then rejects even a notarized app ("Axe is damaged").
     find "$APP" -name '._*' -delete 2>/dev/null || true
 
-    # Homebrew zip
-    ditto -c -k --keepParent "$APP" "$HERE/../Axe.zip"
+    # Homebrew zip — --noextattr/--norsrc so ditto never re-embeds ._ sidecars.
+    ditto --noextattr --norsrc -c -k --keepParent "$APP" "$HERE/../Axe.zip"
     echo "   Axe.zip  $(du -sh "$HERE/../Axe.zip" | cut -f1)"
+
+    # Refuse a zip that carries AppleDouble ._ sidecars — plain unzip (Homebrew)
+    # would materialize them as files and break the install.
+    if unzip -l "$HERE/../Axe.zip" | grep -q '/\._'; then
+        echo "✗ ABORT: Axe.zip contains ._ AppleDouble sidecars." >&2; exit 1
+    fi
 
     # Verify gate: extract the zip we just wrote and confirm Gatekeeper accepts
     # it. Refuse to emit a zip that would install as "damaged".
