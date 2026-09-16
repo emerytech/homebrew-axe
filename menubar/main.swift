@@ -12,7 +12,7 @@ import Metal
 import QuartzCore
 import ServiceManagement
 
-let appVersion = "3.1.0"
+let appVersion = "3.2.0"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -1534,6 +1534,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                      options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
                      selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                          AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
+                         (NSApp.delegate as? AppDelegate)?.handleUIStyleChanged()
                      },
             toggleRow("Show notch hub", icon: "macwindow", iconColor: .systemIndigo,
                       on: AppSettings.notchHubEnabled) { on in
@@ -1805,7 +1806,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                          options: ["Menu bar popover", "Spotlight overlay", "Drop from notch"],
                          selected: [UIStyle.popover, .spotlight, .notch].firstIndex(of: AppSettings.uiStyle) ?? 0) {
                              AppSettings.uiStyle = [UIStyle.popover, .spotlight, .notch][safe: $0] ?? .popover
-                             (NSApp.delegate as? AppDelegate)?.updateStatusItemVisibility()
+                             (NSApp.delegate as? AppDelegate)?.handleUIStyleChanged()
                          },
                 toggleRow("Show menu bar icon", icon: "menubar.rectangle", iconColor: .systemBlue,
                           on: AppSettings.showMenuBarIcon) { on in
@@ -4691,6 +4692,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
             card.onSelect = { chosen in
                 AppSettings.uiStyle = chosen
                 cards.forEach { $0.isSelected = ($0.style == chosen) }
+                (NSApp.delegate as? AppDelegate)?.handleUIStyleChanged()
             }
             cards.append(card)
             cardStack.addArrangedSubview(card)
@@ -9665,13 +9667,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         return NSScreen.screens.first { $0.auxiliaryTopLeftArea != nil }
     }
 
+    /// The display that owns the menu bar / global coordinate origin. Unlike
+    /// NSScreen.main (which follows the focused window across displays), this is
+    /// stable, so on a multi-display notchless Mac the hub, pill, drop overlay
+    /// and clipboard all anchor to the SAME screen instead of splitting apart.
+    private var primaryScreen: NSScreen? {
+        NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main
+    }
+
+    /// True when the notch view is selected but no connected display has a
+    /// hardware notch — the case we synthesize a *virtual* notch for (e.g. a
+    /// Mac Studio / mini on an external display).
+    var hasVirtualNotch: Bool {
+        AppSettings.uiStyle == .notch && notchScreen() == nil && primaryScreen != nil
+    }
+
+    /// The display the notch surfaces (hub, indicator pill, drop overlay,
+    /// clipboard) anchor to. Prefers a real hardware notch; otherwise, when the
+    /// notch view is selected, hosts a virtual notch on the stable primary
+    /// display. Every notch-gating site goes through this instead of
+    /// `notchScreen()` so the surfaces build — and center their black notch
+    /// shape — on a notchless Mac.
+    func notchHostScreen() -> NSScreen? {
+        notchScreen() ?? (hasVirtualNotch ? primaryScreen : nil)
+    }
+
+    /// Call after the Interface-style dropdown changes. On a notchless Mac,
+    /// switching to/from the notch view is what turns the virtual notch on or
+    /// off, so re-sync the notch surfaces (build them, or tear them down) and
+    /// refresh the menu-bar icon. Harmless on a real notched display.
+    func handleUIStyleChanged() {
+        updateStatusItemVisibility()
+        syncNotchIndicator()   // cascades to syncNotchHub()
+    }
+
     /// The UI style to actually render. Notch mode needs a notched display; on
     /// non-notch / external / clamshell setups it would drop a black bar over
     /// the menu bar, so it transparently degrades to the centered spotlight
     /// overlay. This also makes the `.notch` first-run default safe on any Mac.
     var effectiveUIStyle: UIStyle {
         let s = AppSettings.uiStyle
-        return (s == .notch && notchScreen() == nil) ? .spotlight : s
+        // Notch view stays live as long as *some* display can host it — a real
+        // notch, or a virtual notch on the main display. Only degrade to the
+        // centered spotlight overlay when there's no screen at all to anchor to.
+        return (s == .notch && notchHostScreen() == nil) ? .spotlight : s
     }
 
     func resetNotchIndicator() {
@@ -9683,13 +9722,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func syncNotchIndicator() {
         // The centered hub supersedes the offset pill when both are enabled on a
         // notched display — otherwise you'd get two ⚡ indicators flanking the notch.
-        let hubActive = AppSettings.notchHubEnabled && notchScreen() != nil
-        if AppSettings.notchIndicatorEnabled && !hubActive {
+        let host = notchHostScreen()
+        let hubActive = AppSettings.notchHubEnabled && host != nil
+        // Requiring `host` here (not just inside the build) means leaving the notch
+        // view on a notchless Mac — where host goes nil — falls into the else and
+        // tears the pill down, instead of stranding it (matching syncNotchHub).
+        if AppSettings.notchIndicatorEnabled && !hubActive, let screen = host {
             if notchIndicator == nil {
-                // Anchor to whichever connected display actually has the notch,
-                // not just the primary — so the pill still shows when the built-in
-                // notched display isn't the main one.
-                guard let screen = notchScreen() else { return }
+                // Anchor to whichever display hosts the notch — a real one, or the
+                // virtual notch on the primary display when notch view is selected.
                 let ind = NotchIndicatorPanel(screen: screen, onRight: AppSettings.notchIndicatorOnRight)
                 ind.onOpen = { [weak self] in self?.openOverlayFromIndicator() }
                 notchIndicator = ind
@@ -9700,12 +9741,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             notchIndicator?.orderOut(nil)
             notchIndicator = nil
         }
-        syncNotchHub()
+        syncNotchHub()   // always reconcile the hub — never early-return past it
     }
 
     /// Create/tear down the centered notch hub (needs a notched display).
     func syncNotchHub() {
-        if AppSettings.notchHubEnabled, let screen = notchScreen() {
+        if AppSettings.notchHubEnabled, let screen = notchHostScreen() {
             if notchHub == nil {
                 let hub = NotchHubPanel(screen: screen)
                 hub.onOpenAxe      = { [weak self] in self?.showOverlay() }
@@ -9743,7 +9784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Show/hide the clipboard-history panel dropping from the notch.
     func toggleClipboard() {
         if clipboardPanel == nil {
-            guard let screen = notchScreen() ?? NSScreen.main else { return }
+            guard let screen = notchHostScreen() ?? NSScreen.main else { return }
             let p = ClipboardPanel(screen: screen)
             p.onClose = { [weak self] in self?.refreshNotchHub() }
             p.onPaste = { [weak self] in self?.performAutoPaste() }
@@ -9751,7 +9792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         if !(clipboardPanel?.isVisible ?? false) { captureClipboardPrevApp() }
         notchHub?.orderOut(nil)                 // only one notch surface at a time
-        clipboardPanel?.toggle(on: notchScreen())
+        clipboardPanel?.toggle(on: notchHostScreen())
     }
 
     /// Remember the app that was frontmost so auto-paste can return focus to it.
@@ -9790,7 +9831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // Decide from the display the pill actually lives on (the notch screen),
         // not NSScreen.main (the keyboard-focus screen) — otherwise a full-screen
         // app on a *different* display would wrongly hide/show the pill.
-        guard let screen = notchScreen() ?? NSScreen.main else { return false }
+        guard let screen = notchHostScreen() ?? NSScreen.main else { return false }
         // When a full-screen app hides the menu bar, visibleFrame extends all
         // the way to frame.maxY with no reserved space at the top.
         return screen.visibleFrame.maxY >= screen.frame.maxY - 2
@@ -10201,7 +10242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         // exists; anchor to it (not NSScreen.main) so the pill and the overlay
         // always land on the same screen.
         if panel == nil { buildPanel(); lastBuiltStyle = .notch }
-        guard let screen = notchScreen() ?? NSScreen.main, let p = panel else { return }
+        guard let screen = notchHostScreen() ?? NSScreen.main, let p = panel else { return }
 
         // Create or tear down the persistent indicator based on current setting
         if AppSettings.notchIndicatorEnabled, notchIndicator == nil {
@@ -10384,7 +10425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         let contentH: CGFloat = 445 + AppSettings.notchExtraHeight
         // Read the bezel inset from the notched display the panel anchors to, not
         // NSScreen.main (which may be an external, non-notch display).
-        let bezelH = max((notchScreen()?.safeAreaInsets.top) ?? 24, 24)
+        let bezelH = max((notchHostScreen()?.safeAreaInsets.top) ?? 24, 24)
         return NotchGeometry(
             W: W_inner,
             H: contentH + bezelH,    // taller, so the top region covers the menu bar
