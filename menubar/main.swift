@@ -12,7 +12,7 @@ import Metal
 import QuartzCore
 import ServiceManagement
 
-let appVersion = "3.2.0"
+let appVersion = "3.2.1"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -5318,6 +5318,9 @@ final class NotchHubPanel: NSPanel {
 
     private var bezelH: CGFloat = 32
     private let expandedH: CGFloat = 220
+    private let expandedW: CGFloat = 360
+    private var collapsedW: CGFloat = 320   // notch width + slim clock/count flanks; set in init
+    private var centerX: CGFloat = 0        // fixed screen-center anchor; set in init (drift-proof)
     private var expanded = false
     private var collapseWork: DispatchWorkItem?
 
@@ -5333,12 +5336,26 @@ final class NotchHubPanel: NSPanel {
 
     convenience init(screen: NSScreen) {
         let bez = max(screen.safeAreaInsets.top, 24)
-        let w: CGFloat = 360
-        let f = NSRect(x: (screen.frame.midX - w / 2).rounded(),
-                       y: screen.frame.maxY - bez, width: w, height: bez)
+        // Resting width hugs the physical notch plus slim flanks for the app
+        // count (left) and clock (right), so the idle hub reads as the notch
+        // with a little info beside it — not a full-width black bar. It widens
+        // to expandedW only on hover. Falls back to a 200pt virtual notch when
+        // there's no hardware notch (Mac Studio / mini).
+        let notchW: CGFloat
+        if let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea {
+            notchW = max((screen.frame.width - l.width - r.width).rounded(), 140)
+        } else {
+            notchW = 200
+        }
+        let flank: CGFloat = 60                    // room for the clock without overlapping the notch
+        let cw = min(notchW + flank * 2, 360)
+        let f = NSRect(x: (screen.frame.midX - cw / 2).rounded(),
+                       y: screen.frame.maxY - bez, width: cw, height: bez)
         self.init(contentRect: f, styleMask: [.borderless, .nonactivatingPanel],
                   backing: .buffered, defer: false)
         bezelH = bez
+        collapsedW = cw
+        centerX = screen.frame.midX
         level                = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
         isReleasedWhenClosed = false
         backgroundColor      = .clear
@@ -5544,8 +5561,16 @@ final class NotchHubPanel: NSPanel {
         guard on != expanded else { return }
         expanded = on
         let top = frame.maxY                       // top edge stays pinned behind the bezel
+        let cx  = centerX                           // FIXED screen center — never read back the
+                                                    // (rounded, possibly mid-animation) live frame,
+                                                    // which made the pill creep right on each toggle
         let h   = on ? expandedH : bezelH
-        var f   = frame; f.origin.y = top - h; f.size.height = h
+        let w   = on ? expandedW : collapsedW
+        var f   = frame
+        f.size.width  = w
+        f.origin.x    = (cx - w / 2).rounded()
+        f.size.height = h
+        f.origin.y    = top - h
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = on ? 0.30 : 0.22
             ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.94, 0.6, 1.0)
@@ -7394,10 +7419,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         updateStatusItemVisibility()
     }
 
-    /// Show/hide the menu-bar item per the setting. Always visible in popover mode,
-    /// whose popover anchors to it (hiding it would strand that mode).
+    /// Show/hide the menu-bar item. Popover mode always keeps it (its popover
+    /// anchors to it). In notch mode the hub/pill already sit in the menu bar and
+    /// double as the icon, so the separate status item is redundant — hide it
+    /// whenever a notch surface is actually present. Otherwise honor the setting.
     func updateStatusItemVisibility() {
-        statusItem?.isVisible = AppSettings.showMenuBarIcon || AppSettings.uiStyle == .popover
+        let notchProvidesMenu = AppSettings.uiStyle == .notch
+            && notchHostScreen() != nil
+            && (AppSettings.notchHubEnabled || AppSettings.notchIndicatorEnabled)
+        statusItem?.isVisible = AppSettings.uiStyle == .popover
+            || (AppSettings.showMenuBarIcon && !notchProvidesMenu)
     }
 
     func updateTabStripCount() {
@@ -9765,6 +9796,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
             notchHub?.orderOut(nil)
             notchHub = nil
         }
+        // A notch surface (hub/pill) doubles as the menu-bar icon, so reconcile
+        // the status item whenever the surfaces change.
+        updateStatusItemVisibility()
     }
 
     func resetNotchHub() {
