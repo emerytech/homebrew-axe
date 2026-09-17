@@ -12,7 +12,7 @@ import Metal
 import QuartzCore
 import ServiceManagement
 
-let appVersion = "3.2.1"
+let appVersion = "3.2.2"
 
 // MARK: - Private CoreGraphics Services (Space management)
 // Resolved at runtime via dlsym — no link-time dependency on private symbols.
@@ -5288,6 +5288,19 @@ final class ShelfChipView: NSView, NSDraggingSource {
 final class HubDropView: NSView {
     var onDragEnter: (() -> Void)?
     var onDrop: (([URL]) -> Void)?
+    /// The hub window is fixed at the EXPANDED footprint so a CAShapeLayer mask
+    /// can animate the shape on the GPU (fluid). At rest only the small pill is
+    /// visible; the rest of the window is transparent and must pass clicks through
+    /// to whatever is below. This returns whether a point (in this view's coords)
+    /// is inside the currently-visible shape; outside → hitTest returns nil.
+    var isInsideVisible: ((NSPoint) -> Bool)?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // `point` arrives in our superview's coordinates.
+        let local = convert(point, from: superview)
+        if let inside = isInsideVisible, !inside(local) { return nil }
+        return super.hitTest(point)
+    }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         onDragEnter?()
@@ -5299,6 +5312,19 @@ final class HubDropView: NSView {
         guard !urls.isEmpty else { return false }
         onDrop?(urls)
         return true
+    }
+}
+
+/// The hub window is fixed at the full expanded footprint so its shape mask can
+/// animate on the GPU. As the CONTENT view, this returns nil from hitTest for any
+/// point outside the currently-visible shape, so at rest (only the small pill is
+/// visible) clicks in the empty area below the notch pass through to the app below.
+final class PassThruView: NSView {
+    var isInsideVisible: ((NSPoint) -> Bool)?
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        if let inside = isInsideVisible, !inside(local) { return nil }
+        return super.hitTest(point)
     }
 }
 
@@ -5323,6 +5349,8 @@ final class NotchHubPanel: NSPanel {
     private var centerX: CGFloat = 0        // fixed screen-center anchor; set in init (drift-proof)
     private var expanded = false
     private var collapseWork: DispatchWorkItem?
+    private var maskLayer: CAShapeLayer?    // animates the pill→panel shape on the GPU
+    private var trackingArea: NSTrackingArea?
 
     private weak var bg: NSView?
     private weak var clockLabel: NSTextField?
@@ -5349,8 +5377,12 @@ final class NotchHubPanel: NSPanel {
         }
         let flank: CGFloat = 60                    // room for the clock without overlapping the notch
         let cw = min(notchW + flank * 2, 360)
-        let f = NSRect(x: (screen.frame.midX - cw / 2).rounded(),
-                       y: screen.frame.maxY - bez, width: cw, height: bez)
+        // The window is FIXED at the expanded footprint; the visible shape is a
+        // CAShapeLayer mask animated between the small resting pill and the full
+        // panel. Nothing about the window frame moves, so the open is GPU-smooth
+        // (no per-frame window resize/reposition) and never drifts.
+        let f = NSRect(x: (screen.frame.midX - 180).rounded(),
+                       y: screen.frame.maxY - 220, width: 360, height: 220)
         self.init(contentRect: f, styleMask: [.borderless, .nonactivatingPanel],
                   backing: .buffered, defer: false)
         bezelH = bez
@@ -5368,18 +5400,23 @@ final class NotchHubPanel: NSPanel {
     }
 
     private func buildContent() {
-        guard let cv = contentView else { return }
+        let cv = PassThruView()
+        cv.isInsideVisible = { [weak self] p in self?.pointInsideVisible(p) ?? true }
         cv.wantsLayer = true
+        contentView = cv
 
         // HubDropView stays the content container + drag target, but no longer paints
-        // its own fill — it clips its subtree to the rounded-bottom shape; the skin
-        // view below provides the actual background (Classic black / Liquid Glass / …).
-        let corners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        // its own fill — a CAShapeLayer mask clips its subtree to the current shape
+        // (resting pill ↔ full panel), animated on the GPU. The skin view below
+        // provides the actual background (Classic black / Liquid Glass / …).
         let bgv = HubDropView(); bgv.wantsLayer = true
-        bgv.layer?.cornerRadius  = 14
-        bgv.layer?.cornerCurve   = .continuous
-        bgv.layer?.maskedCorners = corners
         bgv.layer?.masksToBounds = true
+        let mask = CAShapeLayer()
+        mask.frame = CGRect(x: 0, y: 0, width: 360, height: 220)
+        mask.path  = hubPath(expandedFraction: 0)
+        bgv.layer?.mask = mask
+        maskLayer = mask
+        bgv.isInsideVisible = { [weak self] p in self?.pointInsideVisible(p) ?? true }
         bgv.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(bgv); bg = bgv
         NSLayoutConstraint.activate([
@@ -5388,7 +5425,7 @@ final class NotchHubPanel: NSPanel {
             bgv.topAnchor.constraint(equalTo: cv.topAnchor),
             bgv.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
         ])
-        let skinBG = AppSettings.notchSkin.makeHubBackground(cornerRadius: 14, corners: corners)
+        let skinBG = AppSettings.notchSkin.makeHubBackground(cornerRadius: 0, corners: [])
         skinBG.translatesAutoresizingMaskIntoConstraints = false
         bgv.addSubview(skinBG, positioned: .below, relativeTo: nil)
         NSLayoutConstraint.activate([
@@ -5419,14 +5456,19 @@ final class NotchHubPanel: NSPanel {
         clock.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium); clock.textColor = .white
         clock.translatesAutoresizingMaskIntoConstraints = false; clockLabel = clock
         bgv.addSubview(bolt); bgv.addSubview(count); bgv.addSubview(clock)
+        // Count + clock live in the resting pill's flanks. Anchor them CENTER-relative
+        // (not to the full-width edges) so they sit a fixed pad inside the pill's
+        // left/right edges and can't fall outside the mask and get clipped.
+        let halfPill = collapsedW / 2
+        let edgePad: CGFloat = 14
         NSLayoutConstraint.activate([
-            bolt.leadingAnchor.constraint(equalTo: bgv.leadingAnchor, constant: 16),
+            bolt.leadingAnchor.constraint(equalTo: bgv.centerXAnchor, constant: -halfPill + edgePad),
             bolt.topAnchor.constraint(equalTo: bgv.topAnchor, constant: (bezelH - 12) / 2),
             bolt.widthAnchor.constraint(equalToConstant: 10),
             bolt.heightAnchor.constraint(equalToConstant: 12),
             count.leadingAnchor.constraint(equalTo: bolt.trailingAnchor, constant: 3),
             count.centerYAnchor.constraint(equalTo: bolt.centerYAnchor),
-            clock.trailingAnchor.constraint(equalTo: bgv.trailingAnchor, constant: -16),
+            clock.trailingAnchor.constraint(equalTo: bgv.centerXAnchor, constant: halfPill - edgePad),
             clock.centerYAnchor.constraint(equalTo: bolt.centerYAnchor),
         ])
 
@@ -5500,10 +5542,57 @@ final class NotchHubPanel: NSPanel {
         reloadShelf()
         ShelfStore.shared.onChange = { [weak self] in self?.reloadShelf() }
 
-        let track = NSTrackingArea(rect: .zero,
-                                   options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
-                                   owner: self, userInfo: nil)
-        cv.addTrackingArea(track)
+        // The window is fixed at the full footprint but only the pill is "there"
+        // at rest — track just the pill so hover doesn't trigger from the empty
+        // (masked, click-through) area below it. rebuildTracking swaps to the full
+        // bounds while expanded so leaving the open hub collapses it.
+        rebuildTracking()
+    }
+
+    // ── Shape mask + hit region ──────────────────────────────────────
+
+    /// The pill→panel shape in bgv-local coords (origin bottom-left, y up).
+    /// t=0 is the resting pill (collapsedW × bezelH, flat top, tucked at the top);
+    /// t=1 is the full panel (360 × expandedH). Only the bottom corners round.
+    private func hubPath(expandedFraction t: CGFloat) -> CGPath {
+        let W: CGFloat = 360, H = expandedH
+        let w = collapsedW + (W - collapsedW) * t
+        let h = bezelH + (H - bezelH) * t
+        // Rest radius (~10) matches the hardware notch's rounded bottom corners;
+        // eases to 14 when fully expanded. Never 0, so the path structure
+        // (line+arc) stays identical at every t → clean CA interpolation.
+        let r = 10 + 4 * t
+        let left  = ((W - w) / 2).rounded()
+        let right = left + w
+        let topY  = H              // pinned at the top (behind the bezel)
+        let botY  = H - h          // bottom drops down as it expands
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: left, y: topY))
+        p.addArc(tangent1End: CGPoint(x: left,  y: botY), tangent2End: CGPoint(x: right, y: botY), radius: r)
+        p.addArc(tangent1End: CGPoint(x: right, y: botY), tangent2End: CGPoint(x: right, y: topY), radius: r)
+        p.addLine(to: CGPoint(x: right, y: topY))
+        p.closeSubpath()
+        return p
+    }
+
+    /// Whether a point (bgv-local, y up) is inside the currently-visible shape.
+    /// Outside → HubDropView.hitTest returns nil so the click passes through.
+    private func pointInsideVisible(_ p: NSPoint) -> Bool {
+        let H = expandedH
+        if expanded { return NSRect(x: 0, y: 0, width: 360, height: H).contains(p) }
+        let x = (360 - collapsedW) / 2
+        return NSRect(x: x, y: H - bezelH, width: collapsedW, height: bezelH).contains(p)
+    }
+
+    /// Hover target: just the resting pill when collapsed, the full panel when open.
+    private func rebuildTracking() {
+        guard let cv = contentView else { return }
+        if let t = trackingArea { cv.removeTrackingArea(t) }
+        let rect: NSRect = expanded
+            ? cv.bounds
+            : NSRect(x: (360 - collapsedW) / 2, y: 220 - bezelH, width: collapsedW, height: bezelH)
+        let t = NSTrackingArea(rect: rect, options: [.activeAlways, .mouseEnteredAndExited], owner: self, userInfo: nil)
+        cv.addTrackingArea(t); trackingArea = t
     }
 
     private func reloadShelf() {
@@ -5560,21 +5649,31 @@ final class NotchHubPanel: NSPanel {
     private func setExpanded(_ on: Bool) {
         guard on != expanded else { return }
         expanded = on
-        let top = frame.maxY                       // top edge stays pinned behind the bezel
-        let cx  = centerX                           // FIXED screen center — never read back the
-                                                    // (rounded, possibly mid-animation) live frame,
-                                                    // which made the pill creep right on each toggle
-        let h   = on ? expandedH : bezelH
-        let w   = on ? expandedW : collapsedW
-        var f   = frame
-        f.size.width  = w
-        f.origin.x    = (cx - w / 2).rounded()
-        f.size.height = h
-        f.origin.y    = top - h
+        rebuildTracking()                          // hover target follows the visible shape
+
+        // The window never moves or resizes — only the CAShapeLayer mask animates
+        // from the resting pill to the full panel. Path interpolation runs on the
+        // GPU, so the open is fluid (no per-frame window resize/reposition/reflow).
+        let target = hubPath(expandedFraction: on ? 1 : 0)
+        let dur: CFTimeInterval = on ? 0.32 : 0.24
+        if let mask = maskLayer {
+            if AnimationConstants.reduceMotion {
+                mask.removeAnimation(forKey: "path")
+                mask.path = target
+            } else {
+                let a = CABasicAnimation(keyPath: "path")
+                a.fromValue = mask.presentation()?.path ?? mask.path   // smooth even mid-toggle
+                a.toValue   = target
+                a.duration  = dur
+                a.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.94, 0.6, 1.0)
+                a.fillMode  = .forwards
+                mask.add(a, forKey: "path")
+                mask.path = target
+            }
+        }
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = on ? 0.30 : 0.22
+            ctx.duration = AnimationConstants.reduceMotion ? AnimationConstants.reducedDuration : dur
             ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.94, 0.6, 1.0)
-            animator().setFrame(f, display: true)
             expandedView?.animator().alphaValue = on ? 1 : 0
         }
     }
